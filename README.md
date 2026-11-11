@@ -6,7 +6,7 @@
 [![Textual](https://img.shields.io/badge/TUI-Textual%208.x-fab283?style=flat-square)](https://textual.textualize.io/)
 [![License](https://img.shields.io/badge/License-MIT-7fd88f?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-5c9cf5?style=flat-square)](#)
-[![Tests](https://img.shields.io/badge/tests-pytest%20%E2%9C%94%205%2F5-7fd88f?style=flat-square)](tests/test_app.py)
+[![Tests](https://img.shields.io/badge/tests-pytest%205%20passing-7fd88f?style=flat-square)](tests/test_app.py)
 
 **Автономный полноэкранный AI-агент для терминала** — редактирует код, ищет по проекту, выполняет команды, хранит память проекта и откатывает время без Git.
 
@@ -14,7 +14,7 @@
 
 ---
 
-## ✨ Снимки интерфейса
+## Снимки интерфейса
 
 <div align="center">
 
@@ -33,21 +33,21 @@
 
 </div>
 
-## 🚀 Возможности
+## Возможности
 
 | | |
 |---|---|
-| 🖥 **Полноэкранный TUI** | Красивый тёмный интерфейс на [Textual](https://textual.textualize.io/): Home View, сессии, inline-карточки инструментов с **цветными diff'ами** (зелёные/красные подложки, номера строк) и плоский сайдбар (Context · MCP · LSP · Todo · Files) |
-| 🤖 **Два агента (Tab)** | **Build** — свободно редактирует файлы и запускает команды, **Plan** — только читает, анализирует и составляет план, ничего не меняя |
-| ⚡ **Bang Shell (`!`)** | `!git status`, `!pytest` — команда выполняется **мгновенно и без траты LLM-токенов** |
-| ⏱ **Чекпоинты без Git** | `/checkpoint [имя]` — снимок всего проекта в `.rbit/checkpoints/`, `/rewind` — машина времени в любой момент, даже вне репозитория |
-| 🧠 **Память проекта** | `RBIT.md` + `/remember <правило>` → знания автоматически попадают в системный промпт каждой сессии |
-| 🌊 **Real-time Streaming** | Настоящий SSE-стриминг ответов OpenAI-совместимого API в реальном времени |
-| 🔌 **Модели** | OpenRouter / OpenAI / DeepSeek / любой OpenAI-compatible endpoint + автообнаружение локальной **Ollama** (`Ctrl+M`) |
-| 🛠 **Инструменты** | `read`, `write`, `edit`, `multi_edit` (атомарно), `glob`, `grep`, `webfetch`, `bash`, `todowrite` + undo/redo стек |
-| 💾 **Всё локально** | Сессии, конфиг, память и чекпоинты — в скрытой папке `.rbit/` вашего проекта |
+| **Полноэкранный TUI** | Тёмный интерфейс на [Textual](https://textual.textualize.io/): Home View, сессии, inline-карточки инструментов с **цветными diff'ами** (зелёные/красные подложки, номера строк) и плоский сайдбар (Context · MCP · LSP · Todo · Files) |
+| **Два агента (Tab)** | **Build** — свободно редактирует файлы и запускает команды, **Plan** — только читает, анализирует и составляет план, ничего не меняя |
+| **Bang Shell (`!`)** | `!git status`, `!pytest` — команда выполняется мгновенно и **без траты LLM-токенов** |
+| **Чекпоинты без Git** | `/checkpoint [имя]` — снимок всего проекта в `.rbit/checkpoints/`, `/rewind` — машина времени в любой момент, даже вне репозитория |
+| **Память проекта** | `RBIT.md` + `/remember <правило>` — знания автоматически попадают в системный промпт каждой сессии |
+| **Real-time Streaming** | Настоящий SSE-стриминг ответов OpenAI-совместимого API в реальном времени |
+| **Модели** | OpenRouter / OpenAI / DeepSeek / любой OpenAI-compatible endpoint + автообнаружение локальной **Ollama** (`Ctrl+M`) |
+| **Инструменты** | `read`, `write`, `edit`, `multi_edit` (атомарно), `glob`, `grep`, `webfetch`, `bash`, `todowrite` + undo/redo стек |
+| **Всё локально** | Сессии, конфиг, память и чекпоинты — в скрытой папке `.rbit/` вашего проекта |
 
-## 📦 Установка
+## Установка
 
 ```bash
 git clone https://github.com/DreyzeDev/rbit.git
@@ -65,7 +65,7 @@ rbit                                  # TUI по умолчанию
 .\rbit.bat                            # Windows-лаунчер
 ```
 
-## 🎮 Как пользоваться
+## Как пользоваться
 
 Единственный ввод — строка приглашения в нижней части экрана:
 
@@ -77,10 +77,10 @@ rbit                                  # TUI по умолчанию
 ```
 
 Поддержка провайдеров через `/connect` (Base URL + API key):
-`https://openrouter.ai/api/v1` · `https://api.openai.com/v1` · `http://localhost:11434/v1` · любой OpenAI-подобный
+`https://openrouter.ai/api/v1` · `https://api.openai.com/v1` · `http://localhost:11434/v1` · любой OpenAI-подобный.
 Без ключа работает встроенный локальный Smart-агент `rbit/smart-local`.
 
-## ⌨️ Горячие клавиши
+## Горячие клавиши
 
 <div align="center">
 
@@ -99,7 +99,7 @@ rbit                                  # TUI по умолчанию
 
 </div>
 
-## 💬 Слэш-команды
+## Слэш-команды
 
 ```
 /checkpoint [имя]     Снимок проекта (без Git)      /rewind    Откат к снимку
@@ -110,7 +110,7 @@ rbit                                  # TUI по умолчанию
 /init                 Анализ проекта + план         /compact   Сжать контекст
 ```
 
-## 🛰️ CLI (headless / CI)
+## CLI (headless / CI)
 
 ```bash
 rbit run "исправь flake8-предупреждения"      # выполнить задачу без TUI
@@ -121,7 +121,7 @@ rbit sessions                                 # список сохранённ�
 rbit export -o report.md                      # выгрузить переписку в Markdown
 ```
 
-## 🧪 Тесты
+## Тесты
 
 ```bash
 .venv\Scripts\pytest -v
@@ -130,7 +130,7 @@ rbit export -o report.md                      # выгрузить перепи�
 Headless-тесты прогоняют настоящий TUI через Textual Pilot: Home→Session переходы,
 Todo-лист, diff-карточки, undo/redo, чекпоинты, память проекта, модалки и CLI-подкоманды.
 
-## 📁 Структура проекта
+## Структура проекта
 
 ```
 rbit/
@@ -146,7 +146,9 @@ rbit/
 └── __main__.py    # python -m rbit
 ```
 
-## 🗺️ Дорожная карта
+## Дорожная карта
+
+Актуальный приоритизированный бэклог — в [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md).
 
 - [x] Real-time SSE-стриминг
 - [x] Чекпоинты без Git + `/rewind`
@@ -155,12 +157,12 @@ rbit/
 - [ ] AST-диагностика и symbol-index
 - [ ] Кастомные команды проекта (`.rbit/commands/*.md`)
 
-## 📄 Лицензия
+## Лицензия
 
 [MIT](LICENSE) © [DreyzeDev](https://github.com/DreyzeDev)
 
 ---
 
 <div align="center">
-<sub>Сделано с ♥ на <a href="https://textual.textualize.io/">Textual</a> · <a href="https://github.com/DreyzeDev/rbit">star ⭐ если пригодилось</a></sub>
+<sub>Сделано на <a href="https://textual.textualize.io/">Textual</a> · <a href="https://github.com/DreyzeDev/rbit">поставь звезду, если пригодилось</a></sub>
 </div>
