@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rbit"
+version = "1.2.0"
+description = "rbit — Next-Gen Full-Screen Terminal AI Coding Agent & CLI"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=8.0.0",
+    "rich>=14.0.0",
+    "httpx>=0.27.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["rbit*"]
+
+[project.scripts]
+rbit = "rbit.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+
