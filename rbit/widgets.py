@@ -327,6 +327,13 @@ class ToolCallCard(Static):
             super().__init__()
             self.pid = pid
 
+    class CopyRequested(Message):
+        """Posted when the user right-clicks a card to copy its path or command."""
+
+        def __init__(self, text: str) -> None:
+            super().__init__()
+            self.text = text
+
     def __init__(self, record: ToolCallRecord) -> None:
         super().__init__(classes="tool-card")
         self.record = record
@@ -350,7 +357,25 @@ class ToolCallCard(Static):
             self.stop_state = "stopped"
             self.refresh(layout=True)
 
-    def on_click(self, _event: events.Click) -> None:
+    def copy_target(self) -> str:
+        args = self.record.arguments or {}
+        name = self.record.name
+        if name == "bash":
+            return str(args.get("command") or "")
+        if name in ("read", "write", "edit", "multi_edit", "apply_patch", "symbols", "diagnostics", "lint"):
+            return str(args.get("filePath") or args.get("path") or "")
+        if name in ("grep", "glob"):
+            return str(args.get("pattern") or "")
+        if name == "webfetch":
+            return str(args.get("url") or "")
+        return ""
+
+    def on_click(self, event: events.Click) -> None:
+        if getattr(event, "button", 1) == 3:
+            text = self.copy_target()
+            if text:
+                self.post_message(self.CopyRequested(text))
+            return
         if self.record.pid and self.stop_state == "running":
             self.post_message(self.StopRequested(self.record.pid))
             return

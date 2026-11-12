@@ -2175,3 +2175,184 @@ async def test_interrupted_card_meta_and_finalize_result(tmp_path: Path) -> None
         assert app._live_card is None
         meta = str(card.query_one(".assistant-meta", Static).render())
         assert "interrupted" in meta
+
+
+@pytest.mark.asyncio
+async def test_max_steps_budget_stops_the_loop(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"max_steps": 2, "api_key": "test"}
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+    volley = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        volley["count"] += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "t1",
+                                    "type": "function",
+                                    "function": {"name": "read", "arguments": "{}"},
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def invoke_tool(name: str, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(True, "ok", "ok")
+
+    async def on_status(_s: str) -> None:
+        pass
+
+    text = await engine._run_openai_compatible(
+        session=Session(),
+        user_msg=ChatMessage(id="u1", role="user", content="hi"),
+        agent_mode="build",
+        model_id="openai/gpt-4o-mini",
+        api_base="https://mock.local/v1",
+        api_key="test",
+        invoke_tool=invoke_tool,
+        on_status=on_status,
+        on_stream_chunk=None,
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert "лимит шагов вызова инструментов (2)" in text
+    assert volley["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_max_cost_budget_stops_the_loop(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"max_cost_usd": 0.000001, "api_key": "test", "max_steps": 9}
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "t1",
+                                    "type": "function",
+                                    "function": {"name": "read", "arguments": "{}"},
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def invoke_tool(name: str, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(True, "ok", "ok")
+
+    async def on_status(_s: str) -> None:
+        pass
+
+    text = await engine._run_openai_compatible(
+        session=Session(),
+        user_msg=ChatMessage(id="u1", role="user", content="hi"),
+        agent_mode="build",
+        model_id="openai/gpt-4o-mini",
+        api_base="https://mock.local/v1",
+        api_key="test",
+        invoke_tool=invoke_tool,
+        on_status=on_status,
+        on_stream_chunk=None,
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert "лимит стоимости" in text
+
+
+def test_session_finished_flag_roundtrip(tmp_path: Path) -> None:
+    from rbit.storage import StorageManager
+
+    storage = StorageManager(tmp_path)
+    sess = Session()
+    sess.finished = False
+    storage.save_session(sess)
+    loaded = storage.list_sessions()[0]
+    assert loaded.finished is False
+    sess.finished = True
+    storage.save_session(sess)
+    assert storage.list_sessions()[0].finished is True
+
+
+@pytest.mark.asyncio
+async def test_crash_recovery_loads_unfinished_session(tmp_path: Path) -> None:
+    from rbit.storage import StorageManager
+
+    storage = StorageManager(tmp_path)
+    crash = Session()
+    crash.title = "interrupted by crash"
+    crash.messages.append(ChatMessage(id="u1", role="user", content="hello"))
+    crash.finished = False
+    storage.save_session(crash)
+
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        await pilot.pause()
+        assert app.session.id == crash.id
+        assert app.session.title == "interrupted by crash"
+        assert app.session.messages[0].content == "hello"
+
+
+@pytest.mark.asyncio
+async def test_lazy_history_renders_windows_of_30(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        await pilot.pause()
+        app.session.messages = [ChatMessage(id=f"m{i}", role="user", content=f"line {i}") for i in range(40)]
+        app._rebuild_chat_view()
+        await pilot.pause()
+
+        scroll = app.query_one("#chat-scroll", ChatScroll)
+        assert len(scroll.children) == 31
+        assert app.query_one("#load-older", Static) is not None
+
+        app._load_older()
+        await pilot.pause()
+        assert len(scroll.children) == 40
+        assert not scroll.query("#load-older")
+
+
+def test_card_copy_target() -> None:
+    card = ToolCardWidget(ToolCallRecord(id="b", name="bash", arguments={"command": "pytest -q"}))
+    assert card.copy_target() == "pytest -q"
+    card = ToolCardWidget(ToolCallRecord(id="r", name="read", arguments={"filePath": "src/a.py"}))
+    assert card.copy_target() == "src/a.py"
+    card = ToolCardWidget(ToolCallRecord(id="g", name="grep", arguments={"pattern": "TODO"}))
+    assert card.copy_target() == "TODO"
+    card = ToolCardWidget(ToolCallRecord(id="w", name="webfetch", arguments={"url": "https://x"}))
+    assert card.copy_target() == "https://x"
+    card = ToolCardWidget(ToolCallRecord(id="u", name="todowrite", arguments={}))
+    assert card.copy_target() == ""
+
+
+@pytest.mark.asyncio
+async def test_retry_binding_and_last_error_hint(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        await pilot.pause()
+        assert callable(app.action_retry_last)
+        assert app._last_error == ""
+        app._last_error = "boom"
+        assert app._last_error == "boom"

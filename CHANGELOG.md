@@ -35,6 +35,13 @@ All notable changes to rbit are documented here. The format follows
 - Chat scroll sticks to the bottom only while the user is already there.
 - Workspace path validation rejects reads/writes outside the project unless
   `--allow-outside` or `allow_outside_paths` is set.
+- Turn budget controls: `max_steps` caps tool-calling rounds and `max_cost_usd`
+  stops the turn when the estimated spend is exceeded.
+- Crash recovery: an interrupted turn marks the session `finished: false` and
+  reloads it automatically on next launch.
+- History renders in windows of 30 cards with a "load older" link for long sessions.
+- Right-click a tool card copies its path, command, or pattern; `Ctrl+R` retries
+  the last prompt and error notices hint at `/connect` for auth failures.
 
 ### Changed
 

@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from textual import events, on, work
 from textual.app import App, ComposeResult
@@ -416,6 +417,7 @@ class RbitApp(App[None]):
         Binding("ctrl+f", "search_session", "Search", show=False),
         Binding("ctrl+x", "stop_background", "Stop background", show=False),
         Binding("ctrl+e", "collapse_all_cards", "Collapse cards", show=False),
+        Binding("ctrl+r", "retry_last", "Retry", show=False),
         Binding("f1", "show_help", "Help", show=False),
         Binding("escape", "interrupt_or_close", "Interrupt", show=False),
         Binding("ctrl+q", "quit", "Quit", show=False),
@@ -455,6 +457,8 @@ class RbitApp(App[None]):
         self._save_timer: Timer | None = None
         self._live_card: AssistantMessageCard | None = None
         self._interrupted_turn: bool = False
+        self._history_window: int = 30
+        self._last_error: str = ""
 
         self.executor = ToolExecutor(
             workspace=self.workspace,
@@ -508,6 +512,15 @@ class RbitApp(App[None]):
             self.theme = "rbit-dark"
 
         self.set_interval(0.09, self._tick_spinner)
+        if not self.session.messages and self.initial_prompt is None:
+            unfinished = next(
+                (s for s in self.storage.list_sessions() if not s.finished and s.messages),
+                None,
+            )
+            if unfinished is not None:
+                self.session = unfinished
+                self.executor.session = unfinished
+                self.notify("Recovered an unfinished session — continue where you left off.", timeout=4.0)
         if self.session.messages:
             self._rebuild_chat_view()
         self._update_layout_mode()
@@ -693,6 +706,13 @@ class RbitApp(App[None]):
     @on(PromptModelLabel.Clicked)
     def _on_model_label_clicked(self) -> None:
         self.action_open_models()
+
+    @on(ToolCallCard.CopyRequested)
+    def _on_card_copy_requested(self, event: ToolCallCard.CopyRequested) -> None:
+        if _write_clipboard(event.text):
+            self.notify(f"Copied: {event.text[:60]}", timeout=2.0)
+        else:
+            self.notify("Clipboard helper not found.", severity="error", timeout=2.0)
 
     @on(ToolCallCard.StopRequested)
     async def _on_stop_background_requested(self, event: ToolCallCard.StopRequested) -> None:
@@ -943,6 +963,7 @@ class RbitApp(App[None]):
     def action_new_session(self) -> None:
         self.session = Session()
         self.executor.session = self.session
+        self._history_window = 30
         self._has_inline_notices = False
         self._sidebar_override_on_home = False
         self.query_one(HomeTipBanner).pick_new_tip()
@@ -952,6 +973,7 @@ class RbitApp(App[None]):
 
     def action_clear_chat(self) -> None:
         self.session.messages.clear()
+        self._history_window = 30
         self._has_inline_notices = False
         self._rebuild_chat_view()
         self._sync_ui()
@@ -1012,22 +1034,43 @@ class RbitApp(App[None]):
     def _load_session_into_ui(self, sess: Session) -> None:
         self.session = sess
         self.executor.session = sess
+        self._history_window = 30
         self._has_inline_notices = False
         self._rebuild_chat_view()
         self._sync_ui()
 
-    def _rebuild_chat_view(self) -> None:
+    def _rebuild_chat_view(self, limit: int | None = None) -> None:
         scroll = self.query_one("#chat-scroll", ChatScroll)
         scroll.remove_children()
         self._tool_widgets.clear()
-        for m in self.session.messages:
+        window = self._history_window if limit is None else limit
+        messages = self.session.messages
+        truncated = len(messages) > window
+        visible = messages[-window:] if truncated else messages
+        widgets: list[Any] = []
+        if truncated:
+            widgets.append(
+                Static("↑ Load older messages", id="load-older", classes="system-notice")
+            )
+        for m in visible:
             if m.role == "user":
-                scroll.mount(UserMessageCard(m))
+                widgets.append(UserMessageCard(m))
             elif m.role == "assistant":
                 for tc in m.tool_calls:
-                    scroll.mount(ToolCallCard(tc))
-                scroll.mount(AssistantMessageCard(m, self.engine.extra_models))
+                    widgets.append(ToolCallCard(tc))
+                widgets.append(AssistantMessageCard(m, self.engine.extra_models))
+        if widgets:
+            scroll.mount_all(widgets)
         scroll.scroll_end(animate=False)
+
+    def _load_older(self) -> None:
+        self._history_window += 30
+        self._rebuild_chat_view()
+        self.notify("Loaded older messages.", timeout=2.0)
+
+    def on_click(self, event: events.Click) -> None:
+        if getattr(event.widget, "id", None) == "load-older":
+            self._load_older()
 
     def _post_notice(self, text: str) -> None:
         self._has_inline_notices = True
@@ -1303,6 +1346,9 @@ class RbitApp(App[None]):
         self._rebuild_chat_view()
         self._sync_ui()
 
+    def action_retry_last(self) -> None:
+        self._cmd_retry()
+
     def _cmd_retry(self) -> None:
         if self.is_busy:
             self.notify("Agent is busy — press Esc first.", severity="warning")
@@ -1522,6 +1568,8 @@ class RbitApp(App[None]):
         model_id = self.config_data.get("model", "rbit/smart-local")
         self._live_card = None
         self._interrupted_turn = False
+        self.session.finished = False
+        self._schedule_save_session(delay=0.05)
 
         async def on_tool_start(rec: ToolCallRecord) -> None:
             card = ToolCallCard(rec)
@@ -1582,8 +1630,15 @@ class RbitApp(App[None]):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._post_notice(f"✗ Error: {exc}")
+            self._last_error = str(exc)
+            lowered = str(exc).lower()
+            hint = ""
+            if any(k in lowered for k in ("401", "403", "api key", "unauthorized", "connect")):
+                hint = " Check the provider with `/connect`."
+            self._post_notice(f"✗ Error: {exc}\n\nPress `Ctrl+R` to retry the last prompt.{hint}")
         finally:
+            self.session.finished = True
+            self._schedule_save_session(delay=0.05)
             self.is_busy = False
             self.busy_status = ""
             self._sync_ui()
