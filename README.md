@@ -6,7 +6,7 @@
 [![Textual](https://img.shields.io/badge/TUI-Textual%208.x-fab283?style=flat-square)](https://textual.textualize.io/)
 [![License](https://img.shields.io/badge/License-MIT-7fd88f?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-5c9cf5?style=flat-square)](#)
-[![Tests](https://img.shields.io/badge/tests-pytest%2054%20passing-7fd88f?style=flat-square)](tests/test_app.py)
+[![Tests](https://img.shields.io/badge/tests-pytest%2055%20passing-7fd88f?style=flat-square)](tests/test_app.py)
 [![CI](https://github.com/DreyzeDev/rbit/actions/workflows/ci.yml/badge.svg)](https://github.com/DreyzeDev/rbit/actions/workflows/ci.yml)
 
 **Автономный полноэкранный AI-агент для терминала** — редактирует код, ищет по проекту, выполняет команды, хранит память проекта и откатывает время без Git.
@@ -196,6 +196,7 @@ rbit/
 - [x] `bash` timeout/background, читаемый `webfetch`, ripgrep-grep, профили `--profile`, изолированный conftest
 - [x] Кэш списка файлов, keep-alive пул `httpx`, проверка ключа в `/connect`, недавние в палитре, community-доки
 - [x] Импорт всех моделей провайдера в отдельную категорию при `/connect`
+- [x] Автопоиск моделей: кэш в конфиге, фоновое обновление при старте, `/connect` и открытии селектора
 - [ ] `apply_patch`, фоновый `bash`, session search
 
 ## Лицензия

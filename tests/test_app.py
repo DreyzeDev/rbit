@@ -1629,6 +1629,46 @@ async def test_connect_adds_all_provider_models_under_category(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_auto_discovery_on_startup_and_modal_refresh(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/models"):
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "groq/llama-4-scout"}, {"id": "groq/qwen-3-32b"}]},
+            )
+        return httpx.Response(404)
+
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        app.engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        cfg = {"api_base": "https://api.groq.com/openai/v1", "api_key": "k"}
+        provider_count, _ = await app.engine.auto_discover_models(cfg, force=True)
+        assert provider_count == 2
+        assert {m.provider for m in app.engine.extra_models} >= {"Groq"}
+        assert all(
+            m["provider"] != "Ollama Local" for m in app.engine.persistable_provider_models()
+        )
+
+        await app.push_screen(ModelSelectorModal("rbit/smart-local", []))
+        await pilot.pause()
+        modal = app.screen
+        assert isinstance(modal, ModelSelectorModal)
+        assert not any(
+            (modal.query_one("#model-list", OptionList).get_option_at_index(i).id or "")
+            .startswith("groq/")
+            for i in range(modal.query_one("#model-list", OptionList).option_count)
+        )
+        modal.refresh_models(app.engine.extra_models)
+        await pilot.pause()
+        olist = modal.query_one("#model-list", OptionList)
+        ids = [olist.get_option_at_index(i).id for i in range(olist.option_count)]
+        assert "groq/llama-4-scout" in ids
+        assert "groq/qwen-3-32b" in ids
+        await pilot.press("escape")
+        await app.engine.http_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_palette_shows_recents_first(tmp_path: Path) -> None:
     app = RbitApp(workspace=tmp_path)
     async with app.run_test(size=(130, 40)) as pilot:

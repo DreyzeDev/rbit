@@ -19,6 +19,8 @@ All notable changes to rbit are documented here. The format follows
 - Custom provider headers via `extra_headers`.
 - `/connect` imports every model from the provider's `GET /models` under its own
   category in the model picker and caches them in the config.
+- Automatic model discovery: cached provider models load immediately, refresh in the
+  background at startup, on `/connect`, and whenever the model picker opens.
 
 ### Changed
 

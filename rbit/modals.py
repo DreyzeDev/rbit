@@ -242,6 +242,24 @@ class ModelSelectorModal(ModalScreen[str | None]):
         for em in extra_models or []:
             if em.id not in existing_ids:
                 self.all_models.append(em)
+                existing_ids.add(em.id)
+
+    def refresh_models(self, extra_models: list[ModelInfo]) -> None:
+        """Adds models discovered after the modal opened and repaints the list."""
+        existing_ids = {m.id for m in self.all_models}
+        added = 0
+        for em in extra_models:
+            if em.id not in existing_ids:
+                self.all_models.append(em)
+                existing_ids.add(em.id)
+                added += 1
+        if added and self.is_attached:
+            query = ""
+            try:
+                query = self.query_one("#model-search", Input).value
+            except Exception:
+                pass
+            self._populate(query)
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="oc-modal"):

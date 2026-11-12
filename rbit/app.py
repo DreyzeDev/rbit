@@ -495,19 +495,28 @@ class RbitApp(App[None]):
         self._update_layout_mode()
         self._sync_ui()
         self.query_one("#prompt-input", Input).focus()
-        cached = self.engine.load_cached_provider_models(self.config_data)
-        if cached:
-            self.engine.add_provider_models(cached)
-            self._sync_ui()
-        self._discover_local_models()
+        self._discover_models()
 
         if self.initial_prompt:
             self.set_timer(0.15, lambda: self._submit_prompt(self.initial_prompt or ""))
 
     @work
-    async def _discover_local_models(self) -> None:
-        await self.engine.refresh_ollama_models()
+    async def _discover_models(self, force: bool = False) -> None:
+        await self.engine.auto_discover_models(self.config_data, force=force)
+        self._persist_provider_models()
+        screen = self.screen
+        if isinstance(screen, ModelSelectorModal):
+            screen.refresh_models(self.engine.extra_models)
         self._sync_ui()
+
+    def _persist_provider_models(self) -> None:
+        models = self.engine.persistable_provider_models()
+        if models:
+            self.config_data["provider_models"] = models
+            self.storage.save_config(self.config_data)
+
+    def _discover_local_models(self) -> None:
+        self._discover_models()
 
     def _tick_spinner(self) -> None:
         if self.is_busy:
@@ -760,7 +769,8 @@ class RbitApp(App[None]):
 
     @work
     async def action_open_models(self) -> None:
-        self._discover_local_models()
+        self.engine.add_provider_models(self.engine.load_cached_provider_models(self.config_data))
+        self._discover_models(force=True)
         chosen = await self.push_screen_wait(
             ModelSelectorModal(
                 self.config_data.get("model", "rbit/smart-local"),
@@ -843,22 +853,16 @@ class RbitApp(App[None]):
             self.storage.save_config(self.config_data)
             if self.config_data["api_key"]:
                 ok, message, models = await self.engine.fetch_provider_models(
-                    self.config_data["api_base"], self.config_data["api_key"]
+                    self.config_data["api_base"], self.config_data["api_key"], timeout=15.0
                 )
                 if ok and models:
                     added = self.engine.add_provider_models(models)
-                    cached = {
-                        m.id: m.to_dict()
-                        for m in self.engine.load_cached_provider_models(self.config_data)
-                    }
-                    for model in models:
-                        cached[model.id] = model.to_dict()
-                    self.config_data["provider_models"] = list(cached.values())
-                    self.storage.save_config(self.config_data)
+                    self._persist_provider_models()
                     provider = models[0].provider
                     message = f"{message} ({added} added to {provider})"
-                    self._sync_ui()
-                self.notify(("✓ " if ok else "✗ ") + message, timeout=4.0)
+                self.notify(("✓ " if ok else "✗ ") + message, timeout=5.0)
+            await self.engine.auto_discover_models(self.config_data, force=True)
+            self._persist_provider_models()
             self._sync_ui()
         self.query_one("#prompt-input", Input).focus()
 

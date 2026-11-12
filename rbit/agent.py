@@ -126,6 +126,7 @@ class AgentEngine:
         self.retry_attempts = 4
         self.retry_base_delay = 0.6
         self.retry_max_delay = 8.0
+        self._provider_models_synced_at = 0.0
 
     def _retry_delay(self, attempt: int, resp: httpx.Response | None = None) -> float:
         if resp is not None:
@@ -154,6 +155,29 @@ class AgentEngine:
             added += 1
         return added
 
+    async def sync_provider_models(
+        self,
+        api_base: str,
+        api_key: str,
+        force: bool = False,
+        min_interval: float = 60.0,
+        timeout: float = 10.0,
+    ) -> tuple[bool, str, int]:
+        """Fetches provider models and merges them, throttled unless `force` is set."""
+        if not api_base:
+            return False, "Base URL is not set.", 0
+        if (
+            not force
+            and self._provider_models_synced_at
+            and time.monotonic() - self._provider_models_synced_at < min_interval
+        ):
+            return True, "Model list is up to date.", 0
+        ok, message, models = await self.fetch_provider_models(api_base, api_key, timeout=timeout)
+        if ok:
+            self._provider_models_synced_at = time.monotonic()
+        added = self.add_provider_models(models) if ok else 0
+        return ok, message, added
+
     def load_cached_provider_models(self, cfg: dict[str, Any]) -> list[ModelInfo]:
         cached: list[ModelInfo] = []
         for item in cfg.get("provider_models") or []:
@@ -161,13 +185,34 @@ class AgentEngine:
                 cached.append(ModelInfo.from_dict(item))
         return cached
 
+    async def auto_discover_models(
+        self, cfg: dict[str, Any], force: bool = False
+    ) -> tuple[int, int]:
+        """Loads cached models, refreshes the configured provider and local Ollama.
+
+        Returns `(provider_count, ollama_count)` describing how many models are known.
+        """
+        self.add_provider_models(self.load_cached_provider_models(cfg))
+        api_base = str(cfg.get("api_base") or "").strip()
+        api_key = str(cfg.get("api_key") or "").strip()
+        if api_base and api_key:
+            await self.sync_provider_models(api_base, api_key, force=force, timeout=6.0)
+        ollama = await discover_ollama_models()
+        self.ollama_online = bool(ollama)
+        self.add_provider_models(ollama)
+        provider_count = sum(1 for m in self.extra_models if m.provider != "Ollama Local")
+        return provider_count, len(ollama)
+
+    def persistable_provider_models(self) -> list[dict[str, Any]]:
+        return [m.to_dict() for m in self.extra_models if m.provider != "Ollama Local"]
+
     async def validate_api_key(self, api_base: str, api_key: str) -> tuple[bool, str]:
         """Checks a provider key with GET /models and returns a human-readable result."""
         ok, message, _ = await self.fetch_provider_models(api_base, api_key)
         return ok, message
 
     async def fetch_provider_models(
-        self, api_base: str, api_key: str
+        self, api_base: str, api_key: str, timeout: float = 10.0
     ) -> tuple[bool, str, list[ModelInfo]]:
         """Validates a key with GET /models and returns every model the provider exposes."""
         base = (api_base or "").strip().rstrip("/")
@@ -179,7 +224,7 @@ class AgentEngine:
             if self.http_client is not None:
                 resp = await self.http_client.get(url, headers=headers)
             else:
-                async with httpx.AsyncClient(timeout=10.0, limits=HTTP_LIMITS) as client:
+                async with httpx.AsyncClient(timeout=timeout, limits=HTTP_LIMITS) as client:
                     resp = await client.get(url, headers=headers)
         except Exception as exc:
             return False, f"Cannot reach {base}: {exc}", []
