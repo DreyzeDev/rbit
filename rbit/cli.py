@@ -55,7 +55,7 @@ async def _run_headless(args: argparse.Namespace) -> int:
     if len(session.messages) == 0 and session.title == "New Session":
         session.title = prompt_text[:44]
 
-    executor = ToolExecutor(workspace=workspace, session=session, storage=storage)
+    executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=lambda: cfg)
     executor.always_allow_bash = True  # Non-interactive CLI run
     engine = AgentEngine(
         workspace=workspace,

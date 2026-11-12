@@ -15,7 +15,7 @@ from rbit.agent import AgentEngine, MAX_PARALLEL_TOOLS
 from rbit.app import RbitApp
 from rbit.cli import main as cli_main
 from rbit.models import ChatMessage, Session, ToolCallRecord, short_id
-from rbit.tools import ToolExecutor, ToolResult
+from rbit.tools import ToolExecutor, ToolResult, is_secret_file, redact_secrets
 from rbit.widgets import (
     AgentModeBadge,
     AutocompletePopup,
@@ -456,5 +456,74 @@ async def test_auto_diagnostics_on_write_edit_and_self_heal_turn(tmp_path: Path)
     assert "Diagnostics" in step2_tool_msg["content"]
     assert "SyntaxError" in step2_tool_msg["content"]
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "def greet():\n    return 'hi'\n"
+
+
+@pytest.mark.asyncio
+async def test_secret_guard_blocks_env_and_redacts_tokens(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("OPENAI_API_KEY=sk-proj-1234567890abcdefghijklmno\n", encoding="utf-8")
+    env_example = tmp_path / ".env.example"
+    env_example.write_text("OPENAI_API_KEY=\n", encoding="utf-8")
+    key_file = tmp_path / "server.pem"
+    key_file.write_text("-----BEGIN RSA PRIVATE KEY-----\nabc123xyz\n-----END RSA PRIVATE KEY-----\n", encoding="utf-8")
+
+    assert is_secret_file(env_file) is True
+    assert is_secret_file(key_file) is True
+    assert is_secret_file(env_example) is False
+
+    cfg = {"allow_secret_reads": False}
+    session = Session()
+    executor = ToolExecutor(workspace=tmp_path, session=session, get_config=lambda: cfg)
+
+    # 1. Reading .env and .pem is blocked, while .env.example is allowed
+    blocked_env = await executor.execute("read", {"filePath": ".env"})
+    assert blocked_env.ok is False
+    assert "Secret Guard" in blocked_env.output
+    assert "1234567890abcdefghijklmno" not in blocked_env.output
+
+    blocked_pem = await executor.execute("read", {"filePath": "server.pem"})
+    assert blocked_pem.ok is False
+
+    allowed_example = await executor.execute("read", {"filePath": ".env.example"})
+    assert allowed_example.ok is True
+
+    # 2. Grep skips secret files
+    grep_res = await executor.execute("grep", {"pattern": "1234567890"})
+    assert grep_res.ok is True
+    assert "1234567890" not in grep_res.output
+
+    # 3. Allow override via allow_secret_reads=True, STILL redacting token values in tool output!
+    cfg["allow_secret_reads"] = True
+    override_res = await executor.execute("read", {"filePath": ".env"})
+    assert override_res.ok is True
+    assert "sk-[REDACTED]" in override_res.output
+    assert "1234567890abcdefghijklmno" not in override_res.output
+
+    # 4. Diff and session markdown export redact GitHub/Slack/OpenAI tokens
+    cfg["allow_secret_reads"] = False
+    leaked_py = await executor.execute(
+        "write",
+        {
+            "filePath": "client.py",
+            "content": 'TOKEN = "gho_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234"\nSLACK = "xoxb-123456789012-abcdefghijkl"\n',
+        },
+    )
+    assert "gh_[REDACTED]" in leaked_py.diff
+    assert "xox-[REDACTED]" in leaked_py.diff
+    assert "gho_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234" not in leaked_py.diff
+
+    session.messages.append(
+        ChatMessage(
+            id=short_id(),
+            role="user",
+            content="мой ключ sk-or-v1-abcdefghijklmnopqrstuvwxyz123456",
+        )
+    )
+    exported = executor.storage.export_session_markdown(session, tmp_path / "export.md")
+    md_text = exported.read_text(encoding="utf-8")
+    assert "sk-[REDACTED]" in md_text
+    assert "abcdefghijklmnopqrstuvwxyz123456" not in md_text
+    assert redact_secrets("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9") == "Authorization: Bearer [REDACTED]"
+
 
 

@@ -392,6 +392,7 @@ class RbitApp(App[None]):
             session=self.session,
             storage=self.storage,
             permission_cb=self._ask_permission,
+            get_config=lambda: self.config_data,
         )
         self.engine = AgentEngine(
             workspace=self.workspace,

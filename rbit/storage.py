@@ -43,6 +43,7 @@ class StorageManager:
             or "",
             "sidebar_visible": True,
             "auto_approve_safe": True,
+            "allow_secret_reads": False,
         }
         if self.config_path.exists():
             try:
@@ -73,6 +74,11 @@ class StorageManager:
             json.dumps(cfg, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        if os.name != "nt":
+            try:
+                os.chmod(self.config_path, 0o600)
+            except OSError:
+                pass
 
     # --- Sessions ---
     def save_session(self, session: Session) -> None:
@@ -197,6 +203,8 @@ class StorageManager:
 
     # --- Session Markdown Export ---
     def export_session_markdown(self, session: Session, out_path: Path | None = None) -> Path:
+        from .tools import redact_secrets
+
         target = out_path or (self.workspace / f"rbit-session-{session.id}.md")
         lines: list[str] = [
             f"# {session.title}",
@@ -235,5 +243,5 @@ class StorageManager:
                 lines.append("")
                 lines.append(m.content)
 
-        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        target.write_text(redact_secrets("\n".join(lines) + "\n"), encoding="utf-8")
         return target

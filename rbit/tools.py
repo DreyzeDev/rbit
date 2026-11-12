@@ -63,6 +63,73 @@ READONLY_TOOLS: frozenset[str] = frozenset({"read", "glob", "grep", "webfetch", 
 
 MAX_CHECKPOINT_FILE_BYTES = 256_000
 
+SAFE_TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".schema", ".dist")
+SECRET_EXACT_NAMES = frozenset(
+    {
+        ".env",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+        "credentials.json",
+        "service-account.json",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+    }
+)
+SECRET_EXTENSIONS = frozenset({".pem", ".key", ".p12", ".pfx", ".keystore", ".jks"})
+
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.DOTALL),
+        "-----BEGIN PRIVATE KEY-----[REDACTED]-----END PRIVATE KEY-----",
+    ),
+    (
+        re.compile(r"\bsk-(?:or-v1-|ant-api\d+-|ant-|proj-|live_|test_|live-|test-)?[A-Za-z0-9_\-]{16,}\b"),
+        "sk-[REDACTED]",
+    ),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b"), "gh_[REDACTED]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"), "github_pat_[REDACTED]"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{16,}\b"), "xox-[REDACTED]"),
+    (re.compile(r"\bhf_[A-Za-z0-9]{20,}\b"), "hf_[REDACTED]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AKIA[REDACTED]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{32,}\b"), "AIza[REDACTED]"),
+    (re.compile(r"(Bearer\s+)[A-Za-z0-9._\-]{20,}", re.IGNORECASE), r"\1[REDACTED]"),
+    (
+        re.compile(
+            r"(\b(?:[A-Z0-9_]*_)?(?:API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|CLIENT_SECRET|PASSWORD)\s*=\s*['\"]?)"
+            r"[A-Za-z0-9_\-./+=]{12,}"
+            r"(['\"]?)"
+        ),
+        r"\1[REDACTED]\2",
+    ),
+)
+
+
+def is_secret_file(path: Path) -> bool:
+    """Returns True if `path` looks like a secret/credential file that should not be read by default."""
+    name = path.name.lower()
+    if name.endswith(SAFE_TEMPLATE_SUFFIXES):
+        return False
+    if name in SECRET_EXACT_NAMES or name.startswith(".env."):
+        return True
+    if path.suffix.lower() in SECRET_EXTENSIONS:
+        return True
+    if name == "config.json" and path.parent.name.lower() == ".rbit":
+        return True
+    return False
+
+
+def redact_secrets(text: str) -> str:
+    """Redacts API keys, OAuth tokens, PEM private keys, and env secrets from text."""
+    if not text:
+        return text
+    out = text
+    for pat, repl in _SECRET_PATTERNS:
+        out = pat.sub(repl, out)
+    return out
+
 
 @dataclass
 class ToolResult:
@@ -85,6 +152,7 @@ class ToolExecutor:
         permission_cb: PermissionCallback | None = None,
         on_todos_updated: Callable[[list[TodoItem]], None] | None = None,
         on_files_updated: Callable[[], None] | None = None,
+        get_config: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.workspace = workspace.resolve()
         self.session = session
@@ -92,9 +160,18 @@ class ToolExecutor:
         self.permission_cb = permission_cb
         self.on_todos_updated = on_todos_updated
         self.on_files_updated = on_files_updated
+        self.get_config = get_config
         self.undo_stack: list[FileSnapshot] = []
         self.redo_stack: list[FileSnapshot] = []
         self.always_allow_bash: bool = False
+        self.allow_secret_reads: bool = False
+
+    def _secret_reads_allowed(self) -> bool:
+        if self.allow_secret_reads:
+            return True
+        if self.get_config is not None:
+            return bool(self.get_config().get("allow_secret_reads", False))
+        return False
 
     def resolve_path(self, raw_path: str) -> Path:
         p = Path(raw_path)
@@ -231,6 +308,8 @@ class ToolExecutor:
         files_map: dict[str, str] = {}
         for rel in self.list_workspace_files(limit=400):
             full = self.workspace / rel
+            if not self._secret_reads_allowed() and is_secret_file(full):
+                continue
             try:
                 if full.stat().st_size <= MAX_CHECKPOINT_FILE_BYTES:
                     files_map[rel] = full.read_text(encoding="utf-8")
@@ -257,6 +336,8 @@ class ToolExecutor:
         removed = 0
         for rel in current_files - set(saved_files.keys()):
             full = self.workspace / rel
+            if not self._secret_reads_allowed() and is_secret_file(full):
+                continue
             try:
                 if full.exists() and full.stat().st_size <= MAX_CHECKPOINT_FILE_BYTES:
                     full.unlink()
@@ -270,6 +351,7 @@ class ToolExecutor:
     async def execute_bang_shell(self, command: str) -> ToolResult:
         t0 = time.perf_counter()
         res = await self._run_subprocess(command)
+        res.output = redact_secrets(res.output)
         res.duration_ms = int((time.perf_counter() - t0) * 1000)
         return res
 
@@ -315,6 +397,9 @@ class ToolExecutor:
         except Exception as exc:
             res = ToolResult(False, f"Error in {name}", f"{type(exc).__name__}: {exc}")
 
+        res.output = redact_secrets(res.output)
+        if res.diff:
+            res.diff = redact_secrets(res.diff)
         res.duration_ms = int((time.perf_counter() - t0) * 1000)
         return res
 
@@ -327,6 +412,14 @@ class ToolExecutor:
 
         if not target.exists():
             return ToolResult(False, f"{rel} (not found)", f"File not found: {target}")
+
+        if target.is_file() and not self._secret_reads_allowed() and is_secret_file(target):
+            return ToolResult(
+                False,
+                f"{rel} (blocked: secret file)",
+                f"Access blocked by Secret Guard: refusing to read sensitive file `{rel}`. "
+                "Set `allow_secret_reads: true` in `.rbit/config.json` to override.",
+            )
 
         if target.is_dir():
             entries = []
@@ -496,6 +589,8 @@ class ToolExecutor:
         hits: list[str] = []
         for rel in self.list_workspace_files(limit=300):
             full = self.workspace / rel
+            if not self._secret_reads_allowed() and is_secret_file(full):
+                continue
             if include != "*" and not full.match(include):
                 continue
             try:
