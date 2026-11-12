@@ -12,6 +12,8 @@ from .models import CheckpointMeta, Session, short_id
 
 
 class StorageManager:
+    MAX_CHECKPOINTS = 20
+
     def __init__(self, workspace: Path | None = None) -> None:
         self.workspace = (workspace or Path.cwd()).resolve()
         self.state_dir = self.workspace / ".rbit"
@@ -191,12 +193,31 @@ class StorageManager:
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        self.prune_checkpoints(self.MAX_CHECKPOINTS)
         return CheckpointMeta(
             id=cid,
             label=payload["label"],
             created_at=created,
             file_count=len(files_map),
         )
+
+    def prune_checkpoints(self, keep: int = 20) -> int:
+        """Keeps only the newest `keep` checkpoints, deleting older ones."""
+        if not self.checkpoints_dir.exists():
+            return 0
+        files = sorted(
+            self.checkpoints_dir.glob("*.json"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        removed = 0
+        for path in files[max(1, keep):]:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                continue
+        return removed
 
     def list_checkpoints(self) -> list[CheckpointMeta]:
         if not self.checkpoints_dir.exists():

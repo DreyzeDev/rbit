@@ -193,6 +193,20 @@ class AgentEngine:
                 on_status=on_status,
             )
 
+        if use_remote and self._is_model_unavailable(content):
+            await on_status("Модель недоступна (401/404) — fallback на rbit/smart-local...")
+            fallback_text = await self._run_smart_local_agent(
+                session=session,
+                user_msg=user_msg,
+                agent_mode=agent_mode,
+                invoke_tool=invoke_tool,
+                on_status=on_status,
+            )
+            content = (
+                f"**[Fallback]** `{model_id}` недоступна — выполнен встроенный Smart-агент "
+                "без обращения к API.\n\n" + fallback_text
+            )
+
         elapsed = round(time.perf_counter() - t0, 2)
         tokens_est = max(
             12, count_tokens(content) + sum(count_tokens(tc.output) for tc in tool_records)
@@ -699,6 +713,10 @@ class AgentEngine:
             f"Subagent explore result for: {goal}\n\n{text}",
             duration_ms=duration,
         )
+
+    @staticmethod
+    def _is_model_unavailable(content: str) -> bool:
+        return content.startswith(("Ошибка API (401", "Ошибка API (404"))
 
     @staticmethod
     def _transcript_for_summary(messages: list[ChatMessage]) -> str:

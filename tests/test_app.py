@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -1162,3 +1164,98 @@ async def test_copy_last_answer_and_slash_command(tmp_path: Path, monkeypatch: p
         await pilot.pause()
 
     assert copied[-1] == "hello copy"
+
+@pytest.mark.asyncio
+async def test_falls_back_to_smart_local_on_401(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    app.config_data["model"] = "openai/gpt-4.1"
+    app.config_data["api_key"] = "bad-key"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "unauthorized"})
+
+    async with app.run_test(size=(130, 40)) as pilot:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as mock_client:
+            app.engine.http_client = mock_client
+            inp = app.query_one("#prompt-input")
+            inp.focus()
+            inp.value = "создай файл calc.py с калькулятором"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    reply = app.session.messages[1]
+    assert reply.content.startswith("**[Fallback]**")
+    assert "smart" in reply.content.lower()
+    assert (tmp_path / "calc.py").exists()
+
+
+def test_cli_run_reads_stdin_with_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class FakeStdin(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(sys, "stdin", FakeStdin("проанализируй проект и создай план"))
+    assert cli_main(["run", "--stdin", "-m", "rbit/smart-local", "-d", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "Обзор проекта" in out or "план" in out.lower()
+
+
+@pytest.mark.asyncio
+async def test_atomic_write_and_ansi_sanitize(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from rbit.tools import atomic_write_text, strip_ansi
+
+    assert strip_ansi("\x1b[31mred\x1b[0m") == "red"
+    assert strip_ansi("plain") == "plain"
+
+    calls: list[tuple[str, str]] = []
+    real_replace = os.replace
+
+    def spy(src: str, dst: str) -> None:
+        calls.append((str(src), str(dst)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr("rbit.tools.os.replace", spy)
+    target = tmp_path / "atomic.txt"
+    atomic_write_text(target, "payload")
+    assert target.read_text(encoding="utf-8") == "payload"
+    assert calls and Path(calls[0][1]) == target
+    assert not list(tmp_path.glob("*.tmp"))
+
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    res = await executor.execute("write", {"filePath": "via_tool.txt", "content": "hi\n"})
+    assert res.ok is True
+    assert (tmp_path / "via_tool.txt").read_text(encoding="utf-8") == "hi\n"
+    assert len(calls) >= 2
+
+
+def test_checkpoint_rotation_keeps_newest(tmp_path: Path) -> None:
+    from rbit.storage import StorageManager
+
+    storage = StorageManager(tmp_path)
+    storage.ensure_dirs()
+    for idx in range(25):
+        storage.save_checkpoint(f"cp {idx}", {"a.txt": "x"})
+        time.sleep(0.005)
+    kept = storage.list_checkpoints()
+    assert len(kept) == StorageManager.MAX_CHECKPOINTS
+    labels = {item.label for item in kept}
+    assert "cp 24" in labels
+    assert "cp 0" not in labels
+
+
+@pytest.mark.asyncio
+async def test_read_tool_rejects_oversized_file(tmp_path: Path) -> None:
+    big = tmp_path / "big.txt"
+    big.write_text("x" * 600_000, encoding="utf-8")
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+
+    res = await executor.execute("read", {"filePath": "big.txt"})
+    assert res.ok is False
+    assert "too large" in res.summary.lower()
+
+    sliced = await executor.execute("read", {"filePath": "big.txt", "offset": 1, "limit": 3})
+    assert sliced.ok is True
+    assert sliced.output.count("\n") <= 2

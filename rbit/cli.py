@@ -51,7 +51,10 @@ async def _run_headless(args: argparse.Namespace) -> int:
         session = Session()
 
     prompt_text = " ".join(args.prompt).strip()
-    if not prompt_text and not sys.stdin.isatty():
+    if getattr(args, "stdin", False):
+        stdin_text = sys.stdin.read().strip()
+        prompt_text = (prompt_text + "\n\n" + stdin_text).strip()
+    elif not prompt_text and not sys.stdin.isatty():
         prompt_text = sys.stdin.read().strip()
 
     if not prompt_text:
@@ -519,6 +522,7 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("-c", "--continue", dest="continue_last", action="store_true", help="Continue latest session")
             p.add_argument("-s", "--session", help="Continue specific session ID")
             p.add_argument("-d", "--dir", help="Target workspace directory")
+            p.add_argument("--stdin", action="store_true", help="Read the prompt (or extra context) from stdin")
             p.add_argument("--json", action="store_true", help="Emit structured JSON output")
             parsed = p.parse_args(rest)
             return asyncio.run(_run_headless(parsed))
@@ -583,7 +587,7 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "subcommands:\n"
-            "  rbit run [prompt]      Run non-interactively in headless CLI/CI mode (--json supported)\n"
+            "  rbit run [prompt]      Run non-interactively in headless CLI/CI mode (--json, --stdin)\n"
             "  rbit doctor [dir]      Diagnose environment, LLM API, Ollama & workspace health\n"
             "  rbit stats [dir]       Show token, cost & tool analytics across sessions\n"
             "  rbit sessions [dir]    List saved sessions in workspace\n"

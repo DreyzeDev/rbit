@@ -1,4 +1,4 @@
-"""Agent tools for rbit: read, write, edit, multi_edit, glob, grep, bash, todowrite, webfetch + Checkpoints."""
+﻿"""Agent tools for rbit: read, write, edit, multi_edit, glob, grep, bash, todowrite, webfetch + Checkpoints."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -68,6 +69,32 @@ READONLY_TOOLS: frozenset[str] = frozenset(
 VIRTUAL_ATTACHMENTS: frozenset[str] = frozenset({"diff", "git", "staged", "tree"})
 
 MAX_CHECKPOINT_FILE_BYTES = 256_000
+MAX_READ_BYTES = 512_000
+MAX_CHECKPOINTS = 20
+
+_ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def strip_ansi(text: str) -> str:
+    """Removes ANSI/VT100 escape sequences so shell output cannot break TUI rendering."""
+    return _ANSI_RE.sub("", text)
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """Writes text via a temp file + os.replace so a crash never truncates the target."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    os.close(fd)
+    try:
+        Path(tmp_name).write_text(content, encoding="utf-8")
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
 
 DANGEROUS_BASH_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\brm\s+-[a-z]*r[a-z]*f?[a-z]*\s+(?:/|~|\$HOME)\s*(?:$|[;&|])", re.IGNORECASE),
@@ -371,8 +398,8 @@ class ToolExecutor:
         noun = "syntax issue" if len(issues) == 1 else "syntax issues"
         diag_block = "\n".join(f"- {item}" for item in issues)
         return (
-            f"{summary} · {len(issues)} {noun}",
-            f"{output}\n\nDiagnostics (syntax errors detected — fix immediately):\n{diag_block}",
+            f"{summary} Â· {len(issues)} {noun}",
+            f"{output}\n\nDiagnostics (syntax errors detected â€” fix immediately):\n{diag_block}",
         )
 
     # --- Undo / Redo ---
@@ -383,7 +410,7 @@ class ToolExecutor:
         target = Path(snap.path)
         if snap.existed_before:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(snap.previous_content, encoding="utf-8")
+            atomic_write_text(target, snap.previous_content)
         elif target.exists():
             target.unlink()
         self.redo_stack.append(snap)
@@ -398,7 +425,7 @@ class ToolExecutor:
         snap = self.redo_stack.pop()
         target = Path(snap.path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(snap.new_content, encoding="utf-8")
+        atomic_write_text(target, snap.new_content)
         self.undo_stack.append(snap)
         rel = self.rel_display(target)
         if self.on_files_updated:
@@ -431,7 +458,7 @@ class ToolExecutor:
         for rel, content in saved_files.items():
             full = self.workspace / rel
             full.parent.mkdir(parents=True, exist_ok=True)
-            full.write_text(content, encoding="utf-8")
+            atomic_write_text(full, content)
             restored += 1
 
         # Remove newly created text files that didn't exist at checkpoint time
@@ -542,6 +569,19 @@ class ToolExecutor:
             out = "\n".join(entries[:limit]) or "(empty directory)"
             return ToolResult(True, f"{len(entries)} entries", out)
 
+        try:
+            size = target.stat().st_size
+        except OSError:
+            size = 0
+        if size > MAX_READ_BYTES and "offset" not in args and "limit" not in args:
+            size_kb = size / 1024
+            return ToolResult(
+                False,
+                f"{rel} (too large: {size_kb:,.0f} KB)",
+                f"File is {size_kb:,.0f} KB, above the {MAX_READ_BYTES // 1024} KB read budget. "
+                "Use `grep`/`symbols` to locate what you need, or pass `offset` and `limit` to read a slice.",
+            )
+
         text = target.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
         sliced = lines[offset - 1 : offset - 1 + limit]
@@ -560,7 +600,7 @@ class ToolExecutor:
         old_content = target.read_text(encoding="utf-8", errors="replace") if existed else ""
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        atomic_write_text(target, content)
 
         self.undo_stack.append(
             FileSnapshot(
@@ -631,7 +671,7 @@ class ToolExecutor:
                     f"Found {len(spans)} whitespace-normalized matches; add context or set replaceAll=true.",
                 )
             span = spans[0]
-            notes.append("fuzzy match (whitespace normalized) — verify the diff")
+            notes.append("fuzzy match (whitespace normalized) â€” verify the diff")
         elif count > 1 and not replace_all:
             return ToolResult(
                 False,
@@ -647,7 +687,7 @@ class ToolExecutor:
                 if replace_all
                 else old_content.replace(old_str, new_str, 1)
             )
-        target.write_text(new_content, encoding="utf-8")
+        atomic_write_text(target, new_content)
 
         self.undo_stack.append(
             FileSnapshot(
@@ -691,7 +731,7 @@ class ToolExecutor:
                 return ToolResult(False, f"edit #{idx} failed", f"oldString in edit #{idx} not found.")
             updated = updated.replace(old_s, new_s) if rep_all else updated.replace(old_s, new_s, 1)
 
-        target.write_text(updated, encoding="utf-8")
+        atomic_write_text(target, updated)
         self.undo_stack.append(
             FileSnapshot(
                 step_label=f"multi_edit {rel}",
@@ -930,7 +970,7 @@ class ToolExecutor:
 
         output = out_b.decode("utf-8", errors="replace").strip() or "(no output)"
         ok = proc.returncode == 0
-        summary = f"git {action} · {len(output.splitlines())} line(s)"
+        summary = f"git {action} Â· {len(output.splitlines())} line(s)"
         return ToolResult(ok, summary, output[:6000])
 
     async def _tool_lint(self, args: dict[str, Any]) -> ToolResult:
@@ -971,7 +1011,7 @@ class ToolExecutor:
             )
 
         diag = self._tool_diagnostics(args)
-        note = "ruff/pyflakes not installed — ran built-in syntax diagnostics only (pip install ruff)."
+        note = "ruff/pyflakes not installed â€” ran built-in syntax diagnostics only (pip install ruff)."
         return ToolResult(diag.ok, f"fallback: {diag.summary}", f"{diag.output}\n\n{note}")
 
     def _tool_diagnostics(self, args: dict[str, Any]) -> ToolResult:
@@ -1029,8 +1069,8 @@ class ToolExecutor:
         lines = []
         for t in items:
             icon = {
-                "completed": "[✓]",
-                "in_progress": "[•]",
+                "completed": "[âœ“]",
+                "in_progress": "[â€¢]",
                 "cancelled": "[x]",
             }.get(t.status, "[ ]")
             lines.append(f"{icon} {t.content} ({t.priority})")
@@ -1119,6 +1159,7 @@ class ToolExecutor:
         stdout = stdout_b.decode("utf-8", errors="replace").strip()
         stderr = stderr_b.decode("utf-8", errors="replace").strip()
         combined = "\n".join(part for part in (stdout, stderr) if part) or "(no output)"
+        combined = strip_ansi(combined)
         ok = proc.returncode == 0
         return ToolResult(
             ok,
