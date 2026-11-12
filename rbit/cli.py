@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import platform
 import re
@@ -617,6 +618,23 @@ def _run_commit(workspace: Path, apply: bool = False, message: str | None = None
 
 def main(argv: list[str] | None = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
+    log_level: int | None = None
+    for flag, level in (
+        ("--quiet", logging.WARNING),
+        ("--verbose", logging.INFO),
+        ("--trace", logging.DEBUG),
+    ):
+        if flag in args_list:
+            args_list = [item for item in args_list if item != flag]
+            log_level = level
+    if log_level is not None:
+        logging.basicConfig(
+            stream=sys.stderr,
+            level=log_level,
+            format="%(levelname)s %(name)s: %(message)s",
+        )
+        logging.getLogger().setLevel(log_level)
+
     if args_list and args_list[0] == "--generate-completion":
         shell = args_list[1].lower() if len(args_list) > 1 else "bash"
         if shell not in COMPLETION_SCRIPTS:
@@ -736,7 +754,9 @@ def main(argv: list[str] | None = None) -> int:
             "  rbit lint [dir]        Lint workspace; exit code 1 on issues (--json)\n"
             "  rbit init [dir]        Create RBIT.md + .rbit/memory.md from project scan\n"
             "  rbit commit [dir]      Draft a commit message from git diff (--apply to commit)\n"
-            "  rbit --generate-completion bash|zsh|powershell   Print shell completion script"
+            "  rbit --generate-completion bash|zsh|powershell   Print shell completion script\n"
+            "\n"
+            "Global flags: --quiet (warnings only), --verbose (info), --trace (debug)"
         ),
     )
     parser.add_argument("target", nargs="?", help="Workspace directory path (defaults to current directory)")

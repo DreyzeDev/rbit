@@ -22,6 +22,7 @@ from .modals import (
     CheckpointModal,
     CommandPaletteModal,
     ConnectApiModal,
+    HelpModal,
     ModelSelectorModal,
     PermissionModal,
     SessionPickerModal,
@@ -361,6 +362,14 @@ OptionList > .option-list--option-highlighted {
     margin-top: 1;
 }
 
+.help-modal {
+    height: 82%;
+}
+
+#help-scroll {
+    height: 1fr;
+}
+
 .oc-field-label {
     color: #808080;
     margin-top: 1;
@@ -400,6 +409,7 @@ class RbitApp(App[None]):
         Binding("ctrl+n", "new_session", "New Session", show=False),
         Binding("ctrl+l", "clear_chat", "Clear", show=False),
         Binding("ctrl+y", "copy_last", "Copy", show=False),
+        Binding("f1", "show_help", "Help", show=False),
         Binding("escape", "interrupt_or_close", "Interrupt", show=False),
         Binding("ctrl+q", "quit", "Quit", show=False),
     ]
@@ -492,9 +502,8 @@ class RbitApp(App[None]):
 
     @work
     async def _discover_local_models(self) -> None:
-        found = await self.engine.refresh_ollama_models()
-        if found:
-            self._sync_ui()
+        await self.engine.refresh_ollama_models()
+        self._sync_ui()
 
     def _tick_spinner(self) -> None:
         if self.is_busy:
@@ -571,6 +580,7 @@ class RbitApp(App[None]):
             api_ok,
             checkpoints_count=cp_count,
             extra_models=self.engine.extra_models,
+            ollama_online=self.engine.ollama_online,
         )
         self.query_one(BottomStatusBar).update_bar(self.workspace, self.git_branch)
 
@@ -1195,25 +1205,10 @@ class RbitApp(App[None]):
         self._sync_ui()
 
     def _cmd_help(self) -> None:
-        help_txt = (
-            "# rbit Keybindings & Power Commands\n"
-            "  tab              Switch Build ↔ Plan agent\n"
-            "  ctrl+p / k       Open Command Palette\n"
-            "  ctrl+b           Toggle right sidebar (Context / MCP / LSP / Todo / Files)\n"
-            "  !<command>       Direct Bang Shell execution (zero LLM tokens)\n"
-            "  @filename        Fuzzy-attach project file to prompt\n"
-            "  @diff @git       Attach git diff / branch+status+log context\n"
-            "  @staged @tree    Attach staged diff / workspace file tree\n"
-            "  /checkpoint [n]  Save Git-free workspace snapshot   /rewind    Restore snapshot\n"
-            "  /remember <rule> Save persistent project memory     /export    Export session .md\n"
-            "  /retry           Re-run the last user prompt        /fork [N]  Branch session at message N\n"
-            "  /commit [yes]    Draft or confirm a Git commit      /doctor    Environment check\n"
-            "  /copy · Ctrl+Y   Copy the last answer                /models /themes  Switch model or theme\n"
-            "  /todo [task]     Todo checklist manager             /undo /redo  Revert or reapply edits\n"
-            "  /diff            Modified files summary             /help      This screen"
-        )
-        self._post_notice(help_txt)
-        self._post_notice(help_txt)
+        self.push_screen(HelpModal())
+
+    def action_show_help(self) -> None:
+        self.push_screen(HelpModal())
 
     # --- Prompt Submission, Bang Shell & Agent Execution ---
     @on(Input.Submitted, "#prompt-input")

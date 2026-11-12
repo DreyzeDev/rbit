@@ -485,6 +485,7 @@ class SidebarPanel(Vertical):
         yield Static(id="sb-context", classes="sb-block")
         yield Static(id="sb-mcp", classes="sb-block")
         yield Static(id="sb-lsp", classes="sb-block")
+        yield Static(id="sb-ollama", classes="sb-block")
         yield Static(id="sb-todo", classes="sb-block")
         yield Static(id="sb-files", classes="sb-block")
 
@@ -495,6 +496,7 @@ class SidebarPanel(Vertical):
         api_connected: bool,
         checkpoints_count: int = 0,
         extra_models: list[ModelInfo] | None = None,
+        ollama_online: bool | None = None,
     ) -> None:
         info = get_model_info(model_id, extra_models)
         used = session.total_tokens
@@ -534,6 +536,21 @@ class SidebarPanel(Vertical):
         lsp.append("python ", style="#eeeeee")
         lsp.append("Ready", style="#808080")
         self.query_one("#sb-lsp", Static).update(lsp)
+
+        # 4b. Ollama
+        local_models = [m for m in (extra_models or []) if "ollama" in m.provider.lower()]
+        ollama = Text()
+        ollama.append("Ollama\n", style="bold #eeeeee")
+        if ollama_online is False:
+            ollama.append("• ", style="bold #e06c75")
+            ollama.append("offline ", style="#eeeeee")
+            ollama.append("localhost:11434", style="#808080")
+        else:
+            ollama.append("• ", style="bold #7fd88f")
+            ollama.append("online ", style="#eeeeee")
+            count = len(local_models)
+            ollama.append(f"{count} model{'s' if count != 1 else ''}", style="#808080")
+        self.query_one("#sb-ollama", Static).update(ollama)
 
         # 5. Todo
         todo = Text()

@@ -7,9 +7,9 @@ from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, OptionList, Static
+from textual.widgets import Button, Input, Label, Markdown, OptionList, Static
 from textual.widgets.option_list import Option
 
 from .models import AVAILABLE_MODELS, CheckpointMeta, ModelInfo, Session, TodoItem, short_id
@@ -63,6 +63,61 @@ def _two_col_option(left_text: str, right_text: str = "", active_dot: bool = Fal
     rtxt = Text(right_text, style="dim")
     grid.add_row(ltxt, rtxt)
     return grid
+
+
+HELP_MARKDOWN = """
+# rbit Keybindings & Power Commands
+
+## Navigation
+- `tab` — switch Build ↔ Plan agent
+- `ctrl+p` / `ctrl+k` — command palette
+- `ctrl+b` — toggle right sidebar (Context / MCP / LSP / Ollama / Todo / Files)
+- `ctrl+m` — switch model
+- `ctrl+t` — switch theme
+- `ctrl+o` — Todo manager
+- `ctrl+n` — new session
+- `ctrl+y` — copy last answer
+- `ctrl+q` — quit
+
+## Prompt shorthands
+- `!<command>` — direct shell execution (zero LLM tokens)
+- `@filename` — fuzzy-attach project file
+- `@diff` / `@git` — attach git diff / branch+status+log
+- `@staged` / `@tree` — attach staged diff / workspace tree
+
+## Slash commands
+- `/checkpoint [n]` / `/rewind` — save or restore workspace snapshot
+- `/remember <rule>` — persistent project memory
+- `/export` / `/compact` — export session / compact context
+- `/retry` / `/fork [N]` — re-run last prompt / branch session
+- `/commit [yes]` — draft or confirm a Git commit
+- `/doctor` — environment check
+- `/copy` — copy last answer
+- `/models` / `/themes` — switch model or theme
+- `/todo [task]` — Todo checklist manager
+- `/undo` / `/redo` — revert or reapply edits
+- `/diff` — modified files summary
+- `/help` / `F1` — this screen
+"""
+
+
+class HelpModal(ModalScreen[None]):
+    """Full-screen keybindings cheat sheet (F1 / /help)."""
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("f1", "close", "Close"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="oc-modal help-modal"):
+            yield Static(_modal_header("Help & keybindings"), classes="oc-modal-header")
+            with VerticalScroll(id="help-scroll"):
+                yield Markdown(HELP_MARKDOWN, id="help-content")
+            yield Label("esc / f1 close", classes="oc-modal-foot")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
 
 
 class CommandPaletteModal(ModalScreen[str | None]):

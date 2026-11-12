@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from pathlib import Path
@@ -31,6 +32,7 @@ from .tools import (
 
 MAX_PARALLEL_TOOLS = 4
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
+logger = logging.getLogger("rbit.agent")
 
 ToolStartHook = Callable[[ToolCallRecord], Awaitable[None]]
 ToolEndHook = Callable[[ToolCallRecord], Awaitable[None]]
@@ -89,6 +91,7 @@ class AgentEngine:
         self.storage = storage or StorageManager(workspace)
         self.http_client = http_client
         self.extra_models: list[ModelInfo] = []
+        self.ollama_online: bool | None = None
         self.retry_attempts = 4
         self.retry_base_delay = 0.6
         self.retry_max_delay = 8.0
@@ -105,7 +108,20 @@ class AgentEngine:
 
     async def refresh_ollama_models(self) -> list[ModelInfo]:
         self.extra_models = await discover_ollama_models()
+        self.ollama_online = bool(self.extra_models)
         return self.extra_models
+
+    def _build_headers(self, api_key: str) -> dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://rbit.cli",
+            "X-Title": "rbit",
+        }
+        extra = (self.get_config() or {}).get("extra_headers")
+        if isinstance(extra, dict):
+            headers.update({str(k): str(v) for k, v in extra.items()})
+        return headers
 
     async def run_turn(
         self,
@@ -136,6 +152,9 @@ class AgentEngine:
         use_remote = (not model_info.is_local_smart) and (bool(api_key) or is_ollama)
 
         tool_records: list[ToolCallRecord] = []
+        logger.debug(
+            "run_turn model=%s remote=%s ollama=%s mode=%s", model_id, use_remote, is_ollama, agent_mode
+        )
         effective_base = (
             "http://localhost:11434/v1"
             if is_ollama and "openrouter.ai" in api_base
@@ -271,12 +290,7 @@ class AgentEngine:
                     text = "\n\n".join(attached_blocks) + "\n\n" + text
                 api_messages.append({"role": m.role, "content": text})
 
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://rbit.cli",
-            "X-Title": "rbit",
-        }
+        headers = self._build_headers(api_key)
 
         async def _drive_steps(client: httpx.AsyncClient) -> str:
             for step in range(10):
@@ -603,12 +617,7 @@ class AgentEngine:
         api_base: str,
         api_key: str,
     ) -> str:
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://rbit.cli",
-            "X-Title": "rbit",
-        }
+        headers = self._build_headers(api_key)
         writable = {"write", "edit", "multi_edit", "bash", "todowrite", "subagent"}
         tools = [t for t in OPENAI_TOOLS_SCHEMA if t["function"]["name"] not in writable]
         messages: list[dict[str, Any]] = [
@@ -764,12 +773,7 @@ class AgentEngine:
 
         if remote:
             base = "http://localhost:11434/v1" if is_ollama and "openrouter.ai" in api_base else api_base
-            headers = {
-                "Authorization": f"Bearer {api_key or 'ollama'}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://rbit.cli",
-                "X-Title": "rbit",
-            }
+            headers = self._build_headers(api_key or "ollama")
             payload = {
                 "model": remote_id,
                 "messages": [
@@ -850,12 +854,7 @@ class AgentEngine:
         remote = (not info.is_local_smart) and (bool(api_key) or is_ollama)
         if remote:
             base = "http://localhost:11434/v1" if is_ollama and "openrouter.ai" in api_base else api_base
-            headers = {
-                "Authorization": f"Bearer {api_key or 'ollama'}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://rbit.cli",
-                "X-Title": "rbit",
-            }
+            headers = self._build_headers(api_key or "ollama")
             payload = {
                 "model": remote_id,
                 "messages": [

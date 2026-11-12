@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import sys
 import time
@@ -17,7 +18,8 @@ import pytest
 from rbit.agent import AgentEngine, MAX_PARALLEL_TOOLS
 from rbit.app import RbitApp
 from rbit.cli import main as cli_main
-from rbit.models import ChatMessage, Session, ToolCallRecord, short_id
+from rbit.modals import HelpModal
+from rbit.models import ChatMessage, ModelInfo, Session, ToolCallRecord, short_id
 from rbit.tools import ToolExecutor, ToolResult, is_secret_file, redact_secrets
 from rbit.widgets import (
     AgentModeBadge,
@@ -1337,3 +1339,99 @@ def test_generate_completion_scripts(capsys: pytest.CaptureFixture[str]) -> None
         assert "rbit" in out
         assert len(out) > 20
     assert cli_main(["--generate-completion", "tcsh"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_f1_and_slash_help_open_modal(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        await pilot.press("f1")
+        await pilot.pause()
+        assert isinstance(app.screen, HelpModal)
+        help_text = str(app.screen.query_one("#help-content").source)
+        assert "Keybindings" in help_text
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, HelpModal)
+
+        inp = app.query_one("#prompt-input")
+        inp.focus()
+        inp.value = "/help"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, HelpModal)
+
+
+@pytest.mark.asyncio
+async def test_sidebar_ollama_indicator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from textual.widgets import Static
+
+    async def fake_discover(models: list[ModelInfo] | None = None, **kwargs: Any) -> list[ModelInfo]:
+        return models or []
+
+    monkeypatch.setattr(
+        "rbit.agent.discover_ollama_models",
+        lambda: fake_discover(
+            [
+                ModelInfo(
+                    id="ollama/llama3",
+                    name="llama3 (Local)",
+                    provider="Ollama Local",
+                    context_window=8192,
+                    cost_per_1k=0.0,
+                )
+            ]
+        ),
+    )
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        text = str(app.query_one("#sb-ollama", Static).render())
+        assert "Ollama" in text
+        assert "online" in text
+        assert "1 model" in text
+
+    monkeypatch.setattr("rbit.agent.discover_ollama_models", lambda: fake_discover([]))
+    offline = RbitApp(workspace=tmp_path)
+    offline.config_data["sidebar_visible"] = True
+    offline.session.messages = [ChatMessage(id=short_id(), role="assistant", content="hi")]
+    async with offline.run_test(size=(130, 40)) as pilot:
+        await offline.workers.wait_for_complete()
+        await pilot.pause()
+        text = str(offline.query_one("#sb-ollama", Static).render())
+        assert "offline" in text
+
+
+def test_custom_extra_headers_are_merged(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    engine = AgentEngine(
+        workspace=tmp_path,
+        executor=executor,
+        get_config=lambda: {"extra_headers": {"X-Org": "acme", "X-Title": "override"}},
+    )
+    headers = engine._build_headers("secret")
+    assert headers["Authorization"] == "Bearer secret"
+    assert headers["X-Org"] == "acme"
+    assert headers["X-Title"] == "override"
+    assert headers["Content-Type"] == "application/json"
+
+
+def test_cli_logging_flags(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    assert cli_main(["lint", str(tmp_path), "--quiet"]) == 0
+    assert logging.getLogger().level == logging.WARNING
+    capsys.readouterr()
+
+    assert cli_main(["lint", str(tmp_path), "--trace"]) == 0
+    assert logging.getLogger().level == logging.DEBUG
+
+
+def test_pre_commit_config_present() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = (root / ".pre-commit-config.yaml").read_text(encoding="utf-8")
+    assert "ruff" in config
+    assert "pytest" in config
+    assert "mixed-line-ending" in config
+    assert "end-of-file-fixer" in config

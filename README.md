@@ -6,7 +6,7 @@
 [![Textual](https://img.shields.io/badge/TUI-Textual%208.x-fab283?style=flat-square)](https://textual.textualize.io/)
 [![License](https://img.shields.io/badge/License-MIT-7fd88f?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-5c9cf5?style=flat-square)](#)
-[![Tests](https://img.shields.io/badge/tests-pytest%2039%20passing-7fd88f?style=flat-square)](tests/test_app.py)
+[![Tests](https://img.shields.io/badge/tests-pytest%2044%20passing-7fd88f?style=flat-square)](tests/test_app.py)
 [![CI](https://github.com/DreyzeDev/rbit/actions/workflows/ci.yml/badge.svg)](https://github.com/DreyzeDev/rbit/actions/workflows/ci.yml)
 
 **Автономный полноэкранный AI-агент для терминала** — редактирует код, ищет по проекту, выполняет команды, хранит память проекта и откатывает время без Git.
@@ -44,7 +44,7 @@
 | **Чекпоинты без Git** | `/checkpoint [имя]` — снимок всего проекта в `.rbit/checkpoints/`, `/rewind` — машина времени в любой момент, даже вне репозитория |
 | **Память проекта** | `RBIT.md` + `/remember <правило>` — знания автоматически попадают в системный промпт каждой сессии |
 | **Real-time Streaming** | Настоящий SSE-стриминг ответов OpenAI-совместимого API в реальном времени, с повторами на 429/5xx и экспоненциальным backoff |
-| **Модели** | OpenRouter / OpenAI / DeepSeek / любой OpenAI-compatible endpoint + автообнаружение локальной **Ollama** (`Ctrl+M`); при 401/404 автоматический fallback на `rbit/smart-local` |
+| **Модели** | OpenRouter / OpenAI / DeepSeek / любой OpenAI-compatible endpoint + автообнаружение локальной **Ollama** (`Ctrl+M`); кастомные заголовки (`extra_headers`); при 401/404 автоматический fallback на `rbit/smart-local` |
 | **Инструменты** | `read`, `write`, `edit` (fuzzy fallback), `multi_edit` (атомарно), `glob`, `grep` (контекст, `-l`, лимиты), `symbols` (AST/JS/MD), `git` (status/diff/log/show/blame), `diagnostics`, `lint` (ruff), `webfetch`, `bash`, `todowrite`, `subagent(explore)` + undo/redo стек; `.gitignore` уважается |
 | **Виртуальные аттачи** | `@diff`, `@staged`, `@git`, `@tree` — git-diff, staged-изменения, состояние ветки и дерево проекта попадают в контекст без чтения файлов |
 | **Команды проекта** | Свои слэш-команды из `.rbit/commands/*.md` с подстановкой `{args}` и автодополнением в палитре |
@@ -104,6 +104,7 @@ rbit                                  # TUI по умолчанию
 | `Ctrl+B` | Показать/скрыть сайдбар |
 | `Ctrl+N` | Новая сессия |
 | `Ctrl+Y` | Скопировать последний ответ |
+| `F1` | Шпаргалка по клавишам и командам |
 | `!` + строка | Мгновенный шелл (без токенов) |
 | `Esc` | Прервать агента |
 | `Ctrl+Q` | Выход |
@@ -190,6 +191,7 @@ rbit/
 - [x] `symbols`, read-only `git`, `/copy`, `rbit init`, `sessions --prune`
 - [x] Fallback на smart-local, `run --stdin`, атомарная запись, лимиты чтения и чекпоинтов, ANSI-санитайз
 - [x] Компактный режим (<100 колонок), тема high contrast, `rbit commit`, JSONL-поток, shell completion
+- [x] Индикатор Ollama в сайдбаре, экран помощи `F1`, флаги `--quiet/--verbose/--trace`, pre-commit
 - [ ] `apply_patch`, фоновый `bash`, session search
 
 ## Лицензия
