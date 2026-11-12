@@ -351,3 +351,110 @@ async def test_mixed_tool_calls_preserve_write_barrier(tmp_path: Path) -> None:
     assert "Wrote a.txt" in tool_msgs["c3"]
     assert "1: v2" in tool_msgs["c4"]
 
+
+@pytest.mark.asyncio
+async def test_auto_diagnostics_on_write_edit_and_self_heal_turn(tmp_path: Path) -> None:
+    session = Session()
+    executor = ToolExecutor(workspace=tmp_path, session=session)
+
+    # 1. Broken Python triggers auto-diagnostics in write, edit fixes it cleanly
+    bad_py = await executor.execute("write", {"filePath": "broken.py", "content": "def calc(x, y)\n    return x + y\n"})
+    assert bad_py.ok is True
+    assert "1 syntax issue" in bad_py.summary
+    assert "Diagnostics" in bad_py.output
+    assert "SyntaxError" in bad_py.output
+
+    fixed_py = await executor.execute(
+        "edit",
+        {"filePath": "broken.py", "oldString": "def calc(x, y)", "newString": "def calc(x, y):"},
+    )
+    assert fixed_py.ok is True
+    assert "syntax issue" not in fixed_py.summary
+    assert "Diagnostics" not in fixed_py.output
+
+    # 2. Broken JSON & TOML & explicit `diagnostics` tool on workspace
+    bad_json = await executor.execute("write", {"filePath": "cfg.json", "content": '{"port": }\n'})
+    assert "JSONDecodeError" in bad_json.output
+
+    bad_toml = await executor.execute("write", {"filePath": "cfg.toml", "content": "[server\nport = 80\n"})
+    assert "TOMLDecodeError" in bad_toml.output
+
+    ws_diag = await executor.execute("diagnostics", {"filePath": "."})
+    assert ws_diag.ok is True
+    assert "2 issues" in ws_diag.summary
+    assert "cfg.json" in ws_diag.output
+    assert "cfg.toml" in ws_diag.output
+
+    # 3. Full agent self-heal loop: step 1 writes broken Python -> receives Diagnostics -> step 2 edits & fixes
+    await executor.execute("write", {"filePath": "cfg.json", "content": '{"port": 8080}\n'})
+    await executor.execute("write", {"filePath": "cfg.toml", "content": "[server]\nport = 80\n"})
+
+    captured_requests: list[dict[str, Any]] = []
+    step = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal step
+        body = json.loads(request.content.decode("utf-8"))
+        captured_requests.append(body)
+        step += 1
+        if step == 1:
+            tcs = [
+                {
+                    "id": "w1",
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": json.dumps({"filePath": "app.py", "content": "def greet(\n    return 'hi'\n"}),
+                    },
+                }
+            ]
+            return httpx.Response(200, json={"choices": [{"message": {"content": "", "tool_calls": tcs}}]})
+        if step == 2:
+            tcs = [
+                {
+                    "id": "e1",
+                    "type": "function",
+                    "function": {
+                        "name": "edit",
+                        "arguments": json.dumps(
+                            {"filePath": "app.py", "oldString": "def greet(", "newString": "def greet():"}
+                        ),
+                    },
+                }
+            ]
+            return httpx.Response(200, json={"choices": [{"message": {"content": "", "tool_calls": tcs}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Исправил синтаксис в том же ходе."}}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as mock_client:
+        engine = AgentEngine(
+            workspace=tmp_path,
+            executor=executor,
+            get_config=lambda: {"api_key": "test-key", "api_base": "https://mock.local/v1"},
+            http_client=mock_client,
+        )
+        user_msg = ChatMessage(id=short_id(), role="user", content="напиши app.py")
+        session.messages.append(user_msg)
+
+        async def _noop_rec(_rec: ToolCallRecord) -> None:
+            return
+
+        async def _noop_status(_s: str) -> None:
+            return
+
+        reply = await engine.run_turn(
+            session=session,
+            user_msg=user_msg,
+            agent_mode="build",
+            model_id="openai/gpt-4.1",
+            on_tool_start=_noop_rec,
+            on_tool_end=_noop_rec,
+            on_status=_noop_status,
+        )
+
+    assert reply.content == "Исправил синтаксис в том же ходе."
+    step2_tool_msg = [m for m in captured_requests[1]["messages"] if m["role"] == "tool"][0]
+    assert "Diagnostics" in step2_tool_msg["content"]
+    assert "SyntaxError" in step2_tool_msg["content"]
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "def greet():\n    return 'hi'\n"
+
+

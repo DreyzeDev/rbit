@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import difflib
 import html
+import json
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - Python < 3.11
+    tomllib = None  # type: ignore[assignment]
 
 import httpx
 
@@ -51,7 +59,7 @@ READONLY_BASH_PREFIXES = (
     "pytest",
 )
 
-READONLY_TOOLS: frozenset[str] = frozenset({"read", "glob", "grep", "webfetch"})
+READONLY_TOOLS: frozenset[str] = frozenset({"read", "glob", "grep", "webfetch", "diagnostics"})
 
 MAX_CHECKPOINT_FILE_BYTES = 256_000
 
@@ -137,6 +145,56 @@ class ToolExecutor:
             stat.removed = int(stat.removed) + removed
         if self.on_files_updated:
             self.on_files_updated()
+
+    @staticmethod
+    def diagnose_content(rel_path: str, content: str) -> list[str]:
+        """Fast in-process syntax check for Python, JSON, TOML, and XML/SVG files."""
+        ext = Path(rel_path).suffix.lower()
+        issues: list[str] = []
+
+        if ext in (".py", ".pyi", ".pyw"):
+            try:
+                ast.parse(content, filename=rel_path)
+            except SyntaxError as err:
+                line = err.lineno or 1
+                col = err.offset or 1
+                snippet = f" -> `{err.text.strip()}`" if err.text and err.text.strip() else ""
+                issues.append(f"{rel_path}:{line}:{col}: {type(err).__name__}: {err.msg}{snippet}")
+        elif ext == ".json":
+            try:
+                json.loads(content)
+            except json.JSONDecodeError as err:
+                issues.append(f"{rel_path}:{err.lineno}:{err.colno}: JSONDecodeError: {err.msg}")
+        elif ext == ".toml" and tomllib is not None:
+            try:
+                tomllib.loads(content)
+            except Exception as err:
+                issues.append(f"{rel_path}: TOMLDecodeError: {err}")
+        elif ext in (".xml", ".svg", ".xhtml"):
+            try:
+                ET.fromstring(content)
+            except ET.ParseError as err:
+                line, col = getattr(err, "position", (1, 1))
+                issues.append(f"{rel_path}:{line}:{col}: XMLParseError: {err}")
+
+        return issues
+
+    def _attach_diagnostics(
+        self,
+        summary: str,
+        output: str,
+        rel_path: str,
+        content: str,
+    ) -> tuple[str, str]:
+        issues = self.diagnose_content(rel_path, content)
+        if not issues:
+            return summary, output
+        noun = "syntax issue" if len(issues) == 1 else "syntax issues"
+        diag_block = "\n".join(f"- {item}" for item in issues)
+        return (
+            f"{summary} · {len(issues)} {noun}",
+            f"{output}\n\nDiagnostics (syntax errors detected — fix immediately):\n{diag_block}",
+        )
 
     # --- Undo / Redo ---
     def undo_last(self) -> str:
@@ -244,6 +302,8 @@ class ToolExecutor:
                 res = await asyncio.to_thread(self._tool_glob, args)
             elif name == "grep":
                 res = await asyncio.to_thread(self._tool_grep, args)
+            elif name == "diagnostics":
+                res = await asyncio.to_thread(self._tool_diagnostics, args)
             elif name == "todowrite":
                 res = self._tool_todowrite(args)
             elif name == "webfetch":
@@ -311,12 +371,13 @@ class ToolExecutor:
 
         diff, added, removed = self._compute_diff(old_content, content, rel)
         self._record_file_change(rel, added, removed)
-        return ToolResult(
-            True,
+        summary, output = self._attach_diagnostics(
             f"(+{added} -{removed})",
             f"Wrote {rel} (+{added} -{removed} lines)",
-            diff=diff,
+            rel,
+            content,
         )
+        return ToolResult(True, summary, output, diff=diff)
 
     def _tool_edit(self, args: dict[str, Any]) -> ToolResult:
         raw = args.get("filePath") or args.get("path")
@@ -362,12 +423,13 @@ class ToolExecutor:
 
         diff, added, removed = self._compute_diff(old_content, new_content, rel)
         self._record_file_change(rel, added, removed)
-        return ToolResult(
-            True,
+        summary, output = self._attach_diagnostics(
             f"(+{added} -{removed})",
             f"Edited {rel} (+{added} -{removed} lines)",
-            diff=diff,
+            rel,
+            new_content,
         )
+        return ToolResult(True, summary, output, diff=diff)
 
     def _tool_multi_edit(self, args: dict[str, Any]) -> ToolResult:
         raw = args.get("filePath") or args.get("path")
@@ -403,12 +465,13 @@ class ToolExecutor:
 
         diff, added, removed = self._compute_diff(original, updated, rel)
         self._record_file_change(rel, added, removed)
-        return ToolResult(
-            True,
+        summary, output = self._attach_diagnostics(
             f"{len(edits)} edits (+{added} -{removed})",
             f"Applied {len(edits)} edits to {rel} (+{added} -{removed})",
-            diff=diff,
+            rel,
+            updated,
         )
+        return ToolResult(True, summary, output, diff=diff)
 
     def _tool_glob(self, args: dict[str, Any]) -> ToolResult:
         pattern = str(args.get("pattern", "*"))
@@ -448,6 +511,40 @@ class ToolExecutor:
                 break
         out = "\n".join(hits) if hits else "No matches found."
         return ToolResult(True, f"{len(hits)} matches", out)
+
+    def _tool_diagnostics(self, args: dict[str, Any]) -> ToolResult:
+        raw = str(args.get("filePath") or args.get("path") or ".").strip()
+        target = self.resolve_path(raw)
+        if not target.exists():
+            rel = self.rel_display(target)
+            return ToolResult(False, f"{rel} not found", f"Path not found: {rel}")
+
+        targets: list[Path]
+        if target.is_file():
+            targets = [target]
+        else:
+            targets = [self.workspace / rel for rel in self.list_workspace_files(limit=300)]
+
+        all_issues: list[str] = []
+        checked = 0
+        for fpath in targets:
+            rel = self.rel_display(fpath)
+            if fpath.suffix.lower() not in (".py", ".pyi", ".pyw", ".json", ".toml", ".xml", ".svg", ".xhtml"):
+                continue
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            checked += 1
+            all_issues.extend(self.diagnose_content(rel, content))
+
+        if not all_issues:
+            return ToolResult(True, f"0 issues ({checked} checked)", f"No syntax issues in {checked} file(s).")
+        return ToolResult(
+            True,
+            f"{len(all_issues)} issues ({checked} checked)",
+            "\n".join(f"- {item}" for item in all_issues),
+        )
 
     def _tool_todowrite(self, args: dict[str, Any]) -> ToolResult:
         raw_todos = args.get("todos", [])
@@ -658,6 +755,19 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                     "include": {"type": "string"},
                 },
                 "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "diagnostics",
+            "description": "Run syntax diagnostics on a file or directory (.py, .json, .toml, .xml, .svg).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string"},
+                },
             },
         },
     },
