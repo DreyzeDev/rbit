@@ -88,6 +88,7 @@ class ChatMessage:
     timestamp: str = field(default_factory=now_iso)
     tokens: int = 0
     duration_s: float = 0.0
+    interrupted: bool = False
     attachments: list[str] = field(default_factory=list)
     tool_calls: list[ToolCallRecord] = field(default_factory=list)
 
@@ -106,6 +107,7 @@ class ChatMessage:
             timestamp=data.get("timestamp", now_iso()),
             tokens=data.get("tokens", 0),
             duration_s=data.get("duration_s", 0.0),
+            interrupted=data.get("interrupted", False),
             attachments=data.get("attachments", []),
             tool_calls=tcs,
         )

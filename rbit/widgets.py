@@ -11,7 +11,8 @@ from rich.table import Table
 from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
-from textual.containers import Vertical
+from textual.binding import Binding
+from textual.containers import Vertical, VerticalScroll
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Markdown, OptionList, Static
@@ -318,6 +319,9 @@ def _render_unified_diff(diff_text: str) -> Text:
 class ToolCallCard(Static):
     """Inline tool call renderer (→ Read, ✱ Glob/Grep, ↗ WebFetch, ← Write/Edit/MultiEdit + diff, $ Bash, # Todos)."""
 
+    can_focus = True
+    BINDINGS = [Binding("enter", "toggle_expanded", "Expand / collapse", show=False)]
+
     expanded: reactive[bool] = reactive(False)
 
     class StopRequested(Message):
@@ -333,6 +337,9 @@ class ToolCallCard(Static):
         self.stop_state = "running" if record.pid else ""
         if record.diff or record.name in ("todowrite", "bash"):
             self.expanded = True
+
+    def action_toggle_expanded(self) -> None:
+        self.expanded = not self.expanded
 
     def update_record(self, record: ToolCallRecord) -> None:
         self.record = record
@@ -351,6 +358,7 @@ class ToolCallCard(Static):
         if self.record.pid and self.stop_state == "running":
             self.post_message(self.StopRequested(self.record.pid))
             return
+        self.focus()
         self.expanded = not self.expanded
 
     def render(self) -> Group:
@@ -492,6 +500,8 @@ class AssistantMessageCard(Vertical):
         meta.append("▣ ", style=f"bold {agent_accent(self.msg.agent)}")
         suffix = f" · {self.msg.duration_s:.1f}s" if self.msg.duration_s > 0 else " · streaming..."
         meta.append(f"{self.msg.agent.capitalize()} · {info.name}{suffix}", style="#808080")
+        if self.msg.interrupted:
+            meta.append(" · interrupted", style="italic #e5c07b")
         return meta
 
     async def update_stream(self, new_markdown: str) -> None:
@@ -503,6 +513,21 @@ class AssistantMessageCard(Vertical):
         self.msg = final_msg
         await self.query_one(Markdown).update(final_msg.content)
         self.query_one(".assistant-meta", Static).update(self._build_meta_text())
+
+
+class ChatScroll(VerticalScroll):
+    """Chat log that follows new output only while the user sits at the bottom."""
+
+    stuck_to_bottom: bool = True
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        max_y = self.max_scroll_y
+        self.stuck_to_bottom = new_value >= max(0.0, max_y - 4)
+
+    def follow_end(self) -> None:
+        if self.stuck_to_bottom:
+            self.scroll_end(animate=False)
 
 
 class SidebarPanel(Vertical):

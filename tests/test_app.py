@@ -27,14 +27,23 @@ from rbit.modals import (
     SearchResultsModal,
 )
 from rbit.models import ChatMessage, ModelInfo, Session, ToolCallRecord, search_session, short_id
-from rbit.tools import ToolExecutor, ToolResult, is_secret_file, redact_secrets
+from rbit.tools import (
+    PathOutsideWorkspace,
+    ToolExecutor,
+    ToolResult,
+    is_secret_file,
+    redact_secrets,
+)
 from rbit.widgets import (
     AgentModeBadge,
+    AssistantMessageCard,
     AutocompletePopup,
+    ChatScroll,
     HomeLogo,
     HomeTipBanner,
     SessionHeaderBar,
     SidebarPanel,
+    ToolCallCard as ToolCardWidget,
 )
 
 
@@ -2001,3 +2010,125 @@ async def test_agent_todowrite_syncs_sidebar_without_modal(tmp_path: Path) -> No
         assert app.query_one(SidebarPanel).display is True
         todo_text = str(app.query_one("#sb-todo", Static).render())
         assert "ship batch 9" in todo_text
+
+
+@pytest.mark.asyncio
+async def test_paths_outside_workspace_are_rejected(tmp_path: Path) -> None:
+    outside = tmp_path / "rbit-outside-target.txt"
+    executor = ToolExecutor(workspace=tmp_path / "ws", session=Session())
+    (tmp_path / "ws").mkdir()
+
+    with pytest.raises(PathOutsideWorkspace):
+        executor.resolve_path("../rbit-outside-target.txt")
+
+    blocked = await executor.execute("write", {"filePath": "../rbit-outside-target.txt", "content": "x"})
+    assert blocked.ok is False
+    assert "outside workspace" in blocked.summary
+    assert not outside.exists()
+
+    absolute = await executor.execute("read", {"filePath": str(outside)})
+    assert absolute.ok is False
+    assert "outside workspace" in absolute.summary
+
+    inside = await executor.execute("write", {"filePath": "ok.txt", "content": "hi\n"})
+    assert inside.ok is True
+
+    executor.allow_outside_paths = True
+    allowed = await executor.execute("write", {"filePath": "../rbit-outside-target.txt", "content": "yes\n"})
+    assert allowed.ok is True, allowed
+    assert outside.exists(), (str(outside), allowed.summary)
+    assert outside.read_text(encoding="utf-8") == "yes\n"
+    outside.unlink()
+
+    cfg_executor = ToolExecutor(
+        workspace=tmp_path / "ws",
+        session=Session(),
+        get_config=lambda: {"allow_outside_paths": True},
+    )
+    assert cfg_executor.resolve_path("../rbit-outside-target.txt").name == "rbit-outside-target.txt"
+
+
+@pytest.mark.asyncio
+async def test_escape_saves_partial_answer_as_interrupted(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        await pilot.pause()
+        app.is_busy = True
+        partial = ChatMessage(id="partial-1", role="assistant", content="Half an answer", agent="build")
+        app._live_card = AssistantMessageCard(partial, [])
+        app.query_one("#chat-scroll", ChatScroll).mount(app._live_card)
+        await pilot.pause()
+
+        app.action_interrupt_or_close()
+        await pilot.pause()
+
+        saved = next((m for m in app.session.messages if m.id == "partial-1"), None)
+        assert saved is not None
+        assert saved.interrupted is True
+        assert saved.content == "Half an answer"
+        assert app.is_busy is False
+        assert app._live_card is None
+
+
+@pytest.mark.asyncio
+async def test_enter_expands_card_and_ctrl_e_collapses(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        await pilot.pause()
+        rec = ToolCallRecord(
+            id="c1", name="read", arguments={"filePath": "a.py"}, status="success", summary="1 lines", output="x"
+        )
+        card = ToolCardWidget(rec)
+        app.query_one("#chat-scroll", ChatScroll).mount(card)
+        await pilot.pause()
+        assert card.expanded is False
+
+        card.focus()
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert card.expanded is True
+
+        app.action_collapse_all_cards()
+        await pilot.pause()
+        assert card.expanded is False
+
+
+@pytest.mark.asyncio
+async def test_sticky_scroll_stops_following_when_scrolled_up(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(120, 20)) as pilot:
+        await pilot.pause()
+        app.session.messages = [ChatMessage(id=f"m{i}", role="user", content=f"line {i}") for i in range(40)]
+        app.executor.session = app.session
+        app._rebuild_chat_view()
+        app._sync_ui()
+        await pilot.pause()
+        await pilot.pause()
+
+        scroll = app.query_one("#chat-scroll", ChatScroll)
+        assert scroll.max_scroll_y > 0
+        assert scroll.stuck_to_bottom is True
+        scroll.scroll_home(animate=False)
+        await pilot.pause()
+        assert scroll.stuck_to_bottom is False
+
+        before = scroll.scroll_y
+        app._smart_scroll_end()
+        await pilot.pause()
+        assert scroll.scroll_y == before
+
+
+@pytest.mark.asyncio
+async def test_session_save_is_debounced(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        await pilot.pause()
+        app.session.title = "debounced session"
+        app._schedule_save_session(delay=0.05)
+        assert app._save_timer is not None
+        await asyncio.sleep(0.25)
+        await pilot.pause()
+        assert app._save_timer is None
+        stored = [s for s in app.storage.list_sessions() if s.id == app.session.id]
+        assert stored and stored[0].title == "debounced session"

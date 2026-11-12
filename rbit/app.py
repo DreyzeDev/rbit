@@ -13,7 +13,8 @@ from pathlib import Path
 from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical
+from textual.timer import Timer
 from textual.widgets import Input, OptionList, Static
 
 from . import __version__
@@ -48,6 +49,7 @@ from .widgets import (
     AssistantMessageCard,
     AutocompletePopup,
     BottomStatusBar,
+    ChatScroll,
     HomeLogo,
     HomeTipBanner,
     PromptModelLabel,
@@ -413,6 +415,7 @@ class RbitApp(App[None]):
         Binding("ctrl+y", "copy_last", "Copy", show=False),
         Binding("ctrl+f", "search_session", "Search", show=False),
         Binding("ctrl+x", "stop_background", "Stop background", show=False),
+        Binding("ctrl+e", "collapse_all_cards", "Collapse cards", show=False),
         Binding("f1", "show_help", "Help", show=False),
         Binding("escape", "interrupt_or_close", "Interrupt", show=False),
         Binding("ctrl+q", "quit", "Quit", show=False),
@@ -426,6 +429,7 @@ class RbitApp(App[None]):
         initial_agent: str = "build",
         initial_model: str | None = None,
         initial_effort: str | None = None,
+        allow_outside_paths: bool = False,
     ) -> None:
         super().__init__()
         self.workspace = (workspace or Path.cwd()).resolve()
@@ -448,6 +452,8 @@ class RbitApp(App[None]):
         self._has_inline_notices: bool = False
         self._sidebar_override_on_home: bool = False
         self._tool_widgets: dict[str, ToolCallCard] = {}
+        self._save_timer: Timer | None = None
+        self._live_card: AssistantMessageCard | None = None
 
         self.executor = ToolExecutor(
             workspace=self.workspace,
@@ -458,6 +464,8 @@ class RbitApp(App[None]):
             on_todos_updated=self._on_todos_updated,
             on_files_updated=self._on_files_updated,
         )
+        if allow_outside_paths:
+            self.executor.allow_outside_paths = True
         self.engine = AgentEngine(
             workspace=self.workspace,
             executor=self.executor,
@@ -471,7 +479,7 @@ class RbitApp(App[None]):
             with Vertical(id="center-stage", classes="is-home"):
                 yield HomeLogo()
                 yield SessionHeaderBar()
-                yield VerticalScroll(id="chat-scroll")
+                yield ChatScroll(id="chat-scroll")
                 with Vertical(id="prompt-outer"):
                     yield AutocompletePopup()
                     with Vertical(id="prompt-box", classes="mode-build"):
@@ -508,6 +516,13 @@ class RbitApp(App[None]):
 
         if self.initial_prompt:
             self.set_timer(0.15, lambda: self._submit_prompt(self.initial_prompt or ""))
+
+    def on_unmount(self) -> None:
+        if self._save_timer is None:
+            return
+        self._save_timer.stop()
+        self._save_timer = None
+        self._flush_save_session()
 
     @work
     async def _discover_models(self, force: bool = False) -> None:
@@ -553,7 +568,7 @@ class RbitApp(App[None]):
         logo = self.query_one(HomeLogo)
         tip = self.query_one(HomeTipBanner)
         header = self.query_one(SessionHeaderBar)
-        scroll = self.query_one("#chat-scroll", VerticalScroll)
+        scroll = self.query_one("#chat-scroll", ChatScroll)
         sidebar = self.query_one(SidebarPanel)
 
         if self._is_home_state:
@@ -710,6 +725,7 @@ class RbitApp(App[None]):
             return
         if self.is_busy:
             self.workers.cancel_all()
+            self._finalize_interrupted()
             self.is_busy = False
             self.busy_status = ""
             self._post_notice("Interrupted by user (esc).")
@@ -951,7 +967,7 @@ class RbitApp(App[None]):
         for idx, m in enumerate(self.session.messages):
             if m.id != message_id:
                 continue
-            for card in self.query_one("#chat-scroll", VerticalScroll).children:
+            for card in self.query_one("#chat-scroll", ChatScroll).children:
                 target = getattr(card, "msg", None)
                 if target is not None and getattr(target, "id", None) == message_id:
                     card.scroll_visible(animate=False)
@@ -1000,7 +1016,7 @@ class RbitApp(App[None]):
         self._sync_ui()
 
     def _rebuild_chat_view(self) -> None:
-        scroll = self.query_one("#chat-scroll", VerticalScroll)
+        scroll = self.query_one("#chat-scroll", ChatScroll)
         scroll.remove_children()
         self._tool_widgets.clear()
         for m in self.session.messages:
@@ -1015,9 +1031,47 @@ class RbitApp(App[None]):
     def _post_notice(self, text: str) -> None:
         self._has_inline_notices = True
         self._update_layout_mode()
-        scroll = self.query_one("#chat-scroll", VerticalScroll)
+        scroll = self.query_one("#chat-scroll", ChatScroll)
         scroll.mount(Static(text, classes="system-notice"))
-        scroll.scroll_end(animate=False)
+        self._smart_scroll_end()
+
+    def _smart_scroll_end(self) -> None:
+        """Follows new output only while the user is already at the bottom."""
+        self.query_one("#chat-scroll", ChatScroll).follow_end()
+
+    def _finalize_interrupted(self) -> None:
+        """Persists the partial streamed answer with an `interrupted` marker."""
+        card = self._live_card
+        self._live_card = None
+        if card is None or not card.msg.content.strip():
+            return
+        pending = card.msg
+        pending.interrupted = True
+        pending.duration_s = max(pending.duration_s, 0.0)
+        self.session.messages.append(pending)
+        self._schedule_save_session()
+
+    def _schedule_save_session(self, delay: float = 1.2) -> None:
+        """Debounces session writes so streaming chunks do not rewrite disk constantly."""
+        if self._save_timer is not None:
+            self._save_timer.stop()
+        self._save_timer = self.set_timer(max(0.01, delay), self._flush_save_session)
+
+    def _flush_save_session(self) -> None:
+        self._save_timer = None
+        try:
+            self.storage.save_session(self.session)
+        except Exception:
+            pass
+
+    def action_collapse_all_cards(self) -> None:
+        scroll = self.query_one("#chat-scroll", ChatScroll)
+        collapsed = 0
+        for card in scroll.query(ToolCallCard):
+            if card.expanded:
+                card.expanded = False
+                collapsed += 1
+        self.notify(f"Collapsed {collapsed} tool card{'s' if collapsed != 1 else ''}.", timeout=2.0)
 
     # --- Slash Command Router ---
     def _handle_slash_command(self, raw: str) -> bool:
@@ -1385,7 +1439,7 @@ class RbitApp(App[None]):
         self.busy_status = f"Running ! {cmd_str}"
         self._sync_ui()
 
-        scroll = self.query_one("#chat-scroll", VerticalScroll)
+        scroll = self.query_one("#chat-scroll", ChatScroll)
         rec = ToolCallRecord(
             id=short_id(),
             name="bash",
@@ -1416,11 +1470,16 @@ class RbitApp(App[None]):
             return
 
         attachments = re.findall(r"@([^\s]+)", raw_text)
-        valid_attachments = [
-            rel
-            for rel in attachments
-            if rel in VIRTUAL_ATTACHMENTS or self.executor.resolve_path(rel).exists()
-        ]
+        valid_attachments = []
+        for rel in attachments:
+            if rel in VIRTUAL_ATTACHMENTS:
+                valid_attachments.append(rel)
+                continue
+            try:
+                if self.executor.resolve_path(rel).exists():
+                    valid_attachments.append(rel)
+            except ValueError:
+                continue
 
         if len(self.session.messages) == 0 and self.session.title in ("New Session", "Новая сессия"):
             self.session.title = raw_text[:44]
@@ -1439,7 +1498,7 @@ class RbitApp(App[None]):
         self.busy_status = "Thinking..."
         self._sync_ui()
 
-        scroll = self.query_one("#chat-scroll", VerticalScroll)
+        scroll = self.query_one("#chat-scroll", ChatScroll)
         scroll.mount(UserMessageCard(user_msg))
         scroll.scroll_end(animate=False)
 
@@ -1447,30 +1506,28 @@ class RbitApp(App[None]):
 
     @work(exclusive=True)
     async def _execute_agent_turn(self, user_msg: ChatMessage) -> None:
-        scroll = self.query_one("#chat-scroll", VerticalScroll)
+        scroll = self.query_one("#chat-scroll", ChatScroll)
         model_id = self.config_data.get("model", "rbit/smart-local")
-        live_card: AssistantMessageCard | None = None
 
         async def on_tool_start(rec: ToolCallRecord) -> None:
             card = ToolCallCard(rec)
             self._tool_widgets[rec.id] = card
             scroll.mount(card)
-            scroll.scroll_end(animate=False)
+            self._smart_scroll_end()
 
         async def on_tool_end(rec: ToolCallRecord) -> None:
             card = self._tool_widgets.get(rec.id)
             if card is not None:
                 card.update_record(rec)
             self._sync_ui()
-            scroll.scroll_end(animate=False)
+            self._smart_scroll_end()
 
         async def on_status(status_text: str) -> None:
             self.busy_status = status_text
             self._sync_ui()
 
         async def on_stream_chunk(partial_md: str) -> None:
-            nonlocal live_card
-            if live_card is None:
+            if self._live_card is None:
                 draft = ChatMessage(
                     id=short_id(),
                     role="assistant",
@@ -1479,11 +1536,11 @@ class RbitApp(App[None]):
                     model=model_id,
                     duration_s=0.0,
                 )
-                live_card = AssistantMessageCard(draft, self.engine.extra_models)
-                scroll.mount(live_card)
+                self._live_card = AssistantMessageCard(draft, self.engine.extra_models)
+                scroll.mount(self._live_card)
             else:
-                await live_card.update_stream(partial_md)
-            scroll.scroll_end(animate=False)
+                await self._live_card.update_stream(partial_md)
+            self._smart_scroll_end()
 
         try:
             reply = await self.engine.run_turn(
@@ -1497,12 +1554,14 @@ class RbitApp(App[None]):
                 on_stream_chunk=on_stream_chunk,
             )
             self.session.messages.append(reply)
-            self.storage.save_session(self.session)
+            self._schedule_save_session(delay=0.05)
+            live_card = self._live_card
+            self._live_card = None
             if live_card is not None:
                 await live_card.finalize(reply)
             else:
                 scroll.mount(AssistantMessageCard(reply, self.engine.extra_models))
-            scroll.scroll_end(animate=False)
+            self._smart_scroll_end()
         except asyncio.CancelledError:
             raise
         except Exception as exc:

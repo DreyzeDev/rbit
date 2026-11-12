@@ -70,6 +70,7 @@ async def _run_headless(args: argparse.Namespace) -> int:
 
     executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=lambda: cfg)
     executor.always_allow_bash = True  # Non-interactive CLI run
+    executor.allow_outside_paths = bool(getattr(args, "allow_outside", False))
     engine = AgentEngine(
         workspace=workspace,
         executor=executor,
@@ -768,6 +769,11 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("-d", "--dir", help="Target workspace directory")
             p.add_argument("--stdin", action="store_true", help="Read the prompt (or extra context) from stdin")
             p.add_argument(
+                "--allow-outside",
+                action="store_true",
+                help="Allow file tools to touch paths outside the workspace",
+            )
+            p.add_argument(
                 "--output-format",
                 choices=["text", "json", "jsonl"],
                 default="text",
@@ -866,10 +872,16 @@ def main(argv: list[str] | None = None) -> int:
             "  rbit update            Check PyPI for a newer release (--check to skip install)\n"
             "  rbit --generate-completion bash|zsh|powershell   Print shell completion script\n"            "\n"
             "Global flags: --quiet (warnings only), --verbose (info), --trace (debug)\n"
-            "              --profile <name> applies a named overlay from config.json"
+            "              --profile <name> applies a named overlay from config.json\n"
+            "              --allow-outside permits file access outside the workspace"
         ),
     )
     parser.add_argument("target", nargs="?", help="Workspace directory path (defaults to current directory)")
+    parser.add_argument(
+        "--allow-outside",
+        action="store_true",
+        help="Allow file tools to read/write paths outside the workspace",
+    )
     parser.add_argument("-p", "--prompt", help="Start TUI and immediately submit this prompt")
     parser.add_argument("-c", "--continue", dest="continue_last", action="store_true", help="Continue most recent session")
     parser.add_argument("-s", "--session", help="Resume specific session by ID")
@@ -906,6 +918,7 @@ def main(argv: list[str] | None = None) -> int:
         initial_agent=parsed.agent,
         initial_model=parsed.model,
         initial_effort=parsed.effort,
+        allow_outside_paths=bool(getattr(parsed, "allow_outside", False)),
     )
     app.run()
     return 0

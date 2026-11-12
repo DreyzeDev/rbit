@@ -88,6 +88,10 @@ HELP_MARKDOWN = """
 - `ctrl+o` — Todo manager
 - `ctrl+n` — new session
 - `ctrl+y` — copy last answer
+- `ctrl+f` — search session messages and tool output
+- `ctrl+x` — stop background shell processes
+- `ctrl+e` — collapse all tool cards
+- `enter` (on a tool card) — expand / collapse it
 - `ctrl+q` — quit
 
 ## Prompt shorthands
@@ -109,6 +113,7 @@ HELP_MARKDOWN = """
 - `/todo [task]` — Todo checklist manager
 - `/undo` / `/redo` — revert or reapply edits
 - `/diff` — modified files summary
+- `/search <query>` — search session messages and tool output
 - `/help` / `F1` — this screen
 """
 

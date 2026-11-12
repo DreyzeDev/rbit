@@ -30,9 +30,16 @@ All notable changes to rbit are documented here. The format follows
 - Session search via `Ctrl+F` / `/search` across messages and tool output.
 - `rbit update [--check] [--json]` checks PyPI and upgrades the installed package.
 - Agent `todowrite` updates now refresh the sidebar and todo manager immediately.
+- Partial assistant answers are saved with an `interrupted` marker when `Esc` cancels a turn.
+- Tool cards expand with `Enter`; `Ctrl+E` collapses every expanded card.
+- Chat scroll sticks to the bottom only while the user is already there.
+- Workspace path validation rejects reads/writes outside the project unless
+  `--allow-outside` or `allow_outside_paths` is set.
 
 ### Changed
 
+- Session writes are debounced (1.2s) instead of rewriting the file on every stream
+  chunk; pending writes flush on exit.
 - File writes are atomic, ANSI escapes are stripped, and checkpoints rotate (20).
 - Session saves no longer depend on ambient provider environment variables in tests.
 

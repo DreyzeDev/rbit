@@ -283,6 +283,14 @@ class ToolResult:
 PermissionCallback = Callable[[str, str], Awaitable[bool]]
 
 
+class PathOutsideWorkspace(ValueError):
+    """Raised when a tool path resolves outside the workspace and is not allowed."""
+
+    def __init__(self, raw_path: str) -> None:
+        super().__init__(f"path outside workspace: {raw_path}")
+        self.raw_path = raw_path
+
+
 class ToolExecutor:
     def __init__(
         self,
@@ -305,6 +313,7 @@ class ToolExecutor:
         self.redo_stack: list[FileSnapshot] = []
         self.always_allow_bash: bool = False
         self.allow_secret_reads: bool = False
+        self.allow_outside_paths: bool = False
         self._auto_checkpoint_done: bool = False
         self._gitignore: GitIgnoreMatcher | None = None
         self._background_procs: list[asyncio.subprocess.Process] = []
@@ -342,7 +351,19 @@ class ToolExecutor:
         p = Path(raw_path)
         if not p.is_absolute():
             p = (self.workspace / p).resolve()
+        try:
+            p.relative_to(self.workspace)
+        except ValueError:
+            if not self._outside_paths_allowed():
+                raise PathOutsideWorkspace(raw_path) from None
         return p
+
+    def _outside_paths_allowed(self) -> bool:
+        if self.allow_outside_paths:
+            return True
+        if self.get_config is not None:
+            return bool(self.get_config().get("allow_outside_paths", False))
+        return False
 
     def rel_display(self, path: Path) -> str:
         try:
@@ -594,6 +615,13 @@ class ToolExecutor:
                 res = await self._tool_bash(args, agent_mode=agent_mode)
             else:
                 res = ToolResult(False, f"Unknown tool: {name}", f"Unknown tool: {name}")
+        except PathOutsideWorkspace as exc:
+            res = ToolResult(
+                False,
+                f"path outside workspace: {exc.raw_path}",
+                f"`{exc.raw_path}` resolves outside the workspace. "
+                "Pass a relative path inside the project, or enable `allow_outside_paths`.",
+            )
         except Exception as exc:
             res = ToolResult(False, f"Error in {name}", f"{type(exc).__name__}: {exc}")
 
