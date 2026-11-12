@@ -580,10 +580,11 @@ class AutocompletePopup(OptionList):
         self.current_kind: str = ""
         self.values: list[str] = []
 
-    def show_slash(self, prefix: str) -> None:
+    def show_slash(self, prefix: str, extra: list[tuple[str, str]] | None = None) -> None:
+        pool = list(SLASH_COMMANDS) + list(extra or [])
         matches = [
             (cmd, desc)
-            for cmd, desc in SLASH_COMMANDS
+            for cmd, desc in pool
             if cmd.startswith(prefix.lower())
         ]
         if not matches:

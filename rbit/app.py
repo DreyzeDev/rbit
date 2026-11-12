@@ -29,7 +29,7 @@ from .modals import (
 from .models import ChatMessage, Session, TodoItem, ToolCallRecord, short_id
 from .storage import StorageManager
 from .themes import RBIT_DARK, RBIT_LIGHT
-from .tools import ToolExecutor
+from .tools import VIRTUAL_ATTACHMENTS, ToolExecutor
 from .widgets import (
     AgentModeBadge,
     AssistantMessageCard,
@@ -608,7 +608,11 @@ class RbitApp(App[None]):
         popup = self.query_one(AutocompletePopup)
 
         if val.startswith("/") and " " not in val:
-            popup.show_slash(val)
+            extra = [
+                (f"/{name}", str(meta.get("description", "")))
+                for name, meta in self.storage.load_custom_commands().items()
+            ]
+            popup.show_slash(val, extra)
             return
 
         at_match = re.search(r"@([^\s]*)$", val)
@@ -870,6 +874,16 @@ class RbitApp(App[None]):
         if cmd == "/help":
             self._cmd_help()
             return True
+
+        custom = self.storage.load_custom_commands()
+        custom_name = cmd.lstrip("/")
+        if custom_name in custom:
+            template = custom[custom_name]["template"]
+            prompt = template.replace("{args}", arg) if "{args}" in template else (
+                template + (f"\n\n{arg}" if arg else "")
+            )
+            self._submit_prompt(prompt.strip())
+            return True
         return False
 
     def _cmd_checkpoint(self, label: str) -> None:
@@ -979,6 +993,8 @@ class RbitApp(App[None]):
             "  ctrl+b           Toggle right sidebar (Context / MCP / LSP / Todo / Files)\n"
             "  !<command>       Direct Bang Shell execution (zero LLM tokens)\n"
             "  @filename        Fuzzy-attach project file to prompt\n"
+            "  @diff @git       Attach git diff / branch+status+log context\n"
+            "  @staged @tree    Attach staged diff / workspace file tree\n"
             "  /checkpoint [n]  Save Git-free workspace snapshot   /rewind    Restore snapshot\n"
             "  /remember <rule> Save persistent project memory     /export    Export session .md\n"
             "  /todo [task]     Todo checklist manager             /doctor    Environment check\n"
@@ -1056,7 +1072,9 @@ class RbitApp(App[None]):
 
         attachments = re.findall(r"@([^\s]+)", raw_text)
         valid_attachments = [
-            rel for rel in attachments if self.executor.resolve_path(rel).exists()
+            rel
+            for rel in attachments
+            if rel in VIRTUAL_ATTACHMENTS or self.executor.resolve_path(rel).exists()
         ]
 
         if len(self.session.messages) == 0 and self.session.title in ("New Session", "Новая сессия"):

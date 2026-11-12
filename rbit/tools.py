@@ -61,6 +61,8 @@ READONLY_BASH_PREFIXES = (
 
 READONLY_TOOLS: frozenset[str] = frozenset({"read", "glob", "grep", "webfetch", "diagnostics"})
 
+VIRTUAL_ATTACHMENTS: frozenset[str] = frozenset({"diff", "git", "staged", "tree"})
+
 MAX_CHECKPOINT_FILE_BYTES = 256_000
 
 SAFE_TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".schema", ".dist")
@@ -882,6 +884,21 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "properties": {
                     "filePath": {"type": "string"},
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "subagent",
+            "description": "Delegate read-only codebase exploration to a fresh-context explore subagent and get back a compact summary with file:line references.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "What to investigate in the workspace."},
+                    "agent": {"type": "string", "enum": ["explore"]},
+                },
+                "required": ["goal"],
             },
         },
     },

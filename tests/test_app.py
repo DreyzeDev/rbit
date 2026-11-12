@@ -572,4 +572,137 @@ async def test_auto_checkpoint_before_first_edit_per_turn(tmp_path: Path) -> Non
     assert not (tmp_path / "c.py").exists()
 
 
+@pytest.mark.asyncio
+async def test_virtual_attachments_and_custom_slash_commands(tmp_path: Path) -> None:
+    (tmp_path / "main.py").write_text("def run() -> int:\n    return 42\n", encoding="utf-8")
+    cmds_dir = tmp_path / ".rbit" / "commands"
+    cmds_dir.mkdir(parents=True)
+    (cmds_dir / "review.md").write_text(
+        "# Review the current change\nReview this change carefully and suggest fixes.\n\nTarget: {args}\n",
+        encoding="utf-8",
+    )
+
+    app = RbitApp(workspace=tmp_path)
+    app.config_data["model"] = "rbit/smart-local"
+    async with app.run_test(size=(130, 40)) as pilot:
+        inp = app.query_one("#prompt-input")
+
+        # @diff / @tree are accepted as virtual attachments even though those files don't exist
+        inp.focus()
+        inp.value = "@diff @tree объясни изменения"
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        user_msg = app.session.messages[0]
+        assert user_msg.attachments == ["diff", "tree"]
+        assert len(app.session.messages) == 2
+        reply = app.session.messages[1].content
+        assert "git-diff" in reply
+        assert "workspace-tree" in reply
+
+        # Custom project command expands its Markdown template with {args}
+        inp.focus()
+        inp.value = "/review src/main.py"
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        last_user = [m for m in app.session.messages if m.role == "user"][-1]
+        assert last_user.content == "Review this change carefully and suggest fixes.\n\nTarget: src/main.py"
+        assert app.storage.load_custom_commands()["review"]["description"] == "Review the current change"
+
+
+@pytest.mark.asyncio
+async def test_subagent_explore_and_virtual_attachment_expansion(tmp_path: Path) -> None:
+    (tmp_path / "main.py").write_text("def run() -> int:\n    return 42\n", encoding="utf-8")
+
+    session = Session()
+    executor = ToolExecutor(workspace=tmp_path, session=session)
+    captured: list[dict[str, Any]] = []
+    main_step = 0
+    sub_step = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal main_step, sub_step
+        body = json.loads(request.content.decode("utf-8"))
+        captured.append(body)
+        system = body["messages"][0]["content"]
+        if "explore subagent" in system:
+            sub_step += 1
+            if sub_step == 1:
+                tcs = [
+                    {
+                        "id": "s1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": '{"filePath":"main.py"}'},
+                    }
+                ]
+                return httpx.Response(200, json={"choices": [{"message": {"content": "", "tool_calls": tcs}}]})
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "main.py:1 defines `run() -> int`, returns 42."}}]},
+            )
+
+        main_step += 1
+        if main_step == 1:
+            tcs = [
+                {
+                    "id": "sub1",
+                    "type": "function",
+                    "function": {"name": "subagent", "arguments": '{"goal":"where is run defined?"}'},
+                }
+            ]
+            return httpx.Response(200, json={"choices": [{"message": {"content": "", "tool_calls": tcs}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Функция определена в main.py."}}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as mock_client:
+        engine = AgentEngine(
+            workspace=tmp_path,
+            executor=executor,
+            get_config=lambda: {"api_key": "test-key", "api_base": "https://mock.local/v1"},
+            http_client=mock_client,
+        )
+        user_msg = ChatMessage(
+            id=short_id(), role="user", content="где определена run?", attachments=["tree"]
+        )
+        session.messages.append(user_msg)
+
+        async def _noop_rec(_rec: ToolCallRecord) -> None:
+            return
+
+        async def _noop_status(_s: str) -> None:
+            return
+
+        reply = await engine.run_turn(
+            session=session,
+            user_msg=user_msg,
+            agent_mode="build",
+            model_id="openai/gpt-4.1",
+            on_tool_start=_noop_rec,
+            on_tool_end=_noop_rec,
+            on_status=_noop_status,
+        )
+
+    assert reply.content == "Функция определена в main.py."
+    assert reply.tool_calls and reply.tool_calls[0].name == "subagent"
+    assert "explore" in reply.tool_calls[0].summary
+
+    main_requests = [b for b in captured if "explore subagent" not in b["messages"][0]["content"]]
+    first_user_content = main_requests[0]["messages"][1]["content"]
+    assert "<workspace-tree" in first_user_content
+    assert "main.py" in first_user_content
+
+    second_main_tool_msg = [m for m in main_requests[1]["messages"] if m["role"] == "tool"][0]
+    assert "Subagent explore result" in second_main_tool_msg["content"]
+    assert "main.py:1 defines" in second_main_tool_msg["content"]
+
+    sub_requests = [b for b in captured if "explore subagent" in b["messages"][0]["content"]]
+    assert sub_requests
+    sub_tools = [t["function"]["name"] for t in sub_requests[0]["tools"]]
+    assert "read" in sub_tools
+    assert "write" not in sub_tools
+    assert "bash" not in sub_tools
+
+
 

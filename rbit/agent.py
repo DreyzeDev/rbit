@@ -13,7 +13,13 @@ import httpx
 
 from .models import ChatMessage, ModelInfo, Session, ToolCallRecord, get_model_info, short_id
 from .storage import StorageManager
-from .tools import OPENAI_TOOLS_SCHEMA, READONLY_TOOLS, ToolExecutor, ToolResult
+from .tools import (
+    OPENAI_TOOLS_SCHEMA,
+    READONLY_TOOLS,
+    VIRTUAL_ATTACHMENTS,
+    ToolExecutor,
+    ToolResult,
+)
 
 MAX_PARALLEL_TOOLS = 4
 
@@ -108,6 +114,11 @@ class AgentEngine:
         use_remote = (not model_info.is_local_smart) and (bool(api_key) or is_ollama)
 
         tool_records: list[ToolCallRecord] = []
+        effective_base = (
+            "http://localhost:11434/v1"
+            if is_ollama and "openrouter.ai" in api_base
+            else api_base
+        )
 
         async def invoke_tool(name: str, args: dict[str, Any]) -> ToolResult:
             rec = ToolCallRecord(
@@ -120,7 +131,15 @@ class AgentEngine:
             tool_records.append(rec)
             await on_tool_start(rec)
             await asyncio.sleep(0.05)
-            res = await self.executor.execute(name, args, agent_mode=agent_mode)
+            if name == "subagent":
+                res = await self._run_subagent(
+                    args,
+                    model_id=remote_model_id if use_remote else "",
+                    api_base=effective_base if use_remote else "",
+                    api_key=api_key or "ollama",
+                )
+            else:
+                res = await self.executor.execute(name, args, agent_mode=agent_mode)
             rec.status = "success" if res.ok else "error"
             rec.summary = res.summary
             rec.output = res.output
@@ -130,11 +149,6 @@ class AgentEngine:
             return res
 
         if use_remote:
-            effective_base = (
-                "http://localhost:11434/v1"
-                if is_ollama and "openrouter.ai" in api_base
-                else api_base
-            )
             content = await self._run_openai_compatible(
                 session=session,
                 user_msg=user_msg,
@@ -209,6 +223,8 @@ class AgentEngine:
                     att_sem = asyncio.Semaphore(MAX_PARALLEL_TOOLS)
 
                     async def _read_attachment(rel: str) -> str:
+                        if rel in VIRTUAL_ATTACHMENTS:
+                            return await self._virtual_attachment(rel)
                         async with att_sem:
                             res = await self.executor.execute("read", {"filePath": rel, "limit": 160}, agent_mode)
                         return f'<file path="{rel}">\n{res.output}\n</file>'
@@ -446,6 +462,177 @@ class AgentEngine:
         choice = data["choices"][0]["message"]
         return True, choice.get("content") or "", choice.get("tool_calls") or []
 
+    async def _run_git(self, *args: str, timeout: float = 15.0) -> str:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                *args,
+                cwd=str(self.workspace),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, _err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode != 0:
+                return ""
+            return out.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+
+    async def _virtual_attachment(self, name: str) -> str:
+        """Expands @diff / @git / @staged / @tree into ready-to-use prompt context."""
+        if name == "diff":
+            content = await self._run_git("diff")
+            return f'<git-diff path=".">\n{content[:8000] or "(no unstaged changes)"}\n</git-diff>'
+        if name == "staged":
+            content = await self._run_git("diff", "--staged")
+            return f'<git-staged-diff>\n{content[:8000] or "(nothing staged)"}\n</git-staged-diff>'
+        if name == "git":
+            status = await self._run_git("status", "--short")
+            log = await self._run_git("log", "--oneline", "-8")
+            branch = await self._run_git("branch", "--show-current")
+            return (
+                "<git-state>\n"
+                f"branch: {branch or '(not a git repo / detached)'}\n\n"
+                f"status:\n{status or '(clean)'}\n\n"
+                f"recent commits:\n{log or '(none)'}\n"
+                "</git-state>"
+            )
+        if name == "tree":
+            files = await asyncio.to_thread(self.executor.list_workspace_files, 200)
+            listing = "\n".join(files) or "(workspace is empty)"
+            return f"<workspace-tree count=\"{len(files)}\">\n{listing}\n</workspace-tree>"
+        return ""
+
+    async def _explore_deterministic(self, goal: str) -> str:
+        keywords = [w for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", goal) if len(w) >= 4][:3]
+        files = await asyncio.to_thread(self.executor.list_workspace_files, 200)
+        lines = [f"Workspace has {len(files)} file(s)."]
+        if files:
+            lines.append("Files: " + ", ".join(files[:12]) + (" ..." if len(files) > 12 else ""))
+        for kw in keywords:
+            res = await self.executor.execute("grep", {"pattern": re.escape(kw)}, agent_mode="plan")
+            head = "\n".join(res.output.splitlines()[:8]) or "(no matches)"
+            lines.append(f"\n`{kw}`:\n{head}")
+        return "\n".join(lines)
+
+    async def _explore_with_llm(
+        self,
+        goal: str,
+        model_id: str,
+        api_base: str,
+        api_key: str,
+    ) -> str:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://rbit.cli",
+            "X-Title": "rbit",
+        }
+        writable = {"write", "edit", "multi_edit", "bash", "todowrite", "subagent"}
+        tools = [t for t in OPENAI_TOOLS_SCHEMA if t["function"]["name"] not in writable]
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an explore subagent inside rbit. You have ONLY read-only tools. "
+                    f"Workspace: {self.workspace}\n"
+                    "Investigate the user's goal and return a compact summary (max ~200 words) "
+                    "with concrete `file:line` references. Do not ask questions."
+                ),
+            },
+            {"role": "user", "content": goal},
+        ]
+        steps = 0
+        last_content = ""
+        used: list[str] = []
+        client_ctx = self.http_client or httpx.AsyncClient(timeout=75.0)
+        try:
+            for _ in range(5):
+                steps += 1
+                try:
+                    resp = await client_ctx.post(
+                        f"{api_base}/chat/completions",
+                        headers=headers,
+                        json={
+                            "model": model_id,
+                            "messages": messages,
+                            "tools": tools,
+                            "tool_choice": "auto",
+                        },
+                    )
+                except Exception as exc:
+                    return f"Subagent network error: {exc}"
+                if resp.status_code >= 400:
+                    return f"Subagent API error ({resp.status_code}): {resp.text[:200]}"
+                choice = resp.json()["choices"][0]["message"]
+                last_content = choice.get("content") or ""
+                tool_calls = choice.get("tool_calls") or []
+                if not tool_calls:
+                    break
+                messages.append(
+                    {"role": "assistant", "content": last_content, "tool_calls": tool_calls}
+                )
+                for tc in tool_calls:
+                    fn_name = tc["function"]["name"]
+                    if fn_name not in READONLY_TOOLS:
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "name": fn_name,
+                                "content": "Rejected: subagent is read-only.",
+                            }
+                        )
+                        continue
+                    used.append(fn_name)
+                    res = await self.executor.execute(
+                        fn_name, self._parse_tool_args(tc["function"].get("arguments")), agent_mode="plan"
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "name": fn_name,
+                            "content": res.output[:4000],
+                        }
+                    )
+        finally:
+            if self.http_client is None:
+                await client_ctx.aclose()
+        suffix = f"\n\n(subagent steps: {steps}, tools: {', '.join(sorted(set(used))) or 'none'})"
+        return (last_content or "Subagent finished without findings.") + suffix
+
+    async def _run_subagent(
+        self,
+        args: dict[str, Any],
+        *,
+        model_id: str,
+        api_base: str,
+        api_key: str,
+    ) -> ToolResult:
+        t0 = time.perf_counter()
+        goal = str(args.get("goal") or "").strip()
+        if not goal:
+            return ToolResult(False, "missing goal", "`goal` is required for subagent.")
+        kind = str(args.get("agent") or "explore").strip().lower()
+        if kind != "explore":
+            return ToolResult(
+                False, f"unsupported agent: {kind}", 'Only agent="explore" is supported for now.'
+            )
+
+        if model_id and api_base:
+            text = await self._explore_with_llm(goal, model_id, api_base, api_key)
+        else:
+            text = await self._explore_deterministic(goal)
+
+        duration = int((time.perf_counter() - t0) * 1000)
+        return ToolResult(
+            True,
+            f"explore · {len(text)} chars",
+            f"Subagent explore result for: {goal}\n\n{text}",
+            duration_ms=duration,
+        )
+
     async def _run_smart_local_agent(
         self,
         session: Session,
@@ -458,17 +645,24 @@ class AgentEngine:
         lower = text.lower()
 
         attached_summaries: list[str] = []
+        attached_blocks: list[str] = []
         if user_msg.attachments:
-            await on_status(f"Чтение контекста ({len(user_msg.attachments)} файлов)...")
+            await on_status(f"Чтение контекста ({len(user_msg.attachments)} элементов)...")
             att_sem = asyncio.Semaphore(MAX_PARALLEL_TOOLS)
 
-            async def _read_att(rel: str) -> tuple[str, ToolResult]:
+            async def _read_att(rel: str) -> tuple[str, ToolResult | None, str]:
+                if rel in VIRTUAL_ATTACHMENTS:
+                    block = await self._virtual_attachment(rel)
+                    return rel, None, block
                 async with att_sem:
-                    return rel, await invoke_tool("read", {"filePath": rel, "limit": 120})
+                    return rel, await invoke_tool("read", {"filePath": rel, "limit": 120}), ""
 
             att_results = await asyncio.gather(*(_read_att(rel) for rel in user_msg.attachments))
-            for rel, res in att_results:
-                if res.ok:
+            for rel, res, block in att_results:
+                if block:
+                    attached_blocks.append(block)
+                    attached_summaries.append(f"- `@{rel}` прикреплён ({len(block)} символов)")
+                elif res is not None and res.ok:
                     attached_summaries.append(f"- `{rel}` прочитан ({res.summary})")
 
         # 1. Greetings / capabilities
@@ -608,8 +802,10 @@ class AgentEngine:
 
         if attached_summaries:
             ctx_block = "\n".join(attached_summaries)
+            preview = "\n\n".join(block[:1200] for block in attached_blocks)
+            preview_section = f"\n\n```text\n{preview}\n```" if preview else ""
             return (
-                f"Изучил прикреплённый контекст:\n{ctx_block}\n\n"
+                f"Изучил прикреплённый контекст:\n{ctx_block}{preview_section}\n\n"
                 f"Запрос: *{text}*\n\n"
                 "Укажите целевой файл (например: `создай файл helper.py ...`) "
                 "или подключите внешний LLM API / локальную Ollama через `/connect`."

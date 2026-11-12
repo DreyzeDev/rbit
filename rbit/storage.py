@@ -19,6 +19,7 @@ class StorageManager:
         self.checkpoints_dir = self.state_dir / "checkpoints"
         self.config_path = self.state_dir / "config.json"
         self.memory_path = self.state_dir / "memory.md"
+        self.commands_dir = self.state_dir / "commands"
 
     def ensure_dirs(self) -> None:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -142,6 +143,38 @@ class StorageManager:
         updated = existing.rstrip() + f"\n- [{stamp}] {rule.strip()}\n"
         self.memory_path.write_text(updated, encoding="utf-8")
         return self.memory_path
+
+    # --- Custom Project Slash Commands (.rbit/commands/*.md) ---
+    def load_custom_commands(self) -> dict[str, dict[str, str]]:
+        """Loads project-local prompt templates: one Markdown file per command."""
+        commands: dict[str, dict[str, str]] = {}
+        if not self.commands_dir.exists():
+            return commands
+        for path in sorted(self.commands_dir.glob("*.md")):
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            name = path.stem.lower().strip()
+            if not name:
+                continue
+            lines = raw.splitlines()
+            description = ""
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                description = stripped.lstrip("#").strip()[:90]
+                break
+            body_lines = lines[1:] if lines and lines[0].strip().startswith("# ") else lines
+            template = "\n".join(body_lines).strip()
+            if not template:
+                continue
+            commands[name] = {
+                "description": description or f"Project command /{name}",
+                "template": template,
+            }
+        return commands
 
     # --- Workspace Checkpoints (Git-independent time travel) ---
     def save_checkpoint(self, label: str, files_map: dict[str, str]) -> CheckpointMeta:

@@ -6,7 +6,7 @@
 [![Textual](https://img.shields.io/badge/TUI-Textual%208.x-fab283?style=flat-square)](https://textual.textualize.io/)
 [![License](https://img.shields.io/badge/License-MIT-7fd88f?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-5c9cf5?style=flat-square)](#)
-[![Tests](https://img.shields.io/badge/tests-pytest%2010%20passing-7fd88f?style=flat-square)](tests/test_app.py)
+[![Tests](https://img.shields.io/badge/tests-pytest%2012%20passing-7fd88f?style=flat-square)](tests/test_app.py)
 
 **Автономный полноэкранный AI-агент для терминала** — редактирует код, ищет по проекту, выполняет команды, хранит память проекта и откатывает время без Git.
 
@@ -44,7 +44,9 @@
 | **Память проекта** | `RBIT.md` + `/remember <правило>` — знания автоматически попадают в системный промпт каждой сессии |
 | **Real-time Streaming** | Настоящий SSE-стриминг ответов OpenAI-совместимого API в реальном времени |
 | **Модели** | OpenRouter / OpenAI / DeepSeek / любой OpenAI-compatible endpoint + автообнаружение локальной **Ollama** (`Ctrl+M`) |
-| **Инструменты** | `read`, `write`, `edit`, `multi_edit` (атомарно), `glob`, `grep`, `webfetch`, `bash`, `todowrite` + undo/redo стек |
+| **Инструменты** | `read`, `write`, `edit`, `multi_edit` (атомарно), `glob`, `grep`, `diagnostics`, `webfetch`, `bash`, `todowrite`, `subagent(explore)` + undo/redo стек |
+| **Виртуальные аттачи** | `@diff`, `@staged`, `@git`, `@tree` — git-diff, staged-изменения, состояние ветки и дерево проекта попадают в контекст без чтения файлов |
+| **Команды проекта** | Свои слэш-команды из `.rbit/commands/*.md` с подстановкой `{args}` и автодополнением в палитре |
 | **Всё локально** | Сессии, конфиг, память и чекпоинты — в скрытой папке `.rbit/` вашего проекта |
 
 ## Установка
@@ -74,7 +76,13 @@ rbit                                  # TUI по умолчанию
 /review src/app.py                      ← анализ файла
 !pytest -q                              ← мгновенный шелл без токенов
 @src/main.py найди утечку памяти        ← аттач файла к промпту
+@diff почему тест падает                ← git-diff прямо в контекст
+@tree + @git где точка входа            ← дерево проекта и состояние ветки
 ```
+
+Свои команды: положите Markdown-файл в `.rbit/commands/`, например
+`.rbit/commands/review.md` — и вызывайте его как `/review <аргументы>`
+(`{args}` в шаблоне подставится автоматически).
 
 Поддержка провайдеров через `/connect` (Base URL + API key):
 `https://openrouter.ai/api/v1` · `https://api.openai.com/v1` · `http://localhost:11434/v1` · любой OpenAI-подобный.
@@ -153,9 +161,12 @@ rbit/
 - [x] Real-time SSE-стриминг
 - [x] Чекпоинты без Git + `/rewind`
 - [x] Проектная память (`RBIT.md`, `/remember`)
-- [ ] Параллельные суб-агенты
-- [ ] AST-диагностика и symbol-index
-- [ ] Кастомные команды проекта (`.rbit/commands/*.md`)
+- [x] Параллельные read-only инструменты и авто-диагностика
+- [x] Секрет-гард и авто-чекпоинты перед правками
+- [x] Виртуальные аттачи `@diff`/`@git`/`@staged`/`@tree` и команды проекта
+- [x] Суб-агент `subagent(explore)`
+- [ ] AST-индекс и symbol-index
+- [ ] `rbit map` и `rbit lint` в CLI
 
 ## Лицензия
 
