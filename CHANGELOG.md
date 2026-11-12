@@ -17,6 +17,8 @@ All notable changes to rbit are documented here. The format follows
 - Readable Markdown `webfetch` output with a 10-minute cache.
 - ripgrep-backed `grep` when `rg` is available.
 - Custom provider headers via `extra_headers`.
+- `/connect` imports every model from the provider's `GET /models` under its own
+  category in the model picker and caches them in the config.
 
 ### Changed
 

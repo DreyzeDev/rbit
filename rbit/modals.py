@@ -260,7 +260,11 @@ class ModelSelectorModal(ModalScreen[str | None]):
 
         last_prov = ""
         matched_ids: list[str] = []
+        grouped: dict[str, list[ModelInfo]] = {}
         for m in self.all_models:
+            grouped.setdefault(m.provider, []).append(m)
+        ordered = [m for models in grouped.values() for m in models]
+        for m in ordered:
             hay = f"{m.id} {m.name} {m.provider}".lower()
             if q and q not in hay:
                 continue

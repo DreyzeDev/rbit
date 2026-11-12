@@ -200,6 +200,25 @@ class ModelInfo:
     cost_per_1k: float = 0.003
     is_local_smart: bool = False
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "provider": self.provider,
+            "context_window": self.context_window,
+            "cost_per_1k": self.cost_per_1k,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ModelInfo":
+        return cls(
+            id=str(data.get("id", "")),
+            name=str(data.get("name") or data.get("id", "")),
+            provider=str(data.get("provider") or "Custom"),
+            context_window=int(data.get("context_window") or 200_000),
+            cost_per_1k=float(data.get("cost_per_1k") or 0.0),
+        )
+
 
 AVAILABLE_MODELS: list[ModelInfo] = [
     ModelInfo(

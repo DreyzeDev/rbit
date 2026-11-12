@@ -35,6 +35,36 @@ RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 logger = logging.getLogger("rbit.agent")
 HTTP_LIMITS = httpx.Limits(max_keepalive_connections=10, max_connections=20)
 
+PROVIDER_LABELS = {
+    "openrouter.ai": "OpenRouter",
+    "api.openai.com": "OpenAI",
+    "api.anthropic.com": "Anthropic",
+    "api.deepseek.com": "DeepSeek",
+    "generativelanguage.googleapis.com": "Google",
+    "api.groq.com": "Groq",
+    "api.mistral.ai": "Mistral",
+    "api.together.xyz": "Together",
+    "localhost": "Ollama",
+    "127.0.0.1": "Ollama",
+}
+
+
+def provider_label_for(api_base: str) -> str:
+    """Maps a provider base URL to a stable display category."""
+    try:
+        host = httpx.URL(api_base).host.lower()
+    except Exception:
+        host = (api_base or "").lower()
+    for key, label in PROVIDER_LABELS.items():
+        if key in host:
+            return label
+    return host or "Custom"
+
+
+def _pretty_model_name(model_id: str) -> str:
+    tail = model_id.rsplit("/", 1)[-1]
+    return tail.replace("-", " ").replace("_", " ").strip() or model_id
+
 ToolStartHook = Callable[[ToolCallRecord], Awaitable[None]]
 ToolEndHook = Callable[[ToolCallRecord], Awaitable[None]]
 StatusHook = Callable[[str], Awaitable[None]]
@@ -112,8 +142,34 @@ class AgentEngine:
         self.ollama_online = bool(self.extra_models)
         return self.extra_models
 
+    def add_provider_models(self, models: list[ModelInfo]) -> int:
+        """Merges provider models into the picker list, keeping one category per provider."""
+        existing = {m.id for m in self.extra_models}
+        added = 0
+        for model in models:
+            if not model.id or model.id in existing:
+                continue
+            self.extra_models.append(model)
+            existing.add(model.id)
+            added += 1
+        return added
+
+    def load_cached_provider_models(self, cfg: dict[str, Any]) -> list[ModelInfo]:
+        cached: list[ModelInfo] = []
+        for item in cfg.get("provider_models") or []:
+            if isinstance(item, dict) and item.get("id"):
+                cached.append(ModelInfo.from_dict(item))
+        return cached
+
     async def validate_api_key(self, api_base: str, api_key: str) -> tuple[bool, str]:
         """Checks a provider key with GET /models and returns a human-readable result."""
+        ok, message, _ = await self.fetch_provider_models(api_base, api_key)
+        return ok, message
+
+    async def fetch_provider_models(
+        self, api_base: str, api_key: str
+    ) -> tuple[bool, str, list[ModelInfo]]:
+        """Validates a key with GET /models and returns every model the provider exposes."""
         base = (api_base or "").strip().rstrip("/")
         if base.endswith("/chat/completions"):
             base = base[: -len("/chat/completions")]
@@ -126,19 +182,44 @@ class AgentEngine:
                 async with httpx.AsyncClient(timeout=10.0, limits=HTTP_LIMITS) as client:
                     resp = await client.get(url, headers=headers)
         except Exception as exc:
-            return False, f"Cannot reach {base}: {exc}"
+            return False, f"Cannot reach {base}: {exc}", []
         if resp.status_code in (401, 403):
-            return False, f"Invalid API key (HTTP {resp.status_code})."
+            return False, f"Invalid API key (HTTP {resp.status_code}).", []
         if resp.status_code >= 400:
-            return False, f"Provider returned HTTP {resp.status_code} for /models."
-        count = 0
+            return False, f"Provider returned HTTP {resp.status_code} for /models.", []
+        listed: list[Any] = []
         try:
             data = resp.json()
-            listed = data.get("data") or data.get("models") or []
-            count = len(listed) if isinstance(listed, list) else 0
+            raw = data.get("data") or data.get("models") or []
+            if isinstance(raw, list):
+                listed = raw
         except Exception:
             pass
-        return True, f"Connected: {count} models available" if count else "Connected."
+        provider = provider_label_for(base)
+        models: list[ModelInfo] = []
+        seen: set[str] = set()
+        for entry in listed:
+            if isinstance(entry, str):
+                model_id = entry
+            elif isinstance(entry, dict):
+                model_id = str(entry.get("id") or entry.get("name") or "")
+            else:
+                continue
+            model_id = model_id.strip()
+            if not model_id or model_id in seen:
+                continue
+            seen.add(model_id)
+            models.append(
+                ModelInfo(
+                    id=model_id,
+                    name=_pretty_model_name(model_id),
+                    provider=provider,
+                    context_window=200_000,
+                    cost_per_1k=0.0,
+                )
+            )
+        count = len(models)
+        return True, f"Connected: {count} models available" if count else "Connected.", models
 
     def _build_headers(self, api_key: str) -> dict[str, str]:
         headers = {

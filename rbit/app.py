@@ -495,6 +495,10 @@ class RbitApp(App[None]):
         self._update_layout_mode()
         self._sync_ui()
         self.query_one("#prompt-input", Input).focus()
+        cached = self.engine.load_cached_provider_models(self.config_data)
+        if cached:
+            self.engine.add_provider_models(cached)
+            self._sync_ui()
         self._discover_local_models()
 
         if self.initial_prompt:
@@ -838,9 +842,22 @@ class RbitApp(App[None]):
             self.config_data["api_key"] = res["api_key"]
             self.storage.save_config(self.config_data)
             if self.config_data["api_key"]:
-                ok, message = await self.engine.validate_api_key(
+                ok, message, models = await self.engine.fetch_provider_models(
                     self.config_data["api_base"], self.config_data["api_key"]
                 )
+                if ok and models:
+                    added = self.engine.add_provider_models(models)
+                    cached = {
+                        m.id: m.to_dict()
+                        for m in self.engine.load_cached_provider_models(self.config_data)
+                    }
+                    for model in models:
+                        cached[model.id] = model.to_dict()
+                    self.config_data["provider_models"] = list(cached.values())
+                    self.storage.save_config(self.config_data)
+                    provider = models[0].provider
+                    message = f"{message} ({added} added to {provider})"
+                    self._sync_ui()
                 self.notify(("✓ " if ok else "✗ ") + message, timeout=4.0)
             self._sync_ui()
         self.query_one("#prompt-input", Input).focus()

@@ -19,7 +19,7 @@ from textual.widgets import Label, OptionList
 from rbit.agent import HTTP_LIMITS, AgentEngine, MAX_PARALLEL_TOOLS
 from rbit.app import RbitApp
 from rbit.cli import main as cli_main
-from rbit.modals import CommandPaletteModal, HelpModal
+from rbit.modals import CommandPaletteModal, HelpModal, ModelSelectorModal
 from rbit.models import ChatMessage, ModelInfo, Session, ToolCallRecord, short_id
 from rbit.tools import ToolExecutor, ToolResult, is_secret_file, redact_secrets
 from rbit.widgets import (
@@ -1567,11 +1567,13 @@ async def test_validate_api_key_via_models_endpoint(tmp_path: Path) -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(ok_handler)) as client:
         engine.http_client = client
-        ok, message = await engine.validate_api_key(
+        ok, message, models = await engine.fetch_provider_models(
             "https://mock.local/v1/chat/completions", "good-key"
         )
     assert ok is True
     assert "2 models" in message
+    assert [m.id for m in models] == ["a", "b"]
+    assert all(m.provider == "mock.local" for m in models)
 
     def deny_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"error": "unauthorized"})
@@ -1581,6 +1583,49 @@ async def test_validate_api_key_via_models_endpoint(tmp_path: Path) -> None:
         ok, message = await engine.validate_api_key("https://mock.local/v1", "bad-key")
     assert ok is False
     assert "Invalid API key" in message
+
+
+@pytest.mark.asyncio
+async def test_connect_adds_all_provider_models_under_category(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://openrouter.ai/api/v1/models"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "openai/gpt-4.1-mini"},
+                    {"id": "anthropic/claude-haiku-4"},
+                    {"id": "deepseek/deepseek-r1"},
+                ]
+            },
+        )
+
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        app.engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        app.config_data["api_base"] = "https://openrouter.ai/api/v1"
+        app.config_data["api_key"] = "test-key"
+        added = app.engine.add_provider_models(
+            (await app.engine.fetch_provider_models(app.config_data["api_base"], "test-key"))[2]
+        )
+        assert added == 3
+        provider_models = [m for m in app.engine.extra_models if m.provider == "OpenRouter"]
+        assert {m.id for m in provider_models} >= {
+            "openai/gpt-4.1-mini",
+            "anthropic/claude-haiku-4",
+            "deepseek/deepseek-r1",
+        }
+
+        await app.push_screen(ModelSelectorModal("rbit/smart-local", app.engine.extra_models))
+        await pilot.pause()
+        olist = app.screen.query_one("#model-list", OptionList)
+        ids = [olist.get_option_at_index(i).id for i in range(olist.option_count)]
+        assert "openai/gpt-4.1-mini" in ids
+        openrouter_idx = ids.index("openai/gpt-4.1-mini")
+        assert olist.get_option_at_index(openrouter_idx - 1).disabled
+        assert "openrouter" in str(olist.get_option_at_index(openrouter_idx - 1).prompt).lower()
+        await pilot.press("escape")
+        await app.engine.http_client.aclose()
 
 
 @pytest.mark.asyncio
