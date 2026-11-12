@@ -56,17 +56,24 @@
 ```bash
 git clone https://github.com/DreyzeDev/rbit.git
 cd rbit
+pip install -e .        # ставит команду `rbit` в PATH
+```
 
-python -m venv .venv
-.venv\Scripts\pip install -e .        # Windows
-pip install -e .                      # Linux / macOS
+После установки достаточно набрать `rbit` в любом терминале, из любого каталога.
+Для изолированной установки без глобальных зависимостей: `pipx install .`.
+
+Если не хочется ставить в PATH, остаются варианты:
+
+```bash
+python -m rbit                          # из исходников
+.\rbit.bat                              # Windows-лаунчер (использует .venv)
 ```
 
 Запуск:
 
 ```bash
 rbit                                  # TUI по умолчанию
-.\rbit.bat                            # Windows-лаунчер
+rbit C:\path\to\project               # открыть конкретный воркспейс
 ```
 
 ## Как пользоваться
