@@ -738,6 +738,10 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["RBIT_PROFILE"] = args_list[idx + 1]
         args_list = args_list[:idx] + args_list[idx + 2:]
 
+    allow_outside = "--allow-outside" in args_list
+    if allow_outside:
+        args_list = [arg for arg in args_list if arg != "--allow-outside"]
+
     if args_list and args_list[0] == "--generate-completion":
         shell = args_list[1].lower() if len(args_list) > 1 else "bash"
         if shell not in COMPLETION_SCRIPTS:
@@ -781,6 +785,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             p.add_argument("--json", action="store_true", help="Emit structured JSON output")
             parsed = p.parse_args(rest)
+            if allow_outside:
+                parsed.allow_outside = True
             return asyncio.run(_run_headless(parsed))
 
         if sub == "doctor":
@@ -918,7 +924,7 @@ def main(argv: list[str] | None = None) -> int:
         initial_agent=parsed.agent,
         initial_model=parsed.model,
         initial_effort=parsed.effort,
-        allow_outside_paths=bool(getattr(parsed, "allow_outside", False)),
+        allow_outside_paths=allow_outside or bool(getattr(parsed, "allow_outside", False)),
     )
     app.run()
     return 0

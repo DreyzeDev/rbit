@@ -11,7 +11,6 @@ from rich.table import Table
 from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
-from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.message import Message
 from textual.reactive import reactive
@@ -319,9 +318,6 @@ def _render_unified_diff(diff_text: str) -> Text:
 class ToolCallCard(Static):
     """Inline tool call renderer (→ Read, ✱ Glob/Grep, ↗ WebFetch, ← Write/Edit/MultiEdit + diff, $ Bash, # Todos)."""
 
-    can_focus = True
-    BINDINGS = [Binding("enter", "toggle_expanded", "Expand / collapse", show=False)]
-
     expanded: reactive[bool] = reactive(False)
 
     class StopRequested(Message):
@@ -358,7 +354,6 @@ class ToolCallCard(Static):
         if self.record.pid and self.stop_state == "running":
             self.post_message(self.StopRequested(self.record.pid))
             return
-        self.focus()
         self.expanded = not self.expanded
 
     def render(self) -> Group:

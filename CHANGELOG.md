@@ -43,6 +43,15 @@ All notable changes to rbit are documented here. The format follows
 - File writes are atomic, ANSI escapes are stripped, and checkpoints rotate (20).
 - Session saves no longer depend on ambient provider environment variables in tests.
 
+### Fixed
+
+- Clicking a tool card no longer steals keyboard focus from the prompt input; `Enter` on an
+  empty prompt toggles the newest card instead.
+- `rbit --allow-outside run ...` is parsed before the subcommand instead of treating `run`
+  as a workspace directory.
+- Interrupting a turn can no longer append both the partial and the completed answer.
+- Path checks resolve absolute and `..` paths before deciding whether they escape the workspace.
+
 ### Security
 
 - Dangerous bash deny-patterns, workspace secret redaction, and config permissions.

@@ -454,6 +454,7 @@ class RbitApp(App[None]):
         self._tool_widgets: dict[str, ToolCallCard] = {}
         self._save_timer: Timer | None = None
         self._live_card: AssistantMessageCard | None = None
+        self._interrupted_turn: bool = False
 
         self.executor = ToolExecutor(
             workspace=self.workspace,
@@ -725,7 +726,7 @@ class RbitApp(App[None]):
             return
         if self.is_busy:
             self.workers.cancel_all()
-            self._finalize_interrupted()
+            self._interrupted_turn = self._finalize_interrupted()
             self.is_busy = False
             self.busy_status = ""
             self._post_notice("Interrupted by user (esc).")
@@ -1039,17 +1040,21 @@ class RbitApp(App[None]):
         """Follows new output only while the user is already at the bottom."""
         self.query_one("#chat-scroll", ChatScroll).follow_end()
 
-    def _finalize_interrupted(self) -> None:
+    def _finalize_interrupted(self) -> bool:
         """Persists the partial streamed answer with an `interrupted` marker."""
         card = self._live_card
         self._live_card = None
         if card is None or not card.msg.content.strip():
-            return
+            return False
         pending = card.msg
         pending.interrupted = True
-        pending.duration_s = max(pending.duration_s, 0.0)
         self.session.messages.append(pending)
+        try:
+            card.query_one(".assistant-meta", Static).update(card._build_meta_text())
+        except Exception:
+            pass
         self._schedule_save_session()
+        return True
 
     def _schedule_save_session(self, delay: float = 1.2) -> None:
         """Debounces session writes so streaming chunks do not rewrite disk constantly."""
@@ -1063,6 +1068,12 @@ class RbitApp(App[None]):
             self.storage.save_session(self.session)
         except Exception:
             pass
+
+    def _toggle_last_card(self) -> None:
+        scroll = self.query_one("#chat-scroll", ChatScroll)
+        cards = list(scroll.query(ToolCallCard))
+        if cards:
+            cards[-1].expanded = not cards[-1].expanded
 
     def action_collapse_all_cards(self) -> None:
         scroll = self.query_one("#chat-scroll", ChatScroll)
@@ -1414,6 +1425,7 @@ class RbitApp(App[None]):
 
         raw = event.value.strip()
         if not raw:
+            self._toggle_last_card()
             return
 
         event.input.value = ""
@@ -1508,6 +1520,8 @@ class RbitApp(App[None]):
     async def _execute_agent_turn(self, user_msg: ChatMessage) -> None:
         scroll = self.query_one("#chat-scroll", ChatScroll)
         model_id = self.config_data.get("model", "rbit/smart-local")
+        self._live_card = None
+        self._interrupted_turn = False
 
         async def on_tool_start(rec: ToolCallRecord) -> None:
             card = ToolCallCard(rec)
@@ -1553,6 +1567,9 @@ class RbitApp(App[None]):
                 on_status=on_status,
                 on_stream_chunk=on_stream_chunk,
             )
+            if self._interrupted_turn:
+                self._live_card = None
+                return
             self.session.messages.append(reply)
             self._schedule_save_session(delay=0.05)
             live_card = self._live_card

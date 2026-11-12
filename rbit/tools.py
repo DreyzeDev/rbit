@@ -350,7 +350,8 @@ class ToolExecutor:
     def resolve_path(self, raw_path: str) -> Path:
         p = Path(raw_path)
         if not p.is_absolute():
-            p = (self.workspace / p).resolve()
+            p = self.workspace / p
+        p = p.resolve()
         try:
             p.relative_to(self.workspace)
         except ValueError:

@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 import pytest
-from textual.widgets import Label, OptionList, Static
+from textual.widgets import Input, Label, OptionList, Static
 
 from rbit.agent import HTTP_LIMITS, AgentEngine, MAX_PARALLEL_TOOLS, is_reasoning_model
 from rbit.app import RbitApp
@@ -2083,7 +2083,9 @@ async def test_enter_expands_card_and_ctrl_e_collapses(tmp_path: Path) -> None:
         await pilot.pause()
         assert card.expanded is False
 
-        card.focus()
+        inp = app.query_one("#prompt-input", Input)
+        inp.focus()
+        inp.value = ""
         await pilot.pause()
         await pilot.press("enter")
         await pilot.pause()
@@ -2132,3 +2134,44 @@ async def test_session_save_is_debounced(tmp_path: Path) -> None:
         assert app._save_timer is None
         stored = [s for s in app.storage.list_sessions() if s.id == app.session.id]
         assert stored and stored[0].title == "debounced session"
+
+
+def test_global_allow_outside_flag_before_subcommand(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rbit import cli as cli_mod
+
+    captured: dict[str, Any] = {}
+
+    async def fake_headless(args: Any) -> int:
+        captured["allow_outside"] = getattr(args, "allow_outside", False)
+        captured["prompt"] = args.prompt
+        return 0
+
+    monkeypatch.setattr(cli_mod, "_run_headless", fake_headless)
+    assert cli_main(["--allow-outside", "run", "hello"]) == 0
+    assert captured["allow_outside"] is True
+    assert captured["prompt"] == ["hello"]
+
+    assert cli_main(["run", "hi"]) == 0
+    assert captured["allow_outside"] is False
+
+
+@pytest.mark.asyncio
+async def test_interrupted_card_meta_and_finalize_result(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        await pilot.pause()
+        assert app._finalize_interrupted() is False
+
+        msg = ChatMessage(id="p2", role="assistant", content="partial answer", agent="build")
+        card = AssistantMessageCard(msg, [])
+        app.query_one("#chat-scroll", ChatScroll).mount(card)
+        app._live_card = card
+        await pilot.pause()
+
+        assert app._finalize_interrupted() is True
+        assert msg.interrupted is True
+        assert app._live_card is None
+        meta = str(card.query_one(".assistant-meta", Static).render())
+        assert "interrupted" in meta
