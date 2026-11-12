@@ -633,6 +633,88 @@ class AgentEngine:
             duration_ms=duration,
         )
 
+    @staticmethod
+    def _transcript_for_summary(messages: list[ChatMessage]) -> str:
+        lines: list[str] = []
+        for m in messages:
+            if m.role == "user":
+                lines.append(f"USER: {m.content[:1200]}")
+                continue
+            for tc in m.tool_calls:
+                lines.append(f"TOOL {tc.name}: {tc.summary}")
+            if m.content:
+                lines.append(f"ASSISTANT: {m.content[:1200]}")
+        return "\n".join(lines)[:14000]
+
+    @staticmethod
+    def _heuristic_summary(messages: list[ChatMessage]) -> str:
+        prompts = [m.content.strip().replace("\n", " ")[:140] for m in messages if m.role == "user"]
+        touched: list[str] = []
+        for m in messages:
+            for tc in m.tool_calls:
+                if tc.name in ("write", "edit", "multi_edit"):
+                    path = tc.arguments.get("filePath") or tc.arguments.get("path")
+                    if path and path not in touched:
+                        touched.append(str(path))
+        goal_lines = "\n".join(f"- {p}" for p in prompts[-8:]) or "- (no user prompts)"
+        files_line = ", ".join(f"`{f}`" for f in touched[:20]) or "none"
+        return f"**Goals**\n{goal_lines}\n\n**Files touched**\n{files_line}"
+
+    async def summarize_session(self, messages: list[ChatMessage], model_id: str) -> str:
+        """Summarizes older messages via the active LLM, with a deterministic fallback."""
+        cfg = self.get_config()
+        api_key = (cfg.get("api_key") or "").strip()
+        api_base = (cfg.get("api_base") or "https://openrouter.ai/api/v1").rstrip("/")
+        if api_base.endswith("/chat/completions"):
+            api_base = api_base[: -len("/chat/completions")]
+        info = get_model_info(model_id, self.extra_models)
+        is_ollama = (
+            model_id.startswith("ollama/")
+            or "ollama" in info.provider.lower()
+            or "localhost:11434" in api_base
+        )
+        remote_id = model_id.split("/", 1)[1] if model_id.startswith("ollama/") else model_id
+        remote = (not info.is_local_smart) and (bool(api_key) or is_ollama)
+        transcript = self._transcript_for_summary(messages)
+
+        if remote:
+            base = "http://localhost:11434/v1" if is_ollama and "openrouter.ai" in api_base else api_base
+            headers = {
+                "Authorization": f"Bearer {api_key or 'ollama'}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://rbit.cli",
+                "X-Title": "rbit",
+            }
+            payload = {
+                "model": remote_id,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You compact coding-agent sessions. Write a dense handoff summary of the "
+                            "transcript: goals, decisions, files touched, verified facts, and open TODOs. "
+                            "Max 220 words, Markdown bullets. No greetings."
+                        ),
+                    },
+                    {"role": "user", "content": transcript or "(empty transcript)"},
+                ],
+                "temperature": 0.2,
+            }
+            try:
+                if self.http_client is not None:
+                    resp = await self.http_client.post(f"{base}/chat/completions", headers=headers, json=payload)
+                else:
+                    async with httpx.AsyncClient(timeout=60.0) as client:
+                        resp = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
+                if resp.status_code < 400:
+                    text = (resp.json()["choices"][0]["message"].get("content") or "").strip()
+                    if text:
+                        return text
+            except Exception:
+                pass
+
+        return self._heuristic_summary(messages)
+
     async def _run_smart_local_agent(
         self,
         session: Session,

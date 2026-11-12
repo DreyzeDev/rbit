@@ -6,7 +6,7 @@
 [![Textual](https://img.shields.io/badge/TUI-Textual%208.x-fab283?style=flat-square)](https://textual.textualize.io/)
 [![License](https://img.shields.io/badge/License-MIT-7fd88f?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-5c9cf5?style=flat-square)](#)
-[![Tests](https://img.shields.io/badge/tests-pytest%2012%20passing-7fd88f?style=flat-square)](tests/test_app.py)
+[![Tests](https://img.shields.io/badge/tests-pytest%2016%20passing-7fd88f?style=flat-square)](tests/test_app.py)
 
 **Автономный полноэкранный AI-агент для терминала** — редактирует код, ищет по проекту, выполняет команды, хранит память проекта и откатывает время без Git.
 
@@ -44,7 +44,7 @@
 | **Память проекта** | `RBIT.md` + `/remember <правило>` — знания автоматически попадают в системный промпт каждой сессии |
 | **Real-time Streaming** | Настоящий SSE-стриминг ответов OpenAI-совместимого API в реальном времени |
 | **Модели** | OpenRouter / OpenAI / DeepSeek / любой OpenAI-compatible endpoint + автообнаружение локальной **Ollama** (`Ctrl+M`) |
-| **Инструменты** | `read`, `write`, `edit`, `multi_edit` (атомарно), `glob`, `grep`, `diagnostics`, `webfetch`, `bash`, `todowrite`, `subagent(explore)` + undo/redo стек |
+| **Инструменты** | `read`, `write`, `edit`, `multi_edit` (атомарно), `glob`, `grep`, `diagnostics`, `lint` (ruff), `webfetch`, `bash`, `todowrite`, `subagent(explore)` + undo/redo стек |
 | **Виртуальные аттачи** | `@diff`, `@staged`, `@git`, `@tree` — git-diff, staged-изменения, состояние ветки и дерево проекта попадают в контекст без чтения файлов |
 | **Команды проекта** | Свои слэш-команды из `.rbit/commands/*.md` с подстановкой `{args}` и автодополнением в палитре |
 | **Всё локально** | Сессии, конфиг, память и чекпоинты — в скрытой папке `.rbit/` вашего проекта |
@@ -115,7 +115,8 @@ rbit                                  # TUI по умолчанию
 /todo [задача]        Чеклист                       /undo      Отменить правку файлов
 /doctor               Диагностика (API, Ollama...)  /redo      Вернуть отменённое
 /model · /theme       Модель и тема                 /diff      Сводка изменений
-/init                 Анализ проекта + план         /compact   Сжать контекст
+/init                 Анализ проекта + план         /compact   Сжать контекст (LLM)
+/retry                Повторить последний промпт    /fork [N]  Ветка сессии от сообщения N
 ```
 
 ## CLI (headless / CI)
@@ -127,6 +128,8 @@ rbit doctor                                   # диагностика окру�
 rbit stats                                    # аналитика токенов и расходов
 rbit sessions                                 # список сохранённых сессий
 rbit export -o report.md                      # выгрузить переписку в Markdown
+rbit map                                      # карта проекта: файлы, языки, бюджет токенов
+rbit map --json --max-tokens 4000             # структурированный вывод для CI
 ```
 
 ## Тесты
@@ -143,7 +146,7 @@ Todo-лист, diff-карточки, undo/redo, чекпоинты, памят�
 ```
 rbit/
 ├── app.py         # Полноэкранное TUI-приложение (Home / Session / Bang Shell)
-├── cli.py         # CLI: run · doctor · stats · sessions · export
+├── cli.py         # CLI: run · doctor · stats · sessions · export · map
 ├── agent.py       # Движок: SSE-стриминг, Ollama discovery, Smart-агент
 ├── tools.py       # Инструменты агента + чекпоинты + undo/redo
 ├── storage.py     # Сессии, конфиг, память, чекпоинты, экспорт
@@ -165,8 +168,9 @@ rbit/
 - [x] Секрет-гард и авто-чекпоинты перед правками
 - [x] Виртуальные аттачи `@diff`/`@git`/`@staged`/`@tree` и команды проекта
 - [x] Суб-агент `subagent(explore)`
+- [x] Умная компакция контекста, `/retry` и `/fork`
+- [x] `rbit map` и инструмент `lint` (ruff с fallback на AST)
 - [ ] AST-индекс и symbol-index
-- [ ] `rbit map` и `rbit lint` в CLI
 
 ## Лицензия
 

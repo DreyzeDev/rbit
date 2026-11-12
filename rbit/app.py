@@ -26,7 +26,7 @@ from .modals import (
     ThemeSelectorModal,
     TodoManagerModal,
 )
-from .models import ChatMessage, Session, TodoItem, ToolCallRecord, short_id
+from .models import ChatMessage, FileChangeStat, Session, TodoItem, ToolCallRecord, short_id
 from .storage import StorageManager
 from .themes import RBIT_DARK, RBIT_LIGHT
 from .tools import VIRTUAL_ATTACHMENTS, ToolExecutor
@@ -663,6 +663,8 @@ class RbitApp(App[None]):
             "redo": self._cmd_redo,
             "diff": self._cmd_diff,
             "compact": self._cmd_compact,
+            "retry": self._cmd_retry,
+            "fork": lambda: self._cmd_fork(""),
             "init": lambda: self._submit_prompt("Проанализируй проект и создай подробный Todo-план"),
             "connect": self.action_open_connect,
             "clear": self.action_clear_chat,
@@ -868,6 +870,12 @@ class RbitApp(App[None]):
         if cmd == "/compact":
             self._cmd_compact()
             return True
+        if cmd == "/retry":
+            self._cmd_retry()
+            return True
+        if cmd == "/fork":
+            self._cmd_fork(arg)
+            return True
         if cmd == "/init":
             self._submit_prompt("Проанализируй структуру этого проекта и создай стартовый Todo-план")
             return True
@@ -965,25 +973,82 @@ class RbitApp(App[None]):
         self._post_notice("\n".join(lines))
 
     def _cmd_compact(self) -> None:
-        count = len(self.session.messages)
-        if count <= 2:
+        if len(self.session.messages) <= 2:
             self.notify("Context is already compact.", timeout=2.0)
             return
+        self._compact_context()
+
+    @work(exclusive=True)
+    async def _compact_context(self) -> None:
+        count = len(self.session.messages)
+        older = list(self.session.messages[:-2])
+        self.is_busy = True
+        self.busy_status = "Compacting context into a handoff summary..."
+        self._sync_ui()
+        try:
+            summary_text = await self.engine.summarize_session(
+                older, self.config_data.get("model", "rbit/smart-local")
+            )
+        except Exception as exc:
+            summary_text = self.engine._heuristic_summary(older) + f"\n\n(LLM summary failed: {exc})"
+
         summary_msg = ChatMessage(
             id=short_id(),
             role="assistant",
             content=(
-                f"**[Compacted]** Summarized {count - 2} earlier messages. "
-                f"Active todos: {len(self.session.todos)}."
+                f"**[Compacted]** {count - 2} earlier message(s) → handoff summary\n\n{summary_text}"
             ),
             agent=self.agent_mode,
             model=self.config_data.get("model", "rbit/smart-local"),
-            tokens=24,
+            tokens=max(24, len(summary_text) // 4),
         )
         self.session.messages = [summary_msg] + self.session.messages[-2:]
         self.storage.save_session(self.session)
+        self.is_busy = False
+        self.busy_status = ""
         self._rebuild_chat_view()
         self._sync_ui()
+
+    def _cmd_retry(self) -> None:
+        if self.is_busy:
+            self.notify("Agent is busy — press Esc first.", severity="warning")
+            return
+        msgs = self.session.messages
+        idx = next((i for i in range(len(msgs) - 1, -1, -1) if msgs[i].role == "user"), None)
+        if idx is None:
+            self.notify("Nothing to retry — no user prompt in this session.", severity="warning")
+            return
+        user_msg = msgs[idx]
+        self.session.messages = msgs[: idx + 1]
+        self.storage.save_session(self.session)
+        self._rebuild_chat_view()
+        self.is_busy = True
+        self.busy_status = "Retrying last prompt..."
+        self._sync_ui()
+        self._execute_agent_turn(user_msg)
+
+    def _cmd_fork(self, arg: str) -> None:
+        msgs = self.session.messages
+        if not msgs:
+            self.notify("Nothing to fork — session is empty.", severity="warning")
+            return
+        upto = len(msgs)
+        if arg.strip():
+            try:
+                upto = max(1, min(len(msgs), int(arg.strip())))
+            except ValueError:
+                self.notify("Usage: /fork [N] — N is the message index to branch at.", timeout=3.0)
+                return
+        forked = Session(title=(self.session.title[:40] + " (fork)"))
+        forked.messages = [ChatMessage.from_dict(m.to_dict()) for m in msgs[:upto]]
+        forked.todos = [TodoItem.from_dict(t.to_dict()) for t in self.session.todos]
+        forked.modified_files = {
+            k: FileChangeStat.from_dict(v.to_dict()) for k, v in self.session.modified_files.items()
+        }
+        self._load_session_into_ui(forked)
+        self.storage.save_session(forked)
+        self._sync_ui()
+        self.notify(f"Forked {upto} message(s) into new session {forked.id}.", timeout=3.0)
 
     def _cmd_help(self) -> None:
         help_txt = (
@@ -997,6 +1062,7 @@ class RbitApp(App[None]):
             "  @staged @tree    Attach staged diff / workspace file tree\n"
             "  /checkpoint [n]  Save Git-free workspace snapshot   /rewind    Restore snapshot\n"
             "  /remember <rule> Save persistent project memory     /export    Export session .md\n"
+            "  /retry           Re-run the last user prompt        /fork [N]  Branch session at message N\n"
             "  /todo [task]     Todo checklist manager             /doctor    Environment check\n"
             "  /models /themes  Switch model or live theme         /undo      Revert file edits"
         )

@@ -29,6 +29,8 @@ PALETTE_ITEMS: list[tuple[str, str, str, str]] = [
     ("Session", "undo", "Undo last file edit", "/undo"),
     ("Session", "redo", "Redo file edit", "/redo"),
     ("Session", "compact", "Compact session context", "/compact"),
+    ("Session", "retry", "Re-run the last prompt", "/retry"),
+    ("Session", "fork", "Fork session into a new branch", "/fork"),
     ("Session", "diff", "View modified files diff summary", "/diff"),
     ("Session", "clear", "Clear messages", "ctrl+l"),
     ("System", "toggle_sidebar", "Toggle sidebar", "ctrl+b"),

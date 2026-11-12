@@ -705,4 +705,122 @@ async def test_subagent_explore_and_virtual_attachment_expansion(tmp_path: Path)
     assert "bash" not in sub_tools
 
 
+@pytest.mark.asyncio
+async def test_smart_compaction_uses_llm_summary(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    app.config_data["model"] = "openai/gpt-4.1"
+    app.config_data["api_key"] = "test-key"
+    app.session.messages = [
+        ChatMessage(id=short_id(), role="user", content=f"шаг {i}") for i in range(5)
+    ]
+
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "SUMMARY: prior work on calc.py"}}]},
+        )
+
+    async with app.run_test(size=(130, 40)) as pilot:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as mock_client:
+            app.engine.http_client = mock_client
+            inp = app.query_one("#prompt-input")
+            inp.focus()
+            inp.value = "/compact"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    assert len(app.session.messages) == 3
+    summary = app.session.messages[0]
+    assert summary.content.startswith("**[Compacted]**")
+    assert "SUMMARY: prior work on calc.py" in summary.content
+    assert captured and "transcript" not in captured[0]["messages"][1]["content"].lower()
+    assert "USER: шаг 0" in captured[0]["messages"][1]["content"]
+    assert "tools" not in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_retry_and_fork_session(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    app.config_data["model"] = "rbit/smart-local"
+    async with app.run_test(size=(130, 40)) as pilot:
+        inp = app.query_one("#prompt-input")
+        inp.focus()
+        inp.value = "создай файл calc.py с калькулятором"
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        assert len(app.session.messages) == 2
+        first_reply_id = app.session.messages[1].id
+        old_session_id = app.session.id
+
+        inp.focus()
+        inp.value = "/retry"
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        assert len(app.session.messages) == 2
+        assert app.session.messages[0].role == "user"
+        assert app.session.messages[1].role == "assistant"
+        assert app.session.messages[1].id != first_reply_id
+
+        inp.focus()
+        inp.value = "/fork 1"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert app.session.id != old_session_id
+    assert len(app.session.messages) == 1
+    assert app.session.title.endswith("(fork)")
+    assert app.storage.find_session(old_session_id) is not None
+
+
+def test_cli_map_json_and_human(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "readme.md").write_text("# hello\n", encoding="utf-8")
+
+    assert cli_main(["map", str(tmp_path), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["file_count"] >= 2
+    assert payload["total_bytes"] > 0
+    assert payload["est_tokens"] == payload["total_bytes"] // 4
+    assert "Python" in payload["languages"]
+    assert any(item["path"] == "a.py" for item in payload["files"])
+
+    assert cli_main(["map", str(tmp_path)]) == 0
+    human = capsys.readouterr().out
+    assert "rbit map" in human
+    assert "Python" in human
+
+    assert cli_main(["map", str(tmp_path), "--max-tokens", "1", "--json"]) == 0
+    trimmed = json.loads(capsys.readouterr().out)
+    assert trimmed["truncated"] is True
+    assert len(trimmed["files"]) < payload["file_count"]
+
+
+@pytest.mark.asyncio
+async def test_lint_tool_reports_issues(tmp_path: Path) -> None:
+    (tmp_path / "bad.py").write_text("def broken(:\n    pass\n", encoding="utf-8")
+    (tmp_path / "good.py").write_text("x = 1\n", encoding="utf-8")
+
+    session = Session()
+    executor = ToolExecutor(workspace=tmp_path, session=session)
+
+    bad = await executor.execute("lint", {"filePath": "bad.py"})
+    combined = f"{bad.summary}\n{bad.output}".lower()
+    assert bad.ok is False
+    assert ("syntax" in combined) or ("e999" in combined) or ("invalid" in combined)
+
+    good = await executor.execute("lint", {"filePath": "good.py"})
+    assert good.ok is True
+    assert "0 issues" in f"{good.summary}\n{good.output}"
+
+
 

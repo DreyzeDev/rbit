@@ -9,6 +9,7 @@ import html
 import json
 import os
 import re
+import shutil
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -59,7 +60,7 @@ READONLY_BASH_PREFIXES = (
     "pytest",
 )
 
-READONLY_TOOLS: frozenset[str] = frozenset({"read", "glob", "grep", "webfetch", "diagnostics"})
+READONLY_TOOLS: frozenset[str] = frozenset({"read", "glob", "grep", "webfetch", "diagnostics", "lint"})
 
 VIRTUAL_ATTACHMENTS: frozenset[str] = frozenset({"diff", "git", "staged", "tree"})
 
@@ -407,6 +408,8 @@ class ToolExecutor:
                 res = await asyncio.to_thread(self._tool_grep, args)
             elif name == "diagnostics":
                 res = await asyncio.to_thread(self._tool_diagnostics, args)
+            elif name == "lint":
+                res = await self._tool_lint(args)
             elif name == "todowrite":
                 res = self._tool_todowrite(args)
             elif name == "webfetch":
@@ -627,6 +630,47 @@ class ToolExecutor:
                 break
         out = "\n".join(hits) if hits else "No matches found."
         return ToolResult(True, f"{len(hits)} matches", out)
+
+    async def _tool_lint(self, args: dict[str, Any]) -> ToolResult:
+        raw = str(args.get("filePath") or args.get("path") or ".").strip()
+        target = self.resolve_path(raw)
+        rel = self.rel_display(target)
+        if not target.exists():
+            return ToolResult(False, f"{rel} not found", f"Path not found: {rel}")
+
+        ruff = shutil.which("ruff")
+        if ruff:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    ruff,
+                    "check",
+                    "--output-format",
+                    "concise",
+                    str(target),
+                    cwd=str(self.workspace),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+            except Exception as exc:
+                return ToolResult(False, f"ruff failed: {rel}", f"ruff execution error: {exc}")
+            text = ("\n".join(
+                part for part in (
+                    out_b.decode("utf-8", errors="replace").strip(),
+                    err_b.decode("utf-8", errors="replace").strip(),
+                ) if part
+            )).strip()
+            ok = proc.returncode == 0
+            count = 0 if ok else len([ln for ln in text.splitlines() if ln.strip()])
+            return ToolResult(
+                ok,
+                "0 issues" if ok else f"{count} issues",
+                (text or "No lint issues.")[:6000],
+            )
+
+        diag = self._tool_diagnostics(args)
+        note = "ruff/pyflakes not installed — ran built-in syntax diagnostics only (pip install ruff)."
+        return ToolResult(diag.ok, f"fallback: {diag.summary}", f"{diag.output}\n\n{note}")
 
     def _tool_diagnostics(self, args: dict[str, Any]) -> ToolResult:
         raw = str(args.get("filePath") or args.get("path") or ".").strip()
@@ -879,6 +923,19 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "function": {
             "name": "diagnostics",
             "description": "Run syntax diagnostics on a file or directory (.py, .json, .toml, .xml, .svg).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lint",
+            "description": "Run a real linter (ruff when installed, else built-in syntax diagnostics) on a file or directory.",
             "parameters": {
                 "type": "object",
                 "properties": {

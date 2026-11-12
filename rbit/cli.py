@@ -1,13 +1,15 @@
-"""CLI entry point & subcommands for rbit: TUI, `run`, `doctor`, `stats`, `sessions`, `export`."""
+"""CLI entry point & subcommands for rbit: TUI, `run`, `doctor`, `stats`, `sessions`, `export`, `map`."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import os
 import platform
 import sys
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
@@ -222,6 +224,96 @@ def _run_export(workspace: Path, session_id: str | None, out_file: str | None) -
     return 0
 
 
+def _run_map(workspace: Path, max_tokens: int | None = None, as_json: bool = False) -> int:
+    from .tools import IGNORED_DIRS
+
+    lang_by_ext = {
+        ".py": "Python", ".pyi": "Python", ".js": "JavaScript", ".jsx": "JavaScript",
+        ".ts": "TypeScript", ".tsx": "TypeScript", ".rs": "Rust", ".go": "Go",
+        ".java": "Java", ".kt": "Kotlin", ".c": "C", ".h": "C", ".cpp": "C++",
+        ".hpp": "C++", ".cs": "C#", ".rb": "Ruby", ".php": "PHP", ".sh": "Shell",
+        ".ps1": "PowerShell", ".sql": "SQL", ".html": "HTML", ".css": "CSS",
+        ".scss": "SCSS", ".md": "Markdown", ".json": "JSON", ".toml": "TOML",
+        ".yaml": "YAML", ".yml": "YAML", ".svg": "SVG", ".txt": "Text",
+    }
+    files: list[dict[str, Any]] = []
+    languages: dict[str, dict[str, int]] = {}
+    total_bytes = 0
+    for root, dirs, names in os.walk(workspace):
+        dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS)
+        for name in sorted(names):
+            path = Path(root) / name
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            rel = path.relative_to(workspace).as_posix()
+            lang = lang_by_ext.get(path.suffix.lower(), "Other")
+            files.append({"path": rel, "bytes": size, "language": lang, "est_tokens": size // 4})
+            total_bytes += size
+            bucket = languages.setdefault(lang, {"files": 0, "bytes": 0})
+            bucket["files"] += 1
+            bucket["bytes"] += size
+
+    files.sort(key=lambda f: f["bytes"], reverse=True)
+    listed = files
+    truncated = False
+    if max_tokens and max_tokens > 0:
+        budget = 0
+        kept: list[dict[str, Any]] = []
+        for item in files:
+            if budget + item["est_tokens"] > max_tokens and kept:
+                truncated = True
+                break
+            kept.append(item)
+            budget += item["est_tokens"]
+        listed = kept
+
+    payload = {
+        "workspace": str(workspace),
+        "total_bytes": total_bytes,
+        "est_tokens": total_bytes // 4,
+        "file_count": len(files),
+        "languages": languages,
+        "files": listed,
+        "truncated": truncated,
+    }
+
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    console = Console()
+    kib = total_bytes / 1024
+    console.print(
+        f"[bold #fab283]rbit map[/] [#808080]{len(files)} files · {kib:,.1f} KB · "
+        f"~{total_bytes // 4:,} tokens[/]"
+    )
+    if languages:
+        parts = [
+            f"{lang} {meta['files']} ({meta['bytes'] / 1024:,.1f} KB)"
+            for lang, meta in sorted(languages.items(), key=lambda kv: kv[1]["bytes"], reverse=True)
+        ]
+        console.print(f"[#5c9cf5]Languages:[/] [#eeeeee]{' · '.join(parts[:8])}[/]")
+    if listed:
+        table = Table(show_header=True, header_style="#5c9cf5", box=None)
+        table.add_column("File", style="#eeeeee")
+        table.add_column("Size", justify="right", style="#808080")
+        table.add_column("~Tokens", justify="right", style="#808080")
+        table.add_column("Lang", style="#808080")
+        for item in listed[:20]:
+            table.add_row(
+                item["path"],
+                f"{item['bytes'] / 1024:,.1f} KB",
+                f"{item['est_tokens']:,}",
+                item["language"],
+            )
+        console.print(table)
+    if truncated:
+        console.print(f"[#808080]... truncated to ~{max_tokens:,} token budget[/]")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
 
@@ -233,7 +325,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "export"}
+    subcommands = {"run", "doctor", "stats", "sessions", "export", "map"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -276,6 +368,14 @@ def main(argv: list[str] | None = None) -> int:
             parsed = p.parse_args(rest)
             return _run_export(_resolve_workspace(parsed.dir), parsed.session_id, parsed.output)
 
+        if sub == "map":
+            p = argparse.ArgumentParser(prog="rbit map", description="Show a token-budgeted repository map")
+            p.add_argument("dir", nargs="?", help="Workspace directory")
+            p.add_argument("--max-tokens", type=int, default=None, help="Token budget for listed files")
+            p.add_argument("--json", action="store_true", help="Emit structured JSON output")
+            parsed = p.parse_args(rest)
+            return _run_map(_resolve_workspace(parsed.dir), parsed.max_tokens, parsed.json)
+
     # Default: Interactive Full-Screen TUI mode
     parser = argparse.ArgumentParser(
         prog="rbit",
@@ -287,7 +387,8 @@ def main(argv: list[str] | None = None) -> int:
             "  rbit doctor [dir]      Diagnose environment, LLM API, Ollama & workspace health\n"
             "  rbit stats [dir]       Show token, cost & tool analytics across sessions\n"
             "  rbit sessions [dir]    List saved sessions in workspace\n"
-            "  rbit export [id]       Export session transcript to Markdown"
+            "  rbit export [id]       Export session transcript to Markdown\n"
+            "  rbit map [dir]         Repository map with sizes, languages & token budget"
         ),
     )
     parser.add_argument("target", nargs="?", help="Workspace directory path (defaults to current directory)")

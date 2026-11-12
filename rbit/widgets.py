@@ -35,6 +35,8 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/undo", "Undo last file modification"),
     ("/redo", "Redo previously undone modification"),
     ("/compact", "Compact session context history"),
+    ("/retry", "Re-run the last user prompt"),
+    ("/fork", "Branch the session into a new one at message N"),
     ("/diff", "Show modified files summary"),
     ("/init", "Analyze workspace and build initial Todo plan"),
     ("/connect", "Connect API provider (OpenRouter / OpenAI / Ollama)"),
