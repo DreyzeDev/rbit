@@ -710,10 +710,13 @@ class RbitApp(App[None]):
     # --- Modals & Actions ---
     @work
     async def action_open_palette(self) -> None:
-        act = await self.push_screen_wait(CommandPaletteModal())
+        act = await self.push_screen_wait(
+            CommandPaletteModal(self.config_data.get("palette_recents", []))
+        )
         if not act:
             self.query_one("#prompt-input", Input).focus()
             return
+        self._record_palette_use(act)
         dispatch = {
             "models": self.action_open_models,
             "theme": self.action_open_themes,
@@ -743,6 +746,13 @@ class RbitApp(App[None]):
         fn = dispatch.get(act)
         if fn:
             fn()
+
+    def _record_palette_use(self, act_id: str, keep: int = 5) -> None:
+        recents = [act_id] + [
+            item for item in self.config_data.get("palette_recents", []) if item != act_id
+        ]
+        self.config_data["palette_recents"] = recents[:keep]
+        self.storage.save_config(self.config_data)
 
     @work
     async def action_open_models(self) -> None:
@@ -827,6 +837,11 @@ class RbitApp(App[None]):
             self.config_data["api_base"] = res["api_base"]
             self.config_data["api_key"] = res["api_key"]
             self.storage.save_config(self.config_data)
+            if self.config_data["api_key"]:
+                ok, message = await self.engine.validate_api_key(
+                    self.config_data["api_base"], self.config_data["api_key"]
+                )
+                self.notify(("✓ " if ok else "✗ ") + message, timeout=4.0)
             self._sync_ui()
         self.query_one("#prompt-input", Input).focus()
 

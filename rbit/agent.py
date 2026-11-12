@@ -33,6 +33,7 @@ from .tools import (
 MAX_PARALLEL_TOOLS = 4
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 logger = logging.getLogger("rbit.agent")
+HTTP_LIMITS = httpx.Limits(max_keepalive_connections=10, max_connections=20)
 
 ToolStartHook = Callable[[ToolCallRecord], Awaitable[None]]
 ToolEndHook = Callable[[ToolCallRecord], Awaitable[None]]
@@ -110,6 +111,34 @@ class AgentEngine:
         self.extra_models = await discover_ollama_models()
         self.ollama_online = bool(self.extra_models)
         return self.extra_models
+
+    async def validate_api_key(self, api_base: str, api_key: str) -> tuple[bool, str]:
+        """Checks a provider key with GET /models and returns a human-readable result."""
+        base = (api_base or "").strip().rstrip("/")
+        if base.endswith("/chat/completions"):
+            base = base[: -len("/chat/completions")]
+        url = f"{base}/models"
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        try:
+            if self.http_client is not None:
+                resp = await self.http_client.get(url, headers=headers)
+            else:
+                async with httpx.AsyncClient(timeout=10.0, limits=HTTP_LIMITS) as client:
+                    resp = await client.get(url, headers=headers)
+        except Exception as exc:
+            return False, f"Cannot reach {base}: {exc}"
+        if resp.status_code in (401, 403):
+            return False, f"Invalid API key (HTTP {resp.status_code})."
+        if resp.status_code >= 400:
+            return False, f"Provider returned HTTP {resp.status_code} for /models."
+        count = 0
+        try:
+            data = resp.json()
+            listed = data.get("data") or data.get("models") or []
+            count = len(listed) if isinstance(listed, list) else 0
+        except Exception:
+            pass
+        return True, f"Connected: {count} models available" if count else "Connected."
 
     def _build_headers(self, api_key: str) -> dict[str, str]:
         headers = {
@@ -340,7 +369,7 @@ class AgentEngine:
 
         if self.http_client is not None:
             return await _drive_steps(self.http_client)
-        async with httpx.AsyncClient(timeout=75.0) as client:
+        async with httpx.AsyncClient(timeout=75.0, limits=HTTP_LIMITS) as client:
             return await _drive_steps(client)
 
     @staticmethod
@@ -635,7 +664,7 @@ class AgentEngine:
         steps = 0
         last_content = ""
         used: list[str] = []
-        client_ctx = self.http_client or httpx.AsyncClient(timeout=75.0)
+        client_ctx = self.http_client or httpx.AsyncClient(timeout=75.0, limits=HTTP_LIMITS)
         try:
             for _ in range(5):
                 steps += 1

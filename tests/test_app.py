@@ -14,11 +14,12 @@ from typing import Any
 
 import httpx
 import pytest
+from textual.widgets import Label, OptionList
 
-from rbit.agent import AgentEngine, MAX_PARALLEL_TOOLS
+from rbit.agent import HTTP_LIMITS, AgentEngine, MAX_PARALLEL_TOOLS
 from rbit.app import RbitApp
 from rbit.cli import main as cli_main
-from rbit.modals import HelpModal
+from rbit.modals import CommandPaletteModal, HelpModal
 from rbit.models import ChatMessage, ModelInfo, Session, ToolCallRecord, short_id
 from rbit.tools import ToolExecutor, ToolResult, is_secret_file, redact_secrets
 from rbit.widgets import (
@@ -1525,3 +1526,97 @@ def test_workspace_fixture_and_env_isolation(workspace: Path) -> None:
     assert (workspace / ".rbit").is_dir()
     assert os.environ.get("OPENAI_API_KEY") is None
     assert os.environ.get("RBIT_API_KEY") is None
+
+
+def test_workspace_file_listing_is_cached_and_invalidated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    calls = {"n": 0}
+    real_walk = os.walk
+
+    def counting_walk(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        return real_walk(*args, **kwargs)
+
+    monkeypatch.setattr("rbit.tools.os.walk", counting_walk)
+    first = executor.list_workspace_files()
+    assert "a.py" in first
+    assert calls["n"] == 1
+
+    executor.list_workspace_files()
+    assert calls["n"] == 1
+
+    executor._tool_write({"filePath": "b.py", "content": "y = 2\n"})
+    refreshed = executor.list_workspace_files()
+    assert calls["n"] == 2
+    assert "b.py" in refreshed
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_via_models_endpoint(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: {})
+    assert HTTP_LIMITS.max_keepalive_connections >= 1
+
+    def ok_handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://mock.local/v1/models"
+        assert request.headers["authorization"] == "Bearer good-key"
+        return httpx.Response(200, json={"data": [{"id": "a"}, {"id": "b"}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(ok_handler)) as client:
+        engine.http_client = client
+        ok, message = await engine.validate_api_key(
+            "https://mock.local/v1/chat/completions", "good-key"
+        )
+    assert ok is True
+    assert "2 models" in message
+
+    def deny_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "unauthorized"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(deny_handler)) as client:
+        engine.http_client = client
+        ok, message = await engine.validate_api_key("https://mock.local/v1", "bad-key")
+    assert ok is False
+    assert "Invalid API key" in message
+
+
+@pytest.mark.asyncio
+async def test_palette_shows_recents_first(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        await app.push_screen(CommandPaletteModal(recents=["diff", "todo"]))
+        await pilot.pause()
+        olist = app.screen.query_one("#palette-list", OptionList)
+        ids = [olist.get_option_at_index(i).id for i in range(olist.option_count)]
+        assert ids[1] == "diff"
+        assert ids[2] == "todo"
+        foot = app.screen.query_one("#palette-foot", Label)
+        assert "last used" in str(foot.render()).lower()
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, CommandPaletteModal)
+
+        app._record_palette_use("diff")
+        app._record_palette_use("todo")
+        assert app.config_data["palette_recents"][:2] == ["todo", "diff"]
+        saved = json.loads((tmp_path / ".rbit" / "config.json").read_text(encoding="utf-8"))
+        assert saved["palette_recents"][:2] == ["todo", "diff"]
+
+
+def test_community_health_files_present() -> None:
+    root = Path(__file__).resolve().parents[1]
+    for rel in (
+        "CONTRIBUTING.md",
+        "SECURITY.md",
+        "CHANGELOG.md",
+        ".github/PULL_REQUEST_TEMPLATE.md",
+        ".github/ISSUE_TEMPLATE/bug_report.md",
+        ".github/ISSUE_TEMPLATE/feature_request.md",
+    ):
+        assert (root / rel).is_file(), rel
+    assert "pytest" in (root / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    assert "vulnerability" in (root / "SECURITY.md").read_text(encoding="utf-8").lower()

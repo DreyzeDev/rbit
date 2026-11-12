@@ -306,6 +306,7 @@ class ToolExecutor:
         self._gitignore: GitIgnoreMatcher | None = None
         self._background_procs: list[asyncio.subprocess.Process] = []
         self._webfetch_cache: dict[str, tuple[float, str]] = {}
+        self._file_cache: tuple[float, list[str]] | None = None
 
     def _gitignore_matcher(self) -> GitIgnoreMatcher:
         if self._gitignore is None:
@@ -346,7 +347,13 @@ class ToolExecutor:
         except ValueError:
             return str(path)
 
+    def invalidate_file_cache(self) -> None:
+        self._file_cache = None
+
     def list_workspace_files(self, limit: int = 250) -> list[str]:
+        now = time.monotonic()
+        if self._file_cache is not None and now - self._file_cache[0] < 2.0:
+            return self._file_cache[1][:limit]
         results: list[str] = []
         ignore = self._gitignore_matcher()
         for root, dirs, files in os.walk(self.workspace):
@@ -363,9 +370,12 @@ class ToolExecutor:
                 if ignore.is_ignored(rel):
                     continue
                 results.append(rel)
-                if len(results) >= limit:
-                    return results
-        return results
+                if len(results) >= 2000:
+                    break
+            if len(results) >= 2000:
+                break
+        self._file_cache = (now, results)
+        return results[:limit]
 
     def _compute_diff(self, old: str, new: str, filename: str) -> tuple[str, int, int]:
         old_lines = old.splitlines(keepends=True)
@@ -455,6 +465,7 @@ class ToolExecutor:
             atomic_write_text(target, snap.previous_content)
         elif target.exists():
             target.unlink()
+        self.invalidate_file_cache()
         self.redo_stack.append(snap)
         rel = self.rel_display(target)
         if self.on_files_updated:
@@ -468,6 +479,7 @@ class ToolExecutor:
         target = Path(snap.path)
         target.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(target, snap.new_content)
+        self.invalidate_file_cache()
         self.undo_stack.append(snap)
         rel = self.rel_display(target)
         if self.on_files_updated:
@@ -477,6 +489,7 @@ class ToolExecutor:
     # --- Named Workspace Checkpoints (No Git required) ---
     def create_checkpoint(self, label: str = "") -> CheckpointMeta:
         files_map: dict[str, str] = {}
+        self.invalidate_file_cache()
         for rel in self.list_workspace_files(limit=400):
             full = self.workspace / rel
             if not self._secret_reads_allowed() and is_secret_file(full):
@@ -493,6 +506,7 @@ class ToolExecutor:
         if not loaded:
             return f"Checkpoint `{cid}` not found."
         meta, saved_files = loaded
+        self.invalidate_file_cache()
         current_files = set(self.list_workspace_files(limit=400))
 
         # Restore saved text files
@@ -502,7 +516,6 @@ class ToolExecutor:
             full.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_text(full, content)
             restored += 1
-
         # Remove newly created text files that didn't exist at checkpoint time
         removed = 0
         for rel in current_files - set(saved_files.keys()):
@@ -516,12 +529,14 @@ class ToolExecutor:
             except Exception:
                 continue
 
+        self.invalidate_file_cache()
         return f"Rewound workspace to `{meta.label}` ({restored} restored, {removed} removed)."
 
     # --- Direct Bang Shell Execution (!command) ---
     async def execute_bang_shell(self, command: str) -> ToolResult:
         t0 = time.perf_counter()
         res = await self._run_subprocess(command)
+        self.invalidate_file_cache()
         res.output = redact_secrets(res.output)
         res.duration_ms = int((time.perf_counter() - t0) * 1000)
         return res
@@ -643,6 +658,7 @@ class ToolExecutor:
 
         target.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(target, content)
+        self.invalidate_file_cache()
 
         self.undo_stack.append(
             FileSnapshot(
@@ -730,6 +746,7 @@ class ToolExecutor:
                 else old_content.replace(old_str, new_str, 1)
             )
         atomic_write_text(target, new_content)
+        self.invalidate_file_cache()
 
         self.undo_stack.append(
             FileSnapshot(
@@ -774,6 +791,7 @@ class ToolExecutor:
             updated = updated.replace(old_s, new_s) if rep_all else updated.replace(old_s, new_s, 1)
 
         atomic_write_text(target, updated)
+        self.invalidate_file_cache()
         self.undo_stack.append(
             FileSnapshot(
                 step_label=f"multi_edit {rel}",
@@ -1239,9 +1257,11 @@ class ToolExecutor:
         timeout_s = max(1.0, min(600.0, timeout_s))
 
         if args.get("background") or args.get("runInBackground"):
-            return await self._run_background(command)
-
-        return await self._run_subprocess(command, timeout_s=timeout_s)
+            result = await self._run_background(command)
+        else:
+            result = await self._run_subprocess(command, timeout_s=timeout_s)
+        self.invalidate_file_cache()
+        return result
 
     async def _run_background(self, command: str) -> ToolResult:
         if os.name == "nt":

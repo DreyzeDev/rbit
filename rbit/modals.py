@@ -123,8 +123,10 @@ class HelpModal(ModalScreen[None]):
 class CommandPaletteModal(ModalScreen[str | None]):
     BINDINGS = [Binding("escape", "cancel", "Close")]
 
-    def __init__(self) -> None:
+    def __init__(self, recents: list[str] | None = None) -> None:
         super().__init__()
+        known = {item[1] for item in PALETTE_ITEMS}
+        self.recents = [item for item in (recents or []) if item in known]
         self._filtered: list[str] = []
 
     def compose(self) -> ComposeResult:
@@ -132,10 +134,24 @@ class CommandPaletteModal(ModalScreen[str | None]):
             yield Static(_modal_header("Commands"), classes="oc-modal-header")
             yield Input(placeholder="Search", id="palette-search", classes="oc-modal-search")
             yield OptionList(id="palette-list", classes="oc-modal-list")
+            yield Label("", id="palette-foot", classes="oc-modal-foot")
 
     def on_mount(self) -> None:
         self._populate("")
         self.query_one("#palette-search", Input).focus()
+
+    def _add_option(self, item: tuple[str, str, str, str]) -> None:
+        _group, act_id, title, shortcut = item
+        self._filtered.append(act_id)
+        self.query_one("#palette-list", OptionList).add_option(
+            Option(_two_col_option(title, shortcut), id=act_id)
+        )
+
+    def _add_header(self, title: str, spaced: bool = False) -> None:
+        olist = self.query_one("#palette-list", OptionList)
+        if spaced:
+            olist.add_option(None)
+        olist.add_option(Option(Text(title, style="bold #fab283"), disabled=True))
 
     def _populate(self, query: str) -> None:
         q = query.lower().strip()
@@ -143,17 +159,43 @@ class CommandPaletteModal(ModalScreen[str | None]):
         olist.clear_options()
         self._filtered.clear()
 
-        last_group = ""
-        for group, act_id, title, shortcut in PALETTE_ITEMS:
-            if q and q not in title.lower() and q not in act_id.lower() and q not in group.lower():
-                continue
-            if group != last_group and not q:
-                if last_group:
-                    olist.add_option(None)
-                olist.add_option(Option(Text(group, style="bold #fab283"), disabled=True))
-                last_group = group
-            self._filtered.append(act_id)
-            olist.add_option(Option(_two_col_option(title, shortcut), id=act_id))
+        foot = self.query_one("#palette-foot", Label)
+        if self.recents and not q:
+            last_title = next(
+                (item[2] for item in PALETTE_ITEMS if item[1] == self.recents[0]), self.recents[0]
+            )
+            foot.update(Text(f"last used: {last_title}", style="#808080"))
+        else:
+            foot.update("")
+
+        if q:
+            matches = [
+                item
+                for item in PALETTE_ITEMS
+                if q in item[2].lower() or q in item[1].lower() or q in item[0].lower()
+            ]
+            matches.sort(key=lambda item: (0 if item[1] in self.recents else 1))
+            for item in matches:
+                self._add_option(item)
+        else:
+            recent_items = [
+                item
+                for recency_id in self.recents
+                for item in PALETTE_ITEMS
+                if item[1] == recency_id
+            ]
+            if recent_items:
+                self._add_header("Recent")
+                for item in recent_items:
+                    self._add_option(item)
+            last_group = ""
+            for item in PALETTE_ITEMS:
+                if item[1] in self.recents:
+                    continue
+                if item[0] != last_group:
+                    self._add_header(item[0], spaced=bool(last_group) or bool(recent_items))
+                    last_group = item[0]
+                self._add_option(item)
 
         if self._filtered:
             for idx in range(olist.option_count):
