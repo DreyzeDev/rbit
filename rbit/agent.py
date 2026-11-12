@@ -65,6 +65,25 @@ def _pretty_model_name(model_id: str) -> str:
     tail = model_id.rsplit("/", 1)[-1]
     return tail.replace("-", " ").replace("_", " ").strip() or model_id
 
+
+EFFORT_LEVELS = ("auto", "low", "medium", "high")
+REASONING_MARKERS = (
+    "o1",
+    "o3",
+    "o4",
+    "gpt-5",
+    "deepseek-r1",
+    "deepseek-reasoner",
+    "qwq",
+    "reasoning",
+    "thinking",
+)
+
+
+def is_reasoning_model(model_id: str) -> bool:
+    lowered = (model_id or "").lower()
+    return any(marker in lowered for marker in REASONING_MARKERS)
+
 ToolStartHook = Callable[[ToolCallRecord], Awaitable[None]]
 ToolEndHook = Callable[[ToolCallRecord], Awaitable[None]]
 StatusHook = Callable[[str], Awaitable[None]]
@@ -265,6 +284,17 @@ class AgentEngine:
             )
         count = len(models)
         return True, f"Connected: {count} models available" if count else "Connected.", models
+
+    def _reasoning_effort(self, model_id: str) -> str | None:
+        """Resolves the configured effort for this model, or None to omit the parameter."""
+        effort = str((self.get_config() or {}).get("effort") or "auto").lower()
+        if effort == "auto":
+            return "medium" if is_reasoning_model(model_id) else None
+        if effort not in ("low", "medium", "high"):
+            return None
+        if not is_reasoning_model(model_id):
+            return None
+        return effort
 
     def _build_headers(self, api_key: str) -> dict[str, str]:
         headers = {
@@ -578,6 +608,9 @@ class AgentEngine:
             "tool_choice": "auto",
             "stream": True,
         }
+        effort = self._reasoning_effort(model_id)
+        if effort is not None:
+            payload["reasoning_effort"] = effort
         full_text: list[str] = []
         tc_acc: dict[int, dict[str, Any]] = {}
 
@@ -672,6 +705,9 @@ class AgentEngine:
             "tools": OPENAI_TOOLS_SCHEMA,
             "tool_choice": "auto",
         }
+        effort = self._reasoning_effort(model_id)
+        if effort is not None:
+            payload["reasoning_effort"] = effort
         for attempt in range(1, self.retry_attempts + 1):
             try:
                 resp = await client.post(url, headers=headers, json=payload)

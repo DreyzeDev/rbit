@@ -24,6 +24,7 @@ from .models import ChatMessage, ModelInfo, Session, ToolCallRecord, get_model_i
 SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/models", "List and switch AI models (incl. local Ollama)"),
     ("/themes", "Switch color theme (live preview)"),
+    ("/effort", "Select reasoning effort (auto / low / medium / high)"),
     ("/todo", "Open interactive Todo list manager"),
     ("/checkpoint", "Save named workspace snapshot (no Git needed)"),
     ("/rewind", "Rewind workspace to a saved checkpoint"),
@@ -159,11 +160,18 @@ class PromptModelLabel(Static):
     class Clicked(Message):
         pass
 
-    def set_model(self, model_id: str, extra_models: list[ModelInfo] | None = None) -> None:
+    def set_model(
+        self,
+        model_id: str,
+        extra_models: list[ModelInfo] | None = None,
+        effort: str = "auto",
+    ) -> None:
         info = get_model_info(model_id, extra_models)
         t = Text()
         t.append(f"  {info.name}", style="#eeeeee")
         t.append(f"  {info.provider}", style="#808080")
+        if effort and effort != "auto":
+            t.append(f"  effort:{effort}", style="#fab283")
         self.update(t)
 
     def on_click(self, _event: events.Click) -> None:

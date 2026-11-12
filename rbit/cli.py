@@ -762,8 +762,7 @@ def main(argv: list[str] | None = None) -> int:
             "  rbit lint [dir]        Lint workspace; exit code 1 on issues (--json)\n"
             "  rbit init [dir]        Create RBIT.md + .rbit/memory.md from project scan\n"
             "  rbit commit [dir]      Draft a commit message from git diff (--apply to commit)\n"
-            "  rbit --generate-completion bash|zsh|powershell   Print shell completion script\n"
-            "\n"
+            "  rbit --generate-completion bash|zsh|powershell   Print shell completion script\n"            "\n"
             "Global flags: --quiet (warnings only), --verbose (info), --trace (debug)\n"
             "              --profile <name> applies a named overlay from config.json"
         ),
@@ -774,6 +773,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-s", "--session", help="Resume specific session by ID")
     parser.add_argument("-m", "--model", help="Override active model ID")
     parser.add_argument("-a", "--agent", choices=["build", "plan"], default="build", help="Initial agent mode")
+    parser.add_argument(
+        "-e",
+        "--effort",
+        choices=["auto", "low", "medium", "high"],
+        help="Reasoning effort for reasoning models (o-series, DeepSeek R, QwQ)",
+    )
     parser.add_argument("-v", "--version", action="store_true", help="Print rbit version and exit")
 
     parsed = parser.parse_args(args_list)
@@ -798,6 +803,7 @@ def main(argv: list[str] | None = None) -> int:
         initial_prompt=parsed.prompt,
         initial_agent=parsed.agent,
         initial_model=parsed.model,
+        initial_effort=parsed.effort,
     )
     app.run()
     return 0

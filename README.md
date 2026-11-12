@@ -6,7 +6,7 @@
 [![Textual](https://img.shields.io/badge/TUI-Textual%208.x-fab283?style=flat-square)](https://textual.textualize.io/)
 [![License](https://img.shields.io/badge/License-MIT-7fd88f?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-5c9cf5?style=flat-square)](#)
-[![Tests](https://img.shields.io/badge/tests-pytest%2055%20passing-7fd88f?style=flat-square)](tests/test_app.py)
+[![Tests](https://img.shields.io/badge/tests-pytest%2058%20passing-7fd88f?style=flat-square)](tests/test_app.py)
 [![CI](https://github.com/DreyzeDev/rbit/actions/workflows/ci.yml/badge.svg)](https://github.com/DreyzeDev/rbit/actions/workflows/ci.yml)
 
 **Автономный полноэкранный AI-агент для терминала** — редактирует код, ищет по проекту, выполняет команды, хранит память проекта и откатывает время без Git.
@@ -107,6 +107,7 @@ rbit C:\path\to\project               # открыть конкретный во
 | `Ctrl+P` / `Ctrl+K` | Палитра команд |
 | `Ctrl+M` | Выбор модели |
 | `Ctrl+T` | Темы (live preview) |
+| `/effort` | Reasoning effort (auto / low / medium / high) |
 | `Ctrl+O` | Менеджер Todo |
 | `Ctrl+B` | Показать/скрыть сайдбар |
 | `Ctrl+N` | Новая сессия |
@@ -125,11 +126,11 @@ rbit C:\path\to\project               # открыть конкретный во
 /remember <правило>   Память проекта               /export    Экспорт сессии в Markdown
 /todo [задача]        Чеклист                       /undo      Отменить правку файлов
 /doctor               Диагностика (API, Ollama...)  /redo      Вернуть отменённое
-/model · /theme       Модель и тема                 /diff      Сводка изменений
-/init                 Анализ проекта + план         /compact   Сжать контекст (LLM)
-/retry                Повторить последний промпт    /fork [N]  Ветка сессии от сообщения N
-/commit [yes]         Черновик коммита по diff       /commit yes  Подтвердить и закоммитить
-/copy                 Скопировать последний ответ    /help        Горячие клавиши и команды
+/model · /theme       Модель и тема                 /compact   Сжать контекст (LLM)
+/init                 Анализ проекта + план         /fork [N]  Ветка сессии от сообщения N
+/retry                Повторить последний промпт    /commit    Черновик коммита по diff
+/copy                 Скопировать последний ответ    /diff      Сводка изменений
+/help                 Горячие клавиши и команды     /effort    Reasoning effort (o-серия / R1)
 ```
 
 ## CLI (headless / CI)
@@ -142,6 +143,7 @@ rbit run --output-format jsonl "..."          # событийный поток 
 rbit commit [dir]                             # черновик сообщения коммита (--apply)
 rbit --generate-completion bash|zsh|powershell  # скрипт автодополнения
 rbit --profile work run "..."                 # оверлей настроек из config.json
+rbit --effort high run "..."                  # reasoning effort для reasoning-моделей
 rbit doctor                                   # диагностика окружения
 rbit stats                                    # аналитика токенов и расходов
 rbit sessions                                 # список сохранённых сессий
@@ -204,6 +206,7 @@ rbit/
 - [x] Кэш списка файлов, keep-alive пул `httpx`, проверка ключа в `/connect`, недавние в палитре, community-доки
 - [x] Импорт всех моделей провайдера в отдельную категорию при `/connect`
 - [x] Автопоиск моделей: кэш в конфиге, фоновое обновление при старте, `/connect` и открытии селектора
+- [x] Выбор reasoning effort (`/effort`, `--effort`) для o-серии, DeepSeek R и thinking-моделей
 - [ ] `apply_patch`, фоновый `bash`, session search
 
 ## Лицензия

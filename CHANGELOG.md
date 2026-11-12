@@ -21,6 +21,8 @@ All notable changes to rbit are documented here. The format follows
   category in the model picker and caches them in the config.
 - Automatic model discovery: cached provider models load immediately, refresh in the
   background at startup, on `/connect`, and whenever the model picker opens.
+- Reasoning effort selection (`/effort`, `--effort`, picker modal) for o-series,
+  DeepSeek R, QwQ, and other thinking models via `reasoning_effort`.
 
 ### Changed
 

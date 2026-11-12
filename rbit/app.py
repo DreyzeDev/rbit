@@ -22,6 +22,7 @@ from .modals import (
     CheckpointModal,
     CommandPaletteModal,
     ConnectApiModal,
+    EffortSelectorModal,
     HelpModal,
     ModelSelectorModal,
     PermissionModal,
@@ -421,6 +422,7 @@ class RbitApp(App[None]):
         initial_prompt: str | None = None,
         initial_agent: str = "build",
         initial_model: str | None = None,
+        initial_effort: str | None = None,
     ) -> None:
         super().__init__()
         self.workspace = (workspace or Path.cwd()).resolve()
@@ -428,6 +430,8 @@ class RbitApp(App[None]):
         self.config_data = self.storage.load_config()
         if initial_model:
             self.config_data["model"] = initial_model
+        if initial_effort:
+            self.config_data["effort"] = initial_effort
 
         self.session = initial_session or Session()
         self.agent_mode: str = initial_agent if initial_agent in ("build", "plan") else "build"
@@ -579,7 +583,11 @@ class RbitApp(App[None]):
         pbox.add_class(f"mode-{self.agent_mode}")
 
         self.query_one(AgentModeBadge).set_mode(self.agent_mode)
-        self.query_one(PromptModelLabel).set_model(model_id, self.engine.extra_models)
+        self.query_one(PromptModelLabel).set_model(
+            model_id,
+            self.engine.extra_models,
+            effort=str(self.config_data.get("effort", "auto")),
+        )
         self.query_one(PromptSubHints).update_state(
             busy=self.is_busy,
             status=self.busy_status,
@@ -733,6 +741,7 @@ class RbitApp(App[None]):
         dispatch = {
             "models": self.action_open_models,
             "theme": self.action_open_themes,
+        "effort": self.action_open_effort,
             "todo": self.action_open_todos,
             "checkpoint": lambda: self._cmd_checkpoint(""),
             "rewind": self.action_open_checkpoints,
@@ -781,6 +790,26 @@ class RbitApp(App[None]):
             self.config_data["model"] = chosen
             self.storage.save_config(self.config_data)
             self._sync_ui()
+        self.query_one("#prompt-input", Input).focus()
+
+    def _set_effort(self, value: str) -> None:
+        effort = value.strip().lower()
+        if effort not in ("auto", "low", "medium", "high"):
+            self.notify("Effort must be one of: auto, low, medium, high", severity="warning")
+            return
+        self.config_data["effort"] = effort
+        self.storage.save_config(self.config_data)
+        self._sync_ui()
+        self.notify(f"Reasoning effort: {effort}", timeout=2.0)
+
+    @work
+    async def action_open_effort(self) -> None:
+        model_id = self.config_data.get("model", "rbit/smart-local")
+        chosen = await self.push_screen_wait(
+            EffortSelectorModal(self.config_data.get("effort", "auto"), model_id)
+        )
+        if chosen:
+            self._set_effort(chosen)
         self.query_one("#prompt-input", Input).focus()
 
     @work
@@ -941,6 +970,12 @@ class RbitApp(App[None]):
             return True
         if cmd in ("/theme", "/themes"):
             self.action_open_themes()
+            return True
+        if cmd == "/effort":
+            if arg:
+                self._set_effort(arg)
+            else:
+                self.action_open_effort()
             return True
         if cmd in ("/sessions", "/session", "/resume"):
             self.action_open_sessions()

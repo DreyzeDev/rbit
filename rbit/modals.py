@@ -37,6 +37,7 @@ PALETTE_ITEMS: list[tuple[str, str, str, str]] = [
     ("Session", "clear", "Clear messages", "ctrl+l"),
     ("System", "toggle_sidebar", "Toggle sidebar", "ctrl+b"),
     ("System", "theme", "Switch theme", "ctrl+t"),
+    ("System", "effort", "Switch reasoning effort", "/effort"),
     ("System", "connect", "Connect provider / API key", "/connect"),
     ("System", "doctor", "Run system & API diagnostics", "/doctor"),
     ("System", "help", "Help & keybindings", "/help"),
@@ -94,6 +95,7 @@ HELP_MARKDOWN = """
 - `/doctor` — environment check
 - `/copy` — copy last answer
 - `/models` / `/themes` — switch model or theme
+- `/effort [auto|low|medium|high]` — reasoning effort for o-series / R1 models
 - `/todo [task]` — Todo checklist manager
 - `/undo` / `/redo` — revert or reapply edits
 - `/diff` — modified files summary
@@ -401,6 +403,62 @@ class ThemeSelectorModal(ModalScreen[str | None]):
     def action_cancel(self) -> None:
         if self.original_theme in self.app.available_themes:
             self.app.theme = self.original_theme
+        self.dismiss(None)
+
+
+EFFORT_CHOICES: list[tuple[str, str, str]] = [
+    ("auto", "Auto", "medium for reasoning models, omitted otherwise"),
+    ("low", "Low", "fastest, least reasoning tokens"),
+    ("medium", "Medium", "balanced default"),
+    ("high", "High", "deepest reasoning, slowest and costliest"),
+]
+
+
+class EffortSelectorModal(ModalScreen[str | None]):
+    """Picks the reasoning effort sent as `reasoning_effort` for reasoning models."""
+
+    BINDINGS = [Binding("escape", "cancel", "Close")]
+
+    def __init__(self, current_effort: str, model_id: str = "") -> None:
+        super().__init__()
+        self.current_effort = current_effort if current_effort in {e[0] for e in EFFORT_CHOICES} else "auto"
+        self.model_id = model_id
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="oc-modal"):
+            yield Static(_modal_header("Reasoning effort"), classes="oc-modal-header")
+            if self.model_id:
+                yield Static(
+                    f"[#808080]Model:[/] [bold #fab283]{self.model_id}[/]",
+                    classes="oc-perm-body",
+                )
+            yield OptionList(id="effort-list", classes="oc-modal-list")
+            yield Label(
+                "Sent only to reasoning models (o-series, DeepSeek R, QwQ, thinking models).",
+                classes="oc-modal-foot",
+            )
+
+    def on_mount(self) -> None:
+        olist = self.query_one("#effort-list", OptionList)
+        selected = 0
+        for idx, (effort_id, label, description) in enumerate(EFFORT_CHOICES):
+            olist.add_option(
+                Option(
+                    _two_col_option(label, description, active_dot=effort_id == self.current_effort),
+                    id=effort_id,
+                )
+            )
+            if effort_id == self.current_effort:
+                selected = idx
+        olist.highlighted = selected
+        olist.focus()
+
+    @on(OptionList.OptionSelected, "#effort-list")
+    def _on_select(self, event: OptionList.OptionSelected) -> None:
+        if event.option_id:
+            self.dismiss(event.option_id)
+
+    def action_cancel(self) -> None:
         self.dismiss(None)
 
 

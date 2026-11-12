@@ -16,10 +16,15 @@ import httpx
 import pytest
 from textual.widgets import Label, OptionList
 
-from rbit.agent import HTTP_LIMITS, AgentEngine, MAX_PARALLEL_TOOLS
+from rbit.agent import HTTP_LIMITS, AgentEngine, MAX_PARALLEL_TOOLS, is_reasoning_model
 from rbit.app import RbitApp
 from rbit.cli import main as cli_main
-from rbit.modals import CommandPaletteModal, HelpModal, ModelSelectorModal
+from rbit.modals import (
+    CommandPaletteModal,
+    EffortSelectorModal,
+    HelpModal,
+    ModelSelectorModal,
+)
 from rbit.models import ChatMessage, ModelInfo, Session, ToolCallRecord, short_id
 from rbit.tools import ToolExecutor, ToolResult, is_secret_file, redact_secrets
 from rbit.widgets import (
@@ -1705,3 +1710,82 @@ def test_community_health_files_present() -> None:
         assert (root / rel).is_file(), rel
     assert "pytest" in (root / "CONTRIBUTING.md").read_text(encoding="utf-8")
     assert "vulnerability" in (root / "SECURITY.md").read_text(encoding="utf-8").lower()
+
+
+def test_reasoning_effort_resolution(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+
+    cfg: dict[str, Any] = {"effort": "auto"}
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+    assert is_reasoning_model("openai/o3-mini") is True
+    assert is_reasoning_model("deepseek/deepseek-r1") is True
+    assert is_reasoning_model("openai/gpt-4.1") is False
+    assert engine._reasoning_effort("openai/o3-mini") == "medium"
+    assert engine._reasoning_effort("openai/gpt-4.1") is None
+
+    cfg["effort"] = "high"
+    assert engine._reasoning_effort("deepseek/deepseek-r1") == "high"
+    assert engine._reasoning_effort("openai/gpt-4.1") is None
+
+    cfg["effort"] = "bogus"
+    assert engine._reasoning_effort("openai/o3-mini") is None
+
+
+def test_effort_is_sent_in_request_payload(tmp_path: Path) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok", "tool_calls": []}}]},
+        )
+
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"effort": "low"}
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await engine._non_stream_chat_step(
+                client=client,
+                url="https://mock.local/v1/chat/completions",
+                headers={},
+                model_id="openai/o3-mini",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+    asyncio.run(run())
+    assert seen and seen[0]["reasoning_effort"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_effort_selector_and_command(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        app._set_effort("high")
+        assert app.config_data["effort"] == "high"
+        saved = json.loads((tmp_path / ".rbit" / "config.json").read_text(encoding="utf-8"))
+        assert saved["effort"] == "high"
+
+        app.config_data["effort"] = "auto"
+        await app.push_screen(EffortSelectorModal("auto", "openai/o3-mini"))
+        await pilot.pause()
+        olist = app.screen.query_one("#effort-list", OptionList)
+        ids = [olist.get_option_at_index(i).id for i in range(olist.option_count)]
+        assert ids == ["auto", "low", "medium", "high"]
+        await pilot.press("escape")
+        await pilot.pause()
+
+        inp = app.query_one("#prompt-input")
+        inp.focus()
+        inp.value = "/effort low"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.config_data["effort"] == "low"
+
+        inp.value = "/effort nonsense"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.config_data["effort"] == "low"
+
