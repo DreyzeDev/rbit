@@ -51,6 +51,8 @@ READONLY_BASH_PREFIXES = (
     "pytest",
 )
 
+READONLY_TOOLS: frozenset[str] = frozenset({"read", "glob", "grep", "webfetch"})
+
 MAX_CHECKPOINT_FILE_BYTES = 256_000
 
 
@@ -231,7 +233,7 @@ class ToolExecutor:
 
         try:
             if name == "read":
-                res = self._tool_read(args)
+                res = await asyncio.to_thread(self._tool_read, args)
             elif name == "write":
                 res = self._tool_write(args)
             elif name == "edit":
@@ -239,9 +241,9 @@ class ToolExecutor:
             elif name == "multi_edit":
                 res = self._tool_multi_edit(args)
             elif name == "glob":
-                res = self._tool_glob(args)
+                res = await asyncio.to_thread(self._tool_glob, args)
             elif name == "grep":
-                res = self._tool_grep(args)
+                res = await asyncio.to_thread(self._tool_grep, args)
             elif name == "todowrite":
                 res = self._tool_todowrite(args)
             elif name == "webfetch":

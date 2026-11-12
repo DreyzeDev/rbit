@@ -13,7 +13,9 @@ import httpx
 
 from .models import ChatMessage, ModelInfo, Session, ToolCallRecord, get_model_info, short_id
 from .storage import StorageManager
-from .tools import OPENAI_TOOLS_SCHEMA, ToolExecutor, ToolResult
+from .tools import OPENAI_TOOLS_SCHEMA, READONLY_TOOLS, ToolExecutor, ToolResult
+
+MAX_PARALLEL_TOOLS = 4
 
 ToolStartHook = Callable[[ToolCallRecord], Awaitable[None]]
 ToolEndHook = Callable[[ToolCallRecord], Awaitable[None]]
@@ -63,11 +65,13 @@ class AgentEngine:
         executor: ToolExecutor,
         get_config: Callable[[], dict[str, Any]],
         storage: StorageManager | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self.workspace = workspace
         self.executor = executor
         self.get_config = get_config
         self.storage = storage or StorageManager(workspace)
+        self.http_client = http_client
         self.extra_models: list[ModelInfo] = []
 
     async def refresh_ollama_models(self) -> list[ModelInfo]:
@@ -200,10 +204,14 @@ class AgentEngine:
             if m.role in ("user", "assistant"):
                 text = m.content
                 if m is user_msg and m.attachments:
-                    attached_blocks = []
-                    for rel in m.attachments:
-                        res = await self.executor.execute("read", {"filePath": rel, "limit": 160}, agent_mode)
-                        attached_blocks.append(f'<file path="{rel}">\n{res.output}\n</file>')
+                    att_sem = asyncio.Semaphore(MAX_PARALLEL_TOOLS)
+
+                    async def _read_attachment(rel: str) -> str:
+                        async with att_sem:
+                            res = await self.executor.execute("read", {"filePath": rel, "limit": 160}, agent_mode)
+                        return f'<file path="{rel}">\n{res.output}\n</file>'
+
+                    attached_blocks = await asyncio.gather(*(_read_attachment(rel) for rel in m.attachments))
                     text = "\n\n".join(attached_blocks) + "\n\n" + text
                 api_messages.append({"role": m.role, "content": text})
 
@@ -214,7 +222,7 @@ class AgentEngine:
             "X-Title": "rbit",
         }
 
-        async with httpx.AsyncClient(timeout=75.0) as client:
+        async def _drive_steps(client: httpx.AsyncClient) -> str:
             for step in range(10):
                 await on_status(f"Запрос к {model_id} (шаг {step + 1})...")
                 if on_stream_chunk is not None:
@@ -249,27 +257,82 @@ class AgentEngine:
                         "tool_calls": tool_calls,
                     }
                 )
-                for tc in tool_calls:
-                    fn_name = tc["function"]["name"]
-                    raw_args = tc["function"].get("arguments") or "{}"
-                    try:
-                        parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    except json.JSONDecodeError:
-                        parsed_args = {}
-                    res = await invoke_tool(fn_name, parsed_args)
-                    out_payload = res.output
-                    if res.diff:
-                        out_payload += f"\n\nDiff:\n{res.diff}"
-                    api_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "name": fn_name,
-                            "content": out_payload[:6000],
-                        }
-                    )
+                await self._dispatch_tool_calls(
+                    tool_calls=tool_calls,
+                    api_messages=api_messages,
+                    invoke_tool=invoke_tool,
+                    on_status=on_status,
+                )
 
-        return "Достигнут лимит шагов вызова инструментов (10)."
+            return "Достигнут лимит шагов вызова инструментов (10)."
+
+        if self.http_client is not None:
+            return await _drive_steps(self.http_client)
+        async with httpx.AsyncClient(timeout=75.0) as client:
+            return await _drive_steps(client)
+
+    @staticmethod
+    def _parse_tool_args(raw_args: Any) -> dict[str, Any]:
+        if isinstance(raw_args, dict):
+            return raw_args
+        if isinstance(raw_args, str) and raw_args.strip():
+            try:
+                parsed = json.loads(raw_args)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        return {}
+
+    @staticmethod
+    def _format_tool_message(tc_id: str, fn_name: str, res: ToolResult) -> dict[str, Any]:
+        out_payload = res.output
+        if res.diff:
+            out_payload += f"\n\nDiff:\n{res.diff}"
+        return {
+            "role": "tool",
+            "tool_call_id": tc_id,
+            "name": fn_name,
+            "content": out_payload[:6000],
+        }
+
+    async def _dispatch_tool_calls(
+        self,
+        tool_calls: list[dict[str, Any]],
+        api_messages: list[dict[str, Any]],
+        invoke_tool: Callable[[str, dict[str, Any]], Awaitable[ToolResult]],
+        on_status: StatusHook,
+    ) -> None:
+        """Runs contiguous read-only tool calls in parallel (Semaphore=4), keeping mutating tools as barriers."""
+        batches: list[list[tuple[dict[str, Any], str, dict[str, Any]]]] = []
+        for tc in tool_calls:
+            fn = tc.get("function") or {}
+            fn_name = fn.get("name", "")
+            parsed_args = self._parse_tool_args(fn.get("arguments"))
+            item = (tc, fn_name, parsed_args)
+            if fn_name in READONLY_TOOLS and batches and batches[-1][0][1] in READONLY_TOOLS:
+                batches[-1].append(item)
+            else:
+                batches.append([item])
+
+        for batch in batches:
+            if len(batch) == 1:
+                tc, fn_name, parsed_args = batch[0]
+                res = await invoke_tool(fn_name, parsed_args)
+                api_messages.append(self._format_tool_message(tc["id"], fn_name, res))
+            else:
+                await on_status(f"Параллельный вызов ({len(batch)} read-only инструментов)...")
+                sem = asyncio.Semaphore(MAX_PARALLEL_TOOLS)
+
+                async def _bounded_call(name: str, args: dict[str, Any]) -> ToolResult:
+                    async with sem:
+                        return await invoke_tool(name, args)
+
+                results = await asyncio.gather(
+                    *(_bounded_call(fn_name, parsed_args) for _, fn_name, parsed_args in batch)
+                )
+                for (tc, fn_name, _), res in zip(batch, results):
+                    api_messages.append(self._format_tool_message(tc["id"], fn_name, res))
 
     async def _stream_chat_step(
         self,
@@ -393,11 +456,18 @@ class AgentEngine:
         lower = text.lower()
 
         attached_summaries: list[str] = []
-        for rel in user_msg.attachments:
-            await on_status(f"Чтение контекста @{rel}...")
-            res = await invoke_tool("read", {"filePath": rel, "limit": 120})
-            if res.ok:
-                attached_summaries.append(f"- `{rel}` прочитан ({res.summary})")
+        if user_msg.attachments:
+            await on_status(f"Чтение контекста ({len(user_msg.attachments)} файлов)...")
+            att_sem = asyncio.Semaphore(MAX_PARALLEL_TOOLS)
+
+            async def _read_att(rel: str) -> tuple[str, ToolResult]:
+                async with att_sem:
+                    return rel, await invoke_tool("read", {"filePath": rel, "limit": 120})
+
+            att_results = await asyncio.gather(*(_read_att(rel) for rel in user_msg.attachments))
+            for rel, res in att_results:
+                if res.ok:
+                    attached_summaries.append(f"- `{rel}` прочитан ({res.summary})")
 
         # 1. Greetings / capabilities
         if re.fullmatch(r"(привет|ку|здравствуй|хай|йо|hello|hi|hey|кто ты\??|что ты умеешь\??)[!?.]*", lower):

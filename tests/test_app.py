@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from pathlib import Path
+from typing import Any
+
+import httpx
 import pytest
 
+from rbit.agent import AgentEngine, MAX_PARALLEL_TOOLS
 from rbit.app import RbitApp
 from rbit.cli import main as cli_main
+from rbit.models import ChatMessage, Session, ToolCallRecord, short_id
+from rbit.tools import ToolExecutor, ToolResult
 from rbit.widgets import (
     AgentModeBadge,
     AutocompletePopup,
@@ -195,3 +203,151 @@ def test_cli_subcommands_headless_run_doctor_stats(tmp_path: Path, capsys: pytes
     out_md = tmp_path / "cli_export.md"
     assert cli_main(["export", "-d", str(tmp_path), "-o", str(out_md)]) == 0
     assert out_md.exists()
+
+
+@pytest.mark.asyncio
+async def test_parallel_readonly_tool_calls_and_semaphore_limit(tmp_path: Path) -> None:
+    for i in range(6):
+        (tmp_path / f"f{i}.txt").write_text(f"payload-{i}\n", encoding="utf-8")
+
+    session = Session()
+    executor = ToolExecutor(workspace=tmp_path, session=session)
+
+    active = 0
+    peak_active = 0
+    orig_execute = executor.execute
+
+    async def slow_execute(name: str, args: dict[str, Any], agent_mode: str = "build") -> ToolResult:
+        nonlocal active, peak_active
+        active += 1
+        peak_active = max(peak_active, active)
+        try:
+            await asyncio.sleep(0.10)
+            return await orig_execute(name, args, agent_mode=agent_mode)
+        finally:
+            active -= 1
+
+    executor.execute = slow_execute  # type: ignore[method-assign]
+
+    captured_requests: list[dict[str, Any]] = []
+    step = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal step
+        body = json.loads(request.content.decode("utf-8"))
+        captured_requests.append(body)
+        step += 1
+        if step == 1:
+            tcs = [
+                {
+                    "id": f"call_{i}",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": json.dumps({"filePath": f"f{i}.txt"})},
+                }
+                for i in range(6)
+            ]
+            return httpx.Response(200, json={"choices": [{"message": {"content": "", "tool_calls": tcs}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Все 6 файлов прочитаны."}}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as mock_client:
+        engine = AgentEngine(
+            workspace=tmp_path,
+            executor=executor,
+            get_config=lambda: {"api_key": "test-key", "api_base": "https://mock.local/v1"},
+            http_client=mock_client,
+        )
+        user_msg = ChatMessage(id=short_id(), role="user", content="прочитай 6 файлов")
+        session.messages.append(user_msg)
+
+        async def _noop_rec(_rec: ToolCallRecord) -> None:
+            return
+
+        async def _noop_status(_s: str) -> None:
+            return
+
+        t0 = time.perf_counter()
+        reply = await engine.run_turn(
+            session=session,
+            user_msg=user_msg,
+            agent_mode="build",
+            model_id="openai/gpt-4.1",
+            on_tool_start=_noop_rec,
+            on_tool_end=_noop_rec,
+            on_status=_noop_status,
+        )
+        elapsed = time.perf_counter() - t0
+
+    assert reply.content == "Все 6 файлов прочитаны."
+    assert 2 <= peak_active <= MAX_PARALLEL_TOOLS
+    # Sequential 6 * (0.05 + 0.10)s would take >= 0.90s; bounded parallel (4 + 2) takes ~0.35s
+    assert elapsed < 0.75
+
+    second_req_msgs = captured_requests[1]["messages"]
+    tool_msgs = [m for m in second_req_msgs if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in tool_msgs] == [f"call_{i}" for i in range(6)]
+    for i, m in enumerate(tool_msgs):
+        assert f"payload-{i}" in m["content"]
+
+
+@pytest.mark.asyncio
+async def test_mixed_tool_calls_preserve_write_barrier(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("v1\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("b-init\n", encoding="utf-8")
+
+    session = Session()
+    executor = ToolExecutor(workspace=tmp_path, session=session)
+    captured_requests: list[dict[str, Any]] = []
+    step = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal step
+        body = json.loads(request.content.decode("utf-8"))
+        captured_requests.append(body)
+        step += 1
+        if step == 1:
+            tcs = [
+                {"id": "c1", "type": "function", "function": {"name": "read", "arguments": '{"filePath":"a.txt"}'}},
+                {"id": "c2", "type": "function", "function": {"name": "read", "arguments": '{"filePath":"b.txt"}'}},
+                {
+                    "id": "c3",
+                    "type": "function",
+                    "function": {"name": "write", "arguments": '{"filePath":"a.txt","content":"v2\\n"}'},
+                },
+                {"id": "c4", "type": "function", "function": {"name": "read", "arguments": '{"filePath":"a.txt"}'}},
+            ]
+            return httpx.Response(200, json={"choices": [{"message": {"content": "", "tool_calls": tcs}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Барьер соблюдён."}}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as mock_client:
+        engine = AgentEngine(
+            workspace=tmp_path,
+            executor=executor,
+            get_config=lambda: {"api_key": "test-key", "api_base": "https://mock.local/v1"},
+            http_client=mock_client,
+        )
+        user_msg = ChatMessage(id=short_id(), role="user", content="обнови a.txt")
+        session.messages.append(user_msg)
+
+        async def _noop_rec(_rec: ToolCallRecord) -> None:
+            return
+
+        async def _noop_status(_s: str) -> None:
+            return
+
+        reply = await engine.run_turn(
+            session=session,
+            user_msg=user_msg,
+            agent_mode="build",
+            model_id="openai/gpt-4.1",
+            on_tool_start=_noop_rec,
+            on_tool_end=_noop_rec,
+            on_status=_noop_status,
+        )
+
+    assert reply.content == "Барьер соблюдён."
+    tool_msgs = {m["tool_call_id"]: m["content"] for m in captured_requests[1]["messages"] if m["role"] == "tool"}
+    assert "1: v1" in tool_msgs["c1"]
+    assert "1: b-init" in tool_msgs["c2"]
+    assert "Wrote a.txt" in tool_msgs["c3"]
+    assert "1: v2" in tool_msgs["c4"]
+
