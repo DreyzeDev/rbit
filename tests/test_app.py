@@ -824,3 +824,117 @@ async def test_lint_tool_reports_issues(tmp_path: Path) -> None:
 
 
 
+
+@pytest.mark.asyncio
+async def test_token_counting_uses_tiktoken_when_available(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import rbit.models as models
+
+    class FakeEncoder:
+        def encode(self, text: str) -> list[int]:
+            return list(range(len(text)))
+
+    monkeypatch.setattr(models, "tiktoken", object())
+    monkeypatch.setattr(models, "_ENCODER", FakeEncoder())
+    assert models.count_tokens("hello") == 5
+    assert models.count_tokens("") == 0
+
+    monkeypatch.setattr(models, "tiktoken", None)
+    monkeypatch.setattr(models, "_ENCODER", None)
+    assert models.count_tokens("abcdefgh") == 2
+    assert models.count_tokens("abc") == 1
+
+    session = Session(messages=[ChatMessage(id=short_id(), role="user", content="abcd")])
+    assert session.total_tokens == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_backoff_on_429_and_5xx(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: {})
+    engine.retry_base_delay = 0.0
+    attempts = {"n": 0}
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(429, headers={"retry-after": "0"}, json={"error": "rate"})
+        if attempts["n"] == 2:
+            return httpx.Response(503, json={"error": "down"})
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ok", "tool_calls": []}}]}
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(flaky)) as client:
+        ok, content, _ = await engine._non_stream_chat_step(
+            client=client,
+            url="https://example.test/chat/completions",
+            headers={},
+            model_id="test",
+            messages=[],
+        )
+
+    assert ok is True
+    assert content == "ok"
+    assert attempts["n"] == 3
+    assert engine.retry_attempts == 4
+
+    def always_500(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "boom"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(always_500)) as client:
+        ok, content, _ = await engine._non_stream_chat_step(
+            client=client,
+            url="https://example.test/chat/completions",
+            headers={},
+            model_id="test",
+            messages=[],
+        )
+    assert ok is False
+    assert "500" in content
+
+
+def test_ci_workflow_runs_pytest_and_ruff() -> None:
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "pytest -q" in workflow
+    assert "ruff check" in workflow
+    assert "push" in workflow
+
+
+@pytest.mark.asyncio
+async def test_commit_command_drafts_and_confirms(tmp_path: Path) -> None:
+    import subprocess
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", *args], cwd=tmp_path, capture_output=True, text=True)
+
+    assert git("init").returncode == 0
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test User")
+    (tmp_path / "a.txt").write_text("one\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-m", "init")
+    (tmp_path / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
+
+    app = RbitApp(workspace=tmp_path)
+    app.config_data["model"] = "rbit/smart-local"
+    async with app.run_test(size=(130, 40)) as pilot:
+        inp = app.query_one("#prompt-input")
+        inp.focus()
+        inp.value = "/commit"
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._pending_commit
+        draft = app._pending_commit
+
+        inp.focus()
+        inp.value = "/commit yes"
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+    assert app._pending_commit == ""
+    subject = git("log", "-1", "--format=%s").stdout.strip()
+    assert subject == draft.splitlines()[0]
+    assert git("status", "--porcelain").stdout.strip() == ""

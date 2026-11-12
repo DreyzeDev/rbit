@@ -37,6 +37,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/compact", "Compact session context history"),
     ("/retry", "Re-run the last user prompt"),
     ("/fork", "Branch the session into a new one at message N"),
+    ("/commit", "Draft a Git commit message from the current diff"),
     ("/diff", "Show modified files summary"),
     ("/init", "Analyze workspace and build initial Todo plan"),
     ("/connect", "Connect API provider (OpenRouter / OpenAI / Ollama)"),

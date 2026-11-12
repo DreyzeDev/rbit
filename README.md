@@ -6,7 +6,8 @@
 [![Textual](https://img.shields.io/badge/TUI-Textual%208.x-fab283?style=flat-square)](https://textual.textualize.io/)
 [![License](https://img.shields.io/badge/License-MIT-7fd88f?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-5c9cf5?style=flat-square)](#)
-[![Tests](https://img.shields.io/badge/tests-pytest%2016%20passing-7fd88f?style=flat-square)](tests/test_app.py)
+[![Tests](https://img.shields.io/badge/tests-pytest%2020%20passing-7fd88f?style=flat-square)](tests/test_app.py)
+[![CI](https://github.com/DreyzeDev/rbit/actions/workflows/ci.yml/badge.svg)](https://github.com/DreyzeDev/rbit/actions/workflows/ci.yml)
 
 **Автономный полноэкранный AI-агент для терминала** — редактирует код, ищет по проекту, выполняет команды, хранит память проекта и откатывает время без Git.
 
@@ -42,12 +43,12 @@
 | **Bang Shell (`!`)** | `!git status`, `!pytest` — команда выполняется мгновенно и **без траты LLM-токенов** |
 | **Чекпоинты без Git** | `/checkpoint [имя]` — снимок всего проекта в `.rbit/checkpoints/`, `/rewind` — машина времени в любой момент, даже вне репозитория |
 | **Память проекта** | `RBIT.md` + `/remember <правило>` — знания автоматически попадают в системный промпт каждой сессии |
-| **Real-time Streaming** | Настоящий SSE-стриминг ответов OpenAI-совместимого API в реальном времени |
+| **Real-time Streaming** | Настоящий SSE-стриминг ответов OpenAI-совместимого API в реальном времени, с повторами на 429/5xx и экспоненциальным backoff |
 | **Модели** | OpenRouter / OpenAI / DeepSeek / любой OpenAI-compatible endpoint + автообнаружение локальной **Ollama** (`Ctrl+M`) |
 | **Инструменты** | `read`, `write`, `edit`, `multi_edit` (атомарно), `glob`, `grep`, `diagnostics`, `lint` (ruff), `webfetch`, `bash`, `todowrite`, `subagent(explore)` + undo/redo стек |
 | **Виртуальные аттачи** | `@diff`, `@staged`, `@git`, `@tree` — git-diff, staged-изменения, состояние ветки и дерево проекта попадают в контекст без чтения файлов |
 | **Команды проекта** | Свои слэш-команды из `.rbit/commands/*.md` с подстановкой `{args}` и автодополнением в палитре |
-| **Всё локально** | Сессии, конфиг, память и чекпоинты — в скрытой папке `.rbit/` вашего проекта |
+| **Всё локально** | Сессии, конфиг, память и чекпоинты — в скрытой папке `.rbit/` вашего проекта. Точный подсчёт токенов при установленном `tiktoken` (`pip install -e ".[tokens]"`) |
 
 ## Установка
 
@@ -117,6 +118,7 @@ rbit                                  # TUI по умолчанию
 /model · /theme       Модель и тема                 /diff      Сводка изменений
 /init                 Анализ проекта + план         /compact   Сжать контекст (LLM)
 /retry                Повторить последний промпт    /fork [N]  Ветка сессии от сообщения N
+/commit [yes]         Черновик коммита по diff       /commit yes  Подтвердить и закоммитить
 ```
 
 ## CLI (headless / CI)
@@ -170,6 +172,8 @@ rbit/
 - [x] Суб-агент `subagent(explore)`
 - [x] Умная компакция контекста, `/retry` и `/fork`
 - [x] `rbit map` и инструмент `lint` (ruff с fallback на AST)
+- [x] Точный подсчёт токенов (`tiktoken`), retry/backoff на 429/5xx, `/commit`
+- [x] CI: GitHub Actions — `pytest` + `ruff` на каждый push
 - [ ] AST-индекс и symbol-index
 
 ## Лицензия

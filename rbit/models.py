@@ -7,6 +7,28 @@ from datetime import datetime
 from typing import Any
 import uuid
 
+try:
+    import tiktoken
+except ImportError:  # optional dependency
+    tiktoken = None
+
+_ENCODER: Any = None
+
+
+def count_tokens(text: str) -> int:
+    """Accurate token count via tiktoken when installed; ~4 chars/token fallback."""
+    if not text:
+        return 0
+    global _ENCODER
+    if tiktoken is not None:
+        try:
+            if _ENCODER is None:
+                _ENCODER = tiktoken.get_encoding("cl100k_base")
+            return len(_ENCODER.encode(text))
+        except Exception:
+            pass
+    return max(1, len(text) // 4)
+
 
 def now_iso() -> str:
     return datetime.now().strftime("%H:%M")
@@ -136,9 +158,9 @@ class Session:
 
     @property
     def total_tokens(self) -> int:
-        base = sum(m.tokens or max(1, len(m.content) // 4) for m in self.messages)
+        base = sum(m.tokens or count_tokens(m.content) for m in self.messages)
         tool_toks = sum(
-            max(1, len(tc.output) // 4)
+            count_tokens(tc.output)
             for m in self.messages
             for tc in m.tool_calls
         )

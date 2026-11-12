@@ -11,7 +11,15 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
-from .models import ChatMessage, ModelInfo, Session, ToolCallRecord, get_model_info, short_id
+from .models import (
+    ChatMessage,
+    ModelInfo,
+    Session,
+    ToolCallRecord,
+    count_tokens,
+    get_model_info,
+    short_id,
+)
 from .storage import StorageManager
 from .tools import (
     OPENAI_TOOLS_SCHEMA,
@@ -22,6 +30,7 @@ from .tools import (
 )
 
 MAX_PARALLEL_TOOLS = 4
+RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
 ToolStartHook = Callable[[ToolCallRecord], Awaitable[None]]
 ToolEndHook = Callable[[ToolCallRecord], Awaitable[None]]
@@ -80,6 +89,19 @@ class AgentEngine:
         self.storage = storage or StorageManager(workspace)
         self.http_client = http_client
         self.extra_models: list[ModelInfo] = []
+        self.retry_attempts = 4
+        self.retry_base_delay = 0.6
+        self.retry_max_delay = 8.0
+
+    def _retry_delay(self, attempt: int, resp: httpx.Response | None = None) -> float:
+        if resp is not None:
+            raw = resp.headers.get("retry-after")
+            if raw:
+                try:
+                    return min(max(float(raw), 0.0), self.retry_max_delay)
+                except ValueError:
+                    pass
+        return min(self.retry_base_delay * (2 ** (attempt - 1)), self.retry_max_delay)
 
     async def refresh_ollama_models(self) -> list[ModelInfo]:
         self.extra_models = await discover_ollama_models()
@@ -172,7 +194,9 @@ class AgentEngine:
             )
 
         elapsed = round(time.perf_counter() - t0, 2)
-        tokens_est = max(12, len(content) // 4 + sum(len(tc.output) // 6 for tc in tool_records))
+        tokens_est = max(
+            12, count_tokens(content) + sum(count_tokens(tc.output) for tc in tool_records)
+        )
         return ChatMessage(
             id=short_id(),
             role="assistant",
@@ -251,6 +275,7 @@ class AgentEngine:
                         model_id=model_id,
                         messages=api_messages,
                         on_stream_chunk=on_stream_chunk,
+                        on_status=on_status,
                     )
                     if not ok:
                         return content
@@ -261,6 +286,7 @@ class AgentEngine:
                         headers=headers,
                         model_id=model_id,
                         messages=api_messages,
+                        on_status=on_status,
                     )
                     if not ok:
                         return content
@@ -360,6 +386,7 @@ class AgentEngine:
         model_id: str,
         messages: list[dict[str, Any]],
         on_stream_chunk: StreamHook,
+        on_status: StatusHook | None = None,
     ) -> tuple[bool, str, list[dict[str, Any]]]:
         payload: dict[str, Any] = {
             "model": model_id,
@@ -371,62 +398,81 @@ class AgentEngine:
         full_text: list[str] = []
         tc_acc: dict[int, dict[str, Any]] = {}
 
-        try:
-            async with client.stream("POST", url, headers=headers, json=payload) as resp:
-                if resp.status_code >= 400:
-                    err_body = (await resp.aread()).decode("utf-8", errors="replace")
-                    return (
-                        False,
-                        f"Ошибка API ({resp.status_code}): `{err_body[:300]}`\n\n"
-                        "Откройте `/connect` для настройки ключа или выберите `rbit/smart-local` в `/models`.",
-                        [],
-                    )
-                async for line in resp.aiter_lines():
-                    if not line or not line.startswith("data:"):
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                    if resp.status_code in RETRYABLE_STATUS and attempt < self.retry_attempts and not full_text:
+                        await resp.aread()
+                        delay = self._retry_delay(attempt, resp)
+                        if on_status is not None:
+                            await on_status(
+                                f"HTTP {resp.status_code} — повтор {attempt}/{self.retry_attempts - 1} через {delay:.1f}s..."
+                            )
+                        await asyncio.sleep(delay)
                         continue
-                    raw_data = line[5:].strip()
-                    if raw_data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(raw_data)
-                    except json.JSONDecodeError:
-                        continue
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
-                    txt_piece = delta.get("content")
-                    if txt_piece:
-                        full_text.append(txt_piece)
-                        await on_stream_chunk("".join(full_text))
-
-                    for tc_delta in delta.get("tool_calls") or []:
-                        idx = int(tc_delta.get("index", 0))
-                        entry = tc_acc.setdefault(
-                            idx,
-                            {
-                                "id": tc_delta.get("id") or f"call_{short_id()}",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            },
+                    if resp.status_code >= 400:
+                        err_body = (await resp.aread()).decode("utf-8", errors="replace")
+                        return (
+                            False,
+                            f"Ошибка API ({resp.status_code}): `{err_body[:300]}`\n\n"
+                            "Откройте `/connect` для настройки ключа или выберите `rbit/smart-local` в `/models`.",
+                            [],
                         )
-                        if tc_delta.get("id"):
-                            entry["id"] = tc_delta["id"]
-                        fn = tc_delta.get("function") or {}
-                        if fn.get("name"):
-                            entry["function"]["name"] += fn["name"]
-                        if fn.get("arguments"):
-                            entry["function"]["arguments"] += fn["arguments"]
-        except Exception as exc:
-            return (
-                False,
-                f"Не удалось подключиться к `{url}`: **{exc}**.\n\n"
-                "Проверьте настройки через `/connect` или переключитесь на `rbit/smart-local` в `/models`.",
-                [],
-            )
+                    async for line in resp.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        raw_data = line[5:].strip()
+                        if raw_data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(raw_data)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta") or {}
+                        txt_piece = delta.get("content")
+                        if txt_piece:
+                            full_text.append(txt_piece)
+                            await on_stream_chunk("".join(full_text))
 
-        ordered_tcs = [tc_acc[k] for k in sorted(tc_acc.keys())]
-        return True, "".join(full_text), ordered_tcs
+                        for tc_delta in delta.get("tool_calls") or []:
+                            idx = int(tc_delta.get("index", 0))
+                            entry = tc_acc.setdefault(
+                                idx,
+                                {
+                                    "id": tc_delta.get("id") or f"call_{short_id()}",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                },
+                            )
+                            if tc_delta.get("id"):
+                                entry["id"] = tc_delta["id"]
+                            fn = tc_delta.get("function") or {}
+                            if fn.get("name"):
+                                entry["function"]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                entry["function"]["arguments"] += fn["arguments"]
+                ordered_tcs = [tc_acc[k] for k in sorted(tc_acc.keys())]
+                return True, "".join(full_text), ordered_tcs
+            except Exception as exc:
+                if attempt < self.retry_attempts and not full_text:
+                    delay = self._retry_delay(attempt)
+                    if on_status is not None:
+                        await on_status(
+                            f"Сеть недоступна ({exc}) — повтор {attempt}/{self.retry_attempts - 1} через {delay:.1f}s..."
+                        )
+                    await asyncio.sleep(delay)
+                    continue
+                return (
+                    False,
+                    f"Не удалось подключиться к `{url}`: **{exc}**.\n\n"
+                    "Проверьте настройки через `/connect` или переключитесь на `rbit/smart-local` в `/models`.",
+                    [],
+                )
+
+        return (False, f"Не удалось получить ответ от `{url}` после повторных попыток.", [])
 
     async def _non_stream_chat_step(
         self,
@@ -435,6 +481,7 @@ class AgentEngine:
         headers: dict[str, str],
         model_id: str,
         messages: list[dict[str, Any]],
+        on_status: StatusHook | None = None,
     ) -> tuple[bool, str, list[dict[str, Any]]]:
         payload: dict[str, Any] = {
             "model": model_id,
@@ -442,41 +489,61 @@ class AgentEngine:
             "tools": OPENAI_TOOLS_SCHEMA,
             "tool_choice": "auto",
         }
-        try:
-            resp = await client.post(url, headers=headers, json=payload)
-        except Exception as exc:
-            return (
-                False,
-                f"Не удалось подключиться к `{url}`: **{exc}**.\n\n"
-                "Проверьте `/connect` или переключитесь на `rbit/smart-local` в `/models`.",
-                [],
-            )
-        if resp.status_code >= 400:
-            return (
-                False,
-                f"Ошибка API ({resp.status_code}): `{resp.text[:300]}`\n\n"
-                "Откройте `/connect` для настройки ключа или выберите `rbit/smart-local` в `/models`.",
-                [],
-            )
-        data = resp.json()
-        choice = data["choices"][0]["message"]
-        return True, choice.get("content") or "", choice.get("tool_calls") or []
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                resp = await client.post(url, headers=headers, json=payload)
+            except Exception as exc:
+                if attempt < self.retry_attempts:
+                    delay = self._retry_delay(attempt)
+                    if on_status is not None:
+                        await on_status(
+                            f"Сеть недоступна ({exc}) — повтор {attempt}/{self.retry_attempts - 1} через {delay:.1f}s..."
+                        )
+                    await asyncio.sleep(delay)
+                    continue
+                return (
+                    False,
+                    f"Не удалось подключиться к `{url}`: **{exc}**.\n\n"
+                    "Проверьте `/connect` или переключитесь на `rbit/smart-local` в `/models`.",
+                    [],
+                )
+            if resp.status_code in RETRYABLE_STATUS and attempt < self.retry_attempts:
+                delay = self._retry_delay(attempt, resp)
+                if on_status is not None:
+                    await on_status(
+                        f"HTTP {resp.status_code} — повтор {attempt}/{self.retry_attempts - 1} через {delay:.1f}s..."
+                    )
+                await asyncio.sleep(delay)
+                continue
+            if resp.status_code >= 400:
+                return (
+                    False,
+                    f"Ошибка API ({resp.status_code}): `{resp.text[:300]}`\n\n"
+                    "Откройте `/connect` для настройки ключа или выберите `rbit/smart-local` в `/models`.",
+                    [],
+                )
+            data = resp.json()
+            choice = data["choices"][0]["message"]
+            return True, choice.get("content") or "", choice.get("tool_calls") or []
+        return False, f"Не удалось получить ответ от `{url}` после повторных попыток.", []
 
-    async def _run_git(self, *args: str, timeout: float = 15.0) -> str:
+    async def _run_git_full(self, *args: str, timeout: float = 15.0) -> tuple[int, str]:
         try:
             proc = await asyncio.create_subprocess_exec(
                 "git",
                 *args,
                 cwd=str(self.workspace),
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
             )
             out, _err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            if proc.returncode != 0:
-                return ""
-            return out.decode("utf-8", errors="replace").strip()
-        except Exception:
-            return ""
+            return proc.returncode, out.decode("utf-8", errors="replace").strip()
+        except Exception as exc:
+            return 1, f"git unavailable: {exc}"
+
+    async def _run_git(self, *args: str, timeout: float = 15.0) -> str:
+        code, out = await self._run_git_full(*args, timeout=timeout)
+        return out if code == 0 else ""
 
     async def _virtual_attachment(self, name: str) -> str:
         """Expands @diff / @git / @staged / @tree into ready-to-use prompt context."""
@@ -714,6 +781,95 @@ class AgentEngine:
                 pass
 
         return self._heuristic_summary(messages)
+
+    @staticmethod
+    def _heuristic_commit_message(stat: str, diff: str) -> str:
+        files: list[str] = []
+        added = removed = 0
+        for line in stat.splitlines():
+            if "|" not in line:
+                continue
+            name = line.split("|", 1)[0].strip()
+            if not name:
+                continue
+            files.append(name)
+            plus = line.count("+")
+            minus = line.count("-")
+            added += plus
+            removed += minus
+        if not files:
+            files = [
+                ln[3:].strip()
+                for ln in diff.splitlines()
+                if ln.startswith(("+++ b/", "--- a/"))
+            ][:5]
+        scope = files[0].split("/")[0] if files else "workspace"
+        kind = "docs" if files and all(f.endswith((".md", ".rst", ".txt")) for f in files) else "chore"
+        subject = f"{kind}: update {len(files) or 'workspace'} file(s)" if files else "chore: update workspace"
+        if len(files) == 1 and files[0]:
+            subject = f"{kind}: update {files[0]}"
+        body = "\n".join(f"- {name}" for name in files[:12])
+        if len(files) > 12:
+            body += f"\n- ...and {len(files) - 12} more"
+        if not body:
+            body = f"- {scope}"
+        return f"{subject}\n\n{body}"
+
+    async def draft_commit_message(self, stat: str, diff: str, model_id: str) -> str:
+        """Drafts a Conventional Commits message from git diff, with a deterministic fallback."""
+        cfg = self.get_config()
+        api_key = (cfg.get("api_key") or "").strip()
+        api_base = (cfg.get("api_base") or "https://openrouter.ai/api/v1").rstrip("/")
+        if api_base.endswith("/chat/completions"):
+            api_base = api_base[: -len("/chat/completions")]
+        info = get_model_info(model_id, self.extra_models)
+        is_ollama = (
+            model_id.startswith("ollama/")
+            or "ollama" in info.provider.lower()
+            or "localhost:11434" in api_base
+        )
+        remote_id = model_id.split("/", 1)[1] if model_id.startswith("ollama/") else model_id
+        remote = (not info.is_local_smart) and (bool(api_key) or is_ollama)
+        if remote:
+            base = "http://localhost:11434/v1" if is_ollama and "openrouter.ai" in api_base else api_base
+            headers = {
+                "Authorization": f"Bearer {api_key or 'ollama'}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://rbit.cli",
+                "X-Title": "rbit",
+            }
+            payload = {
+                "model": remote_id,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You write Git commit messages from a diff. Follow Conventional Commits: "
+                            "a concise imperative subject (max 72 chars, no trailing period), a blank line, "
+                            "then 1-5 bullet points. Return ONLY the commit message, no code fences."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"git diff --stat:\n{stat[:3000]}\n\ndiff:\n{diff[:9000]}",
+                    },
+                ],
+                "temperature": 0.2,
+            }
+            try:
+                if self.http_client is not None:
+                    resp = await self.http_client.post(f"{base}/chat/completions", headers=headers, json=payload)
+                else:
+                    async with httpx.AsyncClient(timeout=60.0) as client:
+                        resp = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
+                if resp.status_code < 400:
+                    text = (resp.json()["choices"][0]["message"].get("content") or "").strip()
+                    text = text.removeprefix("```").removeprefix("text").removesuffix("```").strip()
+                    if text:
+                        return text
+            except Exception:
+                pass
+        return self._heuristic_commit_message(stat, diff)
 
     async def _run_smart_local_agent(
         self,

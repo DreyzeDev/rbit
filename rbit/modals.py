@@ -31,6 +31,7 @@ PALETTE_ITEMS: list[tuple[str, str, str, str]] = [
     ("Session", "compact", "Compact session context", "/compact"),
     ("Session", "retry", "Re-run the last prompt", "/retry"),
     ("Session", "fork", "Fork session into a new branch", "/fork"),
+    ("Session", "commit", "Draft/confirm a Git commit", "/commit"),
     ("Session", "diff", "View modified files diff summary", "/diff"),
     ("Session", "clear", "Clear messages", "ctrl+l"),
     ("System", "toggle_sidebar", "Toggle sidebar", "ctrl+b"),

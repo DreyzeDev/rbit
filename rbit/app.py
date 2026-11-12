@@ -26,7 +26,15 @@ from .modals import (
     ThemeSelectorModal,
     TodoManagerModal,
 )
-from .models import ChatMessage, FileChangeStat, Session, TodoItem, ToolCallRecord, short_id
+from .models import (
+    ChatMessage,
+    FileChangeStat,
+    Session,
+    TodoItem,
+    ToolCallRecord,
+    count_tokens,
+    short_id,
+)
 from .storage import StorageManager
 from .themes import RBIT_DARK, RBIT_LIGHT
 from .tools import VIRTUAL_ATTACHMENTS, ToolExecutor
@@ -400,6 +408,7 @@ class RbitApp(App[None]):
             get_config=lambda: self.config_data,
             storage=self.storage,
         )
+        self._pending_commit: str = ""
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="workspace-row"):
@@ -665,6 +674,7 @@ class RbitApp(App[None]):
             "compact": self._cmd_compact,
             "retry": self._cmd_retry,
             "fork": lambda: self._cmd_fork(""),
+            "commit": lambda: self._cmd_commit(""),
             "init": lambda: self._submit_prompt("Проанализируй проект и создай подробный Todo-план"),
             "connect": self.action_open_connect,
             "clear": self.action_clear_chat,
@@ -876,6 +886,9 @@ class RbitApp(App[None]):
         if cmd == "/fork":
             self._cmd_fork(arg)
             return True
+        if cmd == "/commit":
+            self._cmd_commit(arg)
+            return True
         if cmd == "/init":
             self._submit_prompt("Проанализируй структуру этого проекта и создай стартовый Todo-план")
             return True
@@ -1000,7 +1013,7 @@ class RbitApp(App[None]):
             ),
             agent=self.agent_mode,
             model=self.config_data.get("model", "rbit/smart-local"),
-            tokens=max(24, len(summary_text) // 4),
+            tokens=max(24, count_tokens(summary_text)),
         )
         self.session.messages = [summary_msg] + self.session.messages[-2:]
         self.storage.save_session(self.session)
@@ -1050,6 +1063,68 @@ class RbitApp(App[None]):
         self._sync_ui()
         self.notify(f"Forked {upto} message(s) into new session {forked.id}.", timeout=3.0)
 
+    def _cmd_commit(self, arg: str) -> None:
+        token = arg.strip().lower()
+        if token in ("yes", "y", "confirm", "apply"):
+            if not self._pending_commit:
+                self.notify("No pending commit — run /commit first.", timeout=2.5)
+                return
+            self._run_commit_apply()
+            return
+        if token in ("cancel", "no", "abort"):
+            self._pending_commit = ""
+            self.notify("Commit cancelled.", timeout=2.0)
+            return
+        if arg.strip():
+            self._pending_commit = arg.strip()
+            self.notify("Custom message staged. Send /commit yes to apply it.", timeout=3.0)
+            return
+        self._draft_commit()
+
+    @work(exclusive=True)
+    async def _draft_commit(self) -> None:
+        status = await self.engine._run_git("status", "--short")
+        unstaged_stat = await self.engine._run_git("diff", "--stat")
+        staged_stat = await self.engine._run_git("diff", "--staged", "--stat")
+        unstaged = await self.engine._run_git("diff")
+        staged = await self.engine._run_git("diff", "--staged")
+        if not status.strip() and not unstaged.strip() and not staged.strip():
+            self.notify("Nothing to commit — working tree is clean.", timeout=2.5)
+            return
+        stat = "\n".join(part for part in (unstaged_stat, staged_stat) if part) or status
+        diff = "\n".join(part for part in (unstaged, staged) if part) or status
+        message = await self.engine.draft_commit_message(
+            stat, diff, self.config_data.get("model", "rbit/smart-local")
+        )
+        self._pending_commit = message
+        preview = "\n".join(f"  {line}" for line in message.splitlines())
+        self._post_notice(
+            "# Proposed commit message\n\n"
+            f"{preview}\n\n"
+            "Send `/commit yes` to stage all changes and commit, "
+            "`/commit <your message>` to replace it, or `/commit cancel` to abort."
+        )
+        self._sync_ui()
+
+    @work(exclusive=True)
+    async def _run_commit_apply(self) -> None:
+        message = self._pending_commit
+        if not message:
+            return
+        code, out = await self.engine._run_git_full("add", "-A")
+        if code != 0:
+            self._post_notice(f"git add failed:\n```text\n{out[:500]}\n```")
+            return
+        code, out = await self.engine._run_git_full("commit", "-m", message)
+        if code != 0:
+            self._post_notice(f"git commit failed:\n```text\n{out[:500]}\n```")
+            return
+        self._pending_commit = ""
+        subject = message.splitlines()[0] if message else "(empty)"
+        detail = out.splitlines()[0] if out else ""
+        self._post_notice(f"Committed: `{subject}`\n{detail}")
+        self._sync_ui()
+
     def _cmd_help(self) -> None:
         help_txt = (
             "# rbit Keybindings & Power Commands\n"
@@ -1063,9 +1138,11 @@ class RbitApp(App[None]):
             "  /checkpoint [n]  Save Git-free workspace snapshot   /rewind    Restore snapshot\n"
             "  /remember <rule> Save persistent project memory     /export    Export session .md\n"
             "  /retry           Re-run the last user prompt        /fork [N]  Branch session at message N\n"
-            "  /todo [task]     Todo checklist manager             /doctor    Environment check\n"
-            "  /models /themes  Switch model or live theme         /undo      Revert file edits"
+            "  /commit [yes]    Draft or confirm a Git commit      /doctor    Environment check\n"
+            "  /models /themes  Switch model or live theme         /todo      Todo checklist manager\n"
+            "  /undo /redo      Revert or reapply file edits       /diff      Modified files summary"
         )
+        self._post_notice(help_txt)
         self._post_notice(help_txt)
 
     # --- Prompt Submission, Bang Shell & Agent Execution ---
