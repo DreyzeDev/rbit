@@ -6,7 +6,7 @@
 [![Textual](https://img.shields.io/badge/TUI-Textual%208.x-fab283?style=flat-square)](https://textual.textualize.io/)
 [![License](https://img.shields.io/badge/License-MIT-7fd88f?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-5c9cf5?style=flat-square)](#)
-[![Tests](https://img.shields.io/badge/tests-pytest%2044%20passing-7fd88f?style=flat-square)](tests/test_app.py)
+[![Tests](https://img.shields.io/badge/tests-pytest%2049%20passing-7fd88f?style=flat-square)](tests/test_app.py)
 [![CI](https://github.com/DreyzeDev/rbit/actions/workflows/ci.yml/badge.svg)](https://github.com/DreyzeDev/rbit/actions/workflows/ci.yml)
 
 **Автономный полноэкранный AI-агент для терминала** — редактирует код, ищет по проекту, выполняет команды, хранит память проекта и откатывает время без Git.
@@ -134,6 +134,7 @@ rbit run --json "..."                         # структурированны
 rbit run --output-format jsonl "..."          # событийный поток tool_call/message/done
 rbit commit [dir]                             # черновик сообщения коммита (--apply)
 rbit --generate-completion bash|zsh|powershell  # скрипт автодополнения
+rbit --profile work run "..."                 # оверлей настроек из config.json
 rbit doctor                                   # диагностика окружения
 rbit stats                                    # аналитика токенов и расходов
 rbit sessions                                 # список сохранённых сессий
@@ -192,6 +193,7 @@ rbit/
 - [x] Fallback на smart-local, `run --stdin`, атомарная запись, лимиты чтения и чекпоинтов, ANSI-санитайз
 - [x] Компактный режим (<100 колонок), тема high contrast, `rbit commit`, JSONL-поток, shell completion
 - [x] Индикатор Ollama в сайдбаре, экран помощи `F1`, флаги `--quiet/--verbose/--trace`, pre-commit
+- [x] `bash` timeout/background, читаемый `webfetch`, ripgrep-grep, профили `--profile`, изолированный conftest
 - [ ] `apply_patch`, фоновый `bash`, session search
 
 ## Лицензия

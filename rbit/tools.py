@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import xml.etree.ElementTree as ET
@@ -228,6 +229,45 @@ def redact_secrets(text: str) -> str:
     return out
 
 
+def html_to_markdown(raw: str) -> str:
+    """Converts HTML to a compact readable Markdown outline (headings, links, lists)."""
+    text = re.sub(
+        r"<(script|style|noscript|nav|header|footer|aside)[^>]*>.*?</\1>",
+        " ",
+        raw,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    def _heading(match: re.Match[str]) -> str:
+        level = int(match.group(1))
+        body = re.sub(r"<[^>]+>", "", match.group(2))
+        body = html.unescape(re.sub(r"\s+", " ", body)).strip()
+        return f"\n\n{'#' * level} {body}\n\n" if body else "\n\n"
+
+    text = re.sub(r"<h([1-3])[^>]*>(.*?)</h\1>", _heading, text, flags=re.DOTALL | re.IGNORECASE)
+
+    def _link(match: re.Match[str]) -> str:
+        href = match.group(1).strip()
+        label = re.sub(r"<[^>]+>", "", match.group(2))
+        label = html.unescape(re.sub(r"\s+", " ", label)).strip()
+        return f"[{label}]({href})" if label else href
+
+    text = re.sub(
+        r"<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
+        _link,
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(r"<li[^>]*>(.*?)</li>", r"\n- \1", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</(p|div|tr|section|article)>", "\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    lines = [line.strip() for line in text.splitlines()]
+    text = "\n".join(line for line in lines if line)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 @dataclass
 class ToolResult:
     ok: bool
@@ -264,6 +304,8 @@ class ToolExecutor:
         self.allow_secret_reads: bool = False
         self._auto_checkpoint_done: bool = False
         self._gitignore: GitIgnoreMatcher | None = None
+        self._background_procs: list[asyncio.subprocess.Process] = []
+        self._webfetch_cache: dict[str, tuple[float, str]] = {}
 
     def _gitignore_matcher(self) -> GitIgnoreMatcher:
         if self._gitignore is None:
@@ -770,6 +812,61 @@ class ToolExecutor:
         out = "\n".join(matches) if matches else "No files matched."
         return ToolResult(True, f"{len(matches)} matches", out)
 
+    def _grep_with_ripgrep(
+        self,
+        pattern: str,
+        include: str,
+        files_only: bool,
+        context: int,
+        max_per_file: int,
+    ) -> ToolResult | None:
+        rg = shutil.which("rg")
+        if not rg:
+            return None
+        cmd = [rg, "--line-number", "--no-heading", "--color", "never", "-i"]
+        if files_only:
+            cmd.append("-l")
+        if context:
+            cmd.extend(["-C", str(context)])
+        if max_per_file:
+            cmd.extend(["--max-count", str(max_per_file)])
+        if include != "*":
+            cmd.extend(["--glob", include])
+        cmd.extend(["--", pattern, "."])
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(self.workspace),
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        lines: list[str] = []
+        matched: list[str] = []
+        for raw_line in proc.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            rel = line[2:] if line.startswith("./") else line
+            if files_only:
+                if is_secret_file(self.workspace / rel) and not self._secret_reads_allowed():
+                    continue
+                matched.append(rel)
+                continue
+            path_part = rel.split(":", 1)[0]
+            if is_secret_file(self.workspace / path_part) and not self._secret_reads_allowed():
+                continue
+            lines.append(rel[:200])
+        if files_only:
+            out = "\n".join(matched) if matched else "No matches found."
+            return ToolResult(True, f"{len(matched)} files (rg)", out)
+        if proc.returncode not in (0, 1):
+            return None
+        out = "\n".join(lines) if lines else "No matches found."
+        return ToolResult(True, f"{len(lines)} lines (rg)", out)
+
     def _tool_grep(self, args: dict[str, Any]) -> ToolResult:
         pattern = str(args.get("pattern", ""))
         include = str(args.get("include", "*"))
@@ -785,6 +882,9 @@ class ToolExecutor:
         max_per_file = max(1, raw_per_file) if raw_per_file else 0
         if not pattern:
             return ToolResult(False, "empty pattern", "Regex pattern is required.")
+        rg_result = self._grep_with_ripgrep(pattern, include, files_only, context, max_per_file)
+        if rg_result is not None:
+            return rg_result
         regex = re.compile(pattern, re.IGNORECASE)
         hits: list[str] = []
         matched_files: list[str] = []
@@ -1084,17 +1184,21 @@ class ToolExecutor:
         url = str(args.get("url", "")).strip()
         if not url.startswith(("http://", "https://")):
             return ToolResult(False, "invalid url", "URL must start with http:// or https://")
+        cached = self._webfetch_cache.get(url)
+        if cached and time.time() - cached[0] < 600:
+            return ToolResult(True, f"cached · Markdown {len(cached[1])} chars", cached[1])
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             resp = await client.get(url, headers={"User-Agent": "rbit-cli/1.2"})
         raw = resp.text
-        # Strip scripts/styles and HTML tags cleanly
-        cleaned = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", raw, flags=re.DOTALL | re.IGNORECASE)
-        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
-        cleaned = html.unescape(re.sub(r"\s+", " ", cleaned)).strip()
+        cleaned = html_to_markdown(raw) if "<" in raw else raw.strip()
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = cleaned[:6000] or "(empty response)"
+        if resp.status_code < 400:
+            self._webfetch_cache[url] = (time.time(), cleaned)
         return ToolResult(
             resp.status_code < 400,
-            f"HTTP {resp.status_code} ({len(cleaned)} chars)",
-            cleaned[:6000] or "(empty response)",
+            f"HTTP {resp.status_code} · Markdown {len(cleaned)} chars",
+            cleaned,
         )
 
     async def _tool_bash(self, args: dict[str, Any], agent_mode: str = "build") -> ToolResult:
@@ -1128,9 +1232,61 @@ class ToolExecutor:
                     "Command execution rejected by user.",
                 )
 
-        return await self._run_subprocess(command)
+        try:
+            timeout_s = float(args.get("timeout", 30) or 30)
+        except (TypeError, ValueError):
+            timeout_s = 30.0
+        timeout_s = max(1.0, min(600.0, timeout_s))
 
-    async def _run_subprocess(self, command: str) -> ToolResult:
+        if args.get("background") or args.get("runInBackground"):
+            return await self._run_background(command)
+
+        return await self._run_subprocess(command, timeout_s=timeout_s)
+
+    async def _run_background(self, command: str) -> ToolResult:
+        if os.name == "nt":
+            proc = await asyncio.create_subprocess_exec(
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                command,
+                cwd=str(self.workspace),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        else:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                cwd=str(self.workspace),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        self._background_procs.append(proc)
+        return ToolResult(
+            True,
+            f"background pid {proc.pid}",
+            f"Started in background (pid {proc.pid}): {command}\n"
+            "Output is discarded; poll the process or write results to a file.",
+        )
+
+    async def terminate_background(self) -> int:
+        count = 0
+        for proc in self._background_procs:
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                    count += 1
+                except ProcessLookupError:
+                    pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+        self._background_procs.clear()
+        return count
+
+    async def _run_subprocess(self, command: str, timeout_s: float = 30.0) -> ToolResult:
         if os.name == "nt":
             proc = await asyncio.create_subprocess_exec(
                 "powershell",
@@ -1151,10 +1307,19 @@ class ToolExecutor:
             )
 
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except asyncio.TimeoutError:
             proc.kill()
-            return ToolResult(False, f"timeout: {command[:36]}", "Command timed out after 30s.")
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            return ToolResult(
+                False,
+                f"timeout: {command[:36]}",
+                f"Command timed out after {timeout_s:g}s. Increase the `timeout` argument "
+                "(max 600s) or use `background=true` for long-running processes.",
+            )
 
         stdout = stdout_b.decode("utf-8", errors="replace").strip()
         stderr = stderr_b.decode("utf-8", errors="replace").strip()
@@ -1363,10 +1528,14 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "bash",
-            "description": "Execute a shell/PowerShell command in the workspace.",
+            "description": "Execute a shell/PowerShell command in the workspace (supports timeout and background execution).",
             "parameters": {
                 "type": "object",
-                "properties": {"command": {"type": "string"}},
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "number", "description": "Seconds before aborting (1-600, default 30)."},
+                    "background": {"type": "boolean", "description": "Start detached and return immediately with a pid."},
+                },
                 "required": ["command"],
             },
         },

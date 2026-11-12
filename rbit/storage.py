@@ -60,6 +60,14 @@ class StorageManager:
                 default_cfg.update({k: v for k, v in loaded.items() if v is not None})
             except Exception:
                 pass
+
+        profile = (os.environ.get("RBIT_PROFILE") or "").strip()
+        if profile:
+            profiles = default_cfg.get("profiles")
+            if isinstance(profiles, dict) and isinstance(profiles.get(profile), dict):
+                default_cfg.update(
+                    {k: v for k, v in profiles[profile].items() if v is not None}
+                )
         return default_cfg
 
     def _detect_default_model(self) -> str:

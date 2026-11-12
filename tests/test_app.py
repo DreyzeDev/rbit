@@ -1435,3 +1435,93 @@ def test_pre_commit_config_present() -> None:
     assert "pytest" in config
     assert "mixed-line-ending" in config
     assert "end-of-file-fixer" in config
+
+
+@pytest.mark.asyncio
+async def test_bash_timeout_and_background(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+
+    slow = await executor.execute(
+        "bash",
+        {"command": 'python -c "import time; time.sleep(5)"', "timeout": 1},
+    )
+    assert slow.ok is False
+    assert "timed out" in slow.output.lower()
+    assert "background=true" in slow.output
+
+    bg = await executor.execute(
+        "bash",
+        {"command": 'python -c "import time; time.sleep(0.2)"', "background": True},
+    )
+    assert bg.ok is True
+    assert "background" in bg.summary
+    await asyncio.sleep(0.6)
+    await executor.terminate_background()
+
+
+def test_webfetch_converts_html_to_markdown(tmp_path: Path) -> None:
+    from rbit.tools import html_to_markdown
+
+    html = (
+        "<html><body><nav>menu</nav><h1>Title</h1>"
+        "<p>Hello <a href='/x'>link</a></p>"
+        "<ul><li>One</li><li>Two</li></ul>"
+        "<script>alert(1)</script><h2>Sub</h2></body></html>"
+    )
+    md = html_to_markdown(html)
+    assert "# Title" in md
+    assert "## Sub" in md
+    assert "[link](/x)" in md
+    assert "- One" in md and "- Two" in md
+    assert "menu" not in md
+    assert "alert(1)" not in md
+
+
+def test_grep_uses_ripgrep_when_available(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "a.py").write_text("hit\n", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    class FakeProc:
+        returncode = 0
+        stdout = "./a.py:3:hit\n"
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> FakeProc:
+        calls.append(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr("rbit.tools.shutil.which", lambda name: "rg" if name == "rg" else None)
+    monkeypatch.setattr("rbit.tools.subprocess.run", fake_run)
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    res = executor._tool_grep({"pattern": "hit", "include": "*.py"})
+    assert res.ok is True
+    assert "a.py:3:hit" in res.output
+    assert "(rg)" in res.summary
+    assert calls and "--glob" in calls[0] and "*.py" in calls[0]
+
+
+def test_cli_profile_overlay(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from rbit.storage import StorageManager
+
+    storage = StorageManager(tmp_path)
+    storage.ensure_dirs()
+    storage.save_config(
+        {
+            "model": "rbit/smart-local",
+            "theme": "rbit-dark",
+            "profiles": {"work": {"model": "openai/gpt-4.1", "theme": "rbit-light"}},
+        }
+    )
+    assert cli_main(["--profile", "work", "map", str(tmp_path), "--json"]) == 0
+    cfg = storage.load_config()
+    assert cfg["model"] == "openai/gpt-4.1"
+    assert cfg["theme"] == "rbit-light"
+    capsys.readouterr()
+
+    assert cli_main(["--profile"]) == 2
+
+
+def test_workspace_fixture_and_env_isolation(workspace: Path) -> None:
+    assert workspace.is_dir()
+    assert (workspace / ".rbit").is_dir()
+    assert os.environ.get("OPENAI_API_KEY") is None
+    assert os.environ.get("RBIT_API_KEY") is None

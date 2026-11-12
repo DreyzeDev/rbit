@@ -635,6 +635,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         logging.getLogger().setLevel(log_level)
 
+    if "--profile" in args_list:
+        idx = args_list.index("--profile")
+        if idx + 1 >= len(args_list) or args_list[idx + 1].startswith("-"):
+            Console(stderr=True).print("--profile requires a name (e.g. work, oss, local)")
+            return 2
+        os.environ["RBIT_PROFILE"] = args_list[idx + 1]
+        args_list = args_list[:idx] + args_list[idx + 2:]
+
     if args_list and args_list[0] == "--generate-completion":
         shell = args_list[1].lower() if len(args_list) > 1 else "bash"
         if shell not in COMPLETION_SCRIPTS:
@@ -756,7 +764,8 @@ def main(argv: list[str] | None = None) -> int:
             "  rbit commit [dir]      Draft a commit message from git diff (--apply to commit)\n"
             "  rbit --generate-completion bash|zsh|powershell   Print shell completion script\n"
             "\n"
-            "Global flags: --quiet (warnings only), --verbose (info), --trace (debug)"
+            "Global flags: --quiet (warnings only), --verbose (info), --trace (debug)\n"
+            "              --profile <name> applies a named overlay from config.json"
         ),
     )
     parser.add_argument("target", nargs="?", help="Workspace directory path (defaults to current directory)")
