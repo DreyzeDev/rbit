@@ -32,9 +32,25 @@ RBIT_LIGHT = Theme(
     dark=False,
 )
 
+RBIT_HIGH_CONTRAST = Theme(
+    name="rbit-contrast",
+    primary="#ffd166",
+    secondary="#6ec1ff",
+    accent="#d0a8ff",
+    warning="#ffb454",
+    error="#ff6b6b",
+    success="#8bff9e",
+    foreground="#ffffff",
+    background="#000000",
+    surface="#101010",
+    panel="#1a1a1a",
+    dark=True,
+)
+
 CURATED_THEMES: list[tuple[str, str]] = [
     ("rbit-dark", "rbit Dark (Default)"),
     ("rbit-light", "rbit Light"),
+    ("rbit-contrast", "rbit High Contrast"),
     ("catppuccin-mocha", "Catppuccin Mocha"),
     ("tokyo-night", "Tokyo Night"),
     ("gruvbox", "Gruvbox Dark"),

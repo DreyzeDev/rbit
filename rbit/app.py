@@ -38,7 +38,7 @@ from .models import (
     short_id,
 )
 from .storage import StorageManager
-from .themes import RBIT_DARK, RBIT_LIGHT
+from .themes import RBIT_DARK, RBIT_HIGH_CONTRAST, RBIT_LIGHT
 from .tools import VIRTUAL_ATTACHMENTS, ToolExecutor
 from .widgets import (
     AgentModeBadge,
@@ -471,6 +471,7 @@ class RbitApp(App[None]):
     def on_mount(self) -> None:
         self.register_theme(RBIT_DARK)
         self.register_theme(RBIT_LIGHT)
+        self.register_theme(RBIT_HIGH_CONTRAST)
 
         desired_theme = self.config_data.get("theme", "rbit-dark")
         if desired_theme in self.available_themes:
@@ -509,6 +510,13 @@ class RbitApp(App[None]):
     def _is_home_state(self) -> bool:
         return len(self.session.messages) == 0 and not self._has_inline_notices
 
+    @property
+    def _is_compact(self) -> bool:
+        try:
+            return self.size.width < 100
+        except Exception:
+            return False
+
     def _update_layout_mode(self) -> None:
         stage = self.query_one("#center-stage", Vertical)
         logo = self.query_one(HomeLogo)
@@ -524,7 +532,7 @@ class RbitApp(App[None]):
             tip.display = True
             header.display = False
             scroll.display = False
-            sidebar.display = self._sidebar_override_on_home
+            sidebar.display = self._sidebar_override_on_home and not self._is_compact
         else:
             stage.remove_class("is-home")
             stage.add_class("is-session")
@@ -532,7 +540,10 @@ class RbitApp(App[None]):
             tip.display = False
             header.display = True
             scroll.display = True
-            sidebar.display = bool(self.config_data.get("sidebar_visible", True))
+            sidebar.display = bool(self.config_data.get("sidebar_visible", True)) and not self._is_compact
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._update_layout_mode()
 
     def _sync_ui(self) -> None:
         model_id = self.config_data.get("model", "rbit/smart-local")

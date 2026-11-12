@@ -34,7 +34,10 @@ def _resolve_workspace(raw_dir: str | None) -> Path:
 
 
 async def _run_headless(args: argparse.Namespace) -> int:
-    console = Console(stderr=args.json)
+    output_format = getattr(args, "output_format", "text")
+    jsonl_mode = output_format == "jsonl"
+    json_mode = args.json or output_format == "json"
+    console = Console(stderr=json_mode or jsonl_mode)
     workspace = _resolve_workspace(args.dir)
     storage = StorageManager(workspace)
     cfg = storage.load_config()
@@ -82,12 +85,27 @@ async def _run_headless(args: argparse.Namespace) -> int:
     )
     session.messages.append(user_msg)
 
+    def _jsonl(payload: dict[str, Any]) -> None:
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
     async def on_tool_start(rec: ToolCallRecord) -> None:
-        if not args.json:
+        if jsonl_mode:
+            _jsonl({"event": "tool_start", "name": rec.name, "arguments": rec.arguments})
+        elif not json_mode:
             console.print(f"[#808080]  ~ {rec.name}[/] [dim]{json.dumps(rec.arguments, ensure_ascii=False)}[/]")
 
     async def on_tool_end(rec: ToolCallRecord) -> None:
-        if not args.json:
+        if jsonl_mode:
+            _jsonl(
+                {
+                    "event": "tool_end",
+                    "name": rec.name,
+                    "status": rec.status,
+                    "summary": rec.summary,
+                }
+            )
+        elif not json_mode:
             color = "#7fd88f" if rec.status == "success" else "#e06c75"
             console.print(f"[{color}]  ✓ {rec.name}[/] [#808080]{rec.summary}[/]")
 
@@ -106,7 +124,27 @@ async def _run_headless(args: argparse.Namespace) -> int:
     session.messages.append(reply)
     storage.save_session(session)
 
-    if args.json:
+    if jsonl_mode:
+        _jsonl(
+            {
+                "event": "message",
+                "role": "assistant",
+                "content": reply.content,
+                "model": reply.model,
+                "agent": reply.agent,
+                "tokens": reply.tokens,
+            }
+        )
+        _jsonl(
+            {
+                "event": "done",
+                "ok": True,
+                "session_id": session.id,
+                "duration_s": reply.duration_s,
+                "tokens": reply.tokens,
+            }
+        )
+    elif json_mode:
         out = {
             "session_id": session.id,
             "model": reply.model,
@@ -498,8 +536,94 @@ def _run_init(workspace: Path, force: bool = False, as_json: bool = False) -> in
     return 0
 
 
+COMMANDS = "run doctor stats sessions export map lint init"
+
+COMPLETION_SCRIPTS: dict[str, str] = {
+    "bash": (
+        "_rbit_completion() {\n"
+        f"  COMPREPLY=( $(compgen -W \"{COMMANDS} --help --version --generate-completion\" "
+        "-- \"${COMP_WORDS[COMP_CWORD]}\") )\n"
+        "}\n"
+        "complete -F _rbit_completion rbit\n"
+    ),
+    "zsh": (
+        "#compdef rbit\n"
+        f"_arguments '1:command:({COMMANDS})' '*::arg:->args'\n"
+    ),
+    "powershell": (
+        "Register-ArgumentCompleter -Native -CommandName rbit -ScriptBlock {\n"
+        "    param($wordToComplete, $commandAst, $cursorPosition)\n"
+        f"    '{COMMANDS}'.Split(' ') | Where-Object {{ $_ -like \"$wordToComplete*\" }} | "
+        "ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }\n"
+        "}\n"
+    ),
+}
+
+
+def _completion_script(shell: str) -> str:
+    return COMPLETION_SCRIPTS.get(shell, COMPLETION_SCRIPTS["bash"])
+
+
+def _run_commit(workspace: Path, apply: bool = False, message: str | None = None, as_json: bool = False) -> int:
+    console = Console()
+
+    def git(*git_args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *git_args], cwd=str(workspace), capture_output=True, text=True
+        )
+
+    status = git("status", "--short").stdout.strip()
+    stat = "\n".join(
+        part for part in (git("diff", "--stat").stdout.strip(), git("diff", "--staged", "--stat").stdout.strip()) if part
+    )
+    diff = "\n".join(
+        part for part in (git("diff").stdout.strip(), git("diff", "--staged").stdout.strip()) if part
+    )
+    if not status and not diff:
+        if as_json:
+            print(json.dumps({"ok": False, "error": "nothing to commit"}, ensure_ascii=False))
+        else:
+            console.print("[#808080]Nothing to commit — working tree is clean.[/]")
+        return 1
+
+    from .agent import AgentEngine
+
+    draft = (message or "").strip() or AgentEngine._heuristic_commit_message(stat or status, diff or status)
+
+    if not apply:
+        if as_json:
+            print(json.dumps({"ok": True, "applied": False, "message": draft}, ensure_ascii=False, indent=2))
+        else:
+            console.print("[bold #fab283]Proposed commit message[/] [#808080](use --apply to commit)[/]")
+            console.print(draft)
+        return 0
+
+    add = git("add", "-A")
+    if add.returncode != 0:
+        console.print(f"[bold #e06c75]git add failed:[/] {add.stderr.strip()}")
+        return 1
+    commit = git("commit", "-m", draft)
+    if commit.returncode != 0:
+        console.print(f"[bold #e06c75]git commit failed:[/] {commit.stderr.strip()}")
+        return 1
+
+    subject = draft.splitlines()[0]
+    if as_json:
+        print(json.dumps({"ok": True, "applied": True, "message": draft}, ensure_ascii=False, indent=2))
+    else:
+        console.print(f"[bold #7fd88f]Committed:[/] {subject}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
+    if args_list and args_list[0] == "--generate-completion":
+        shell = args_list[1].lower() if len(args_list) > 1 else "bash"
+        if shell not in COMPLETION_SCRIPTS:
+            Console(stderr=True).print(f"Unsupported shell '{shell}'. Use bash, zsh, or powershell.")
+            return 2
+        print(_completion_script(shell), end="")
+        return 0
 
     # Ensure UTF-8 stdout/stderr on Windows consoles
     if hasattr(sys.stdout, "reconfigure"):
@@ -509,7 +633,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "export", "map", "lint", "init"}
+    subcommands = {"run", "doctor", "stats", "sessions", "export", "map", "lint", "init", "commit"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -523,6 +647,12 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("-s", "--session", help="Continue specific session ID")
             p.add_argument("-d", "--dir", help="Target workspace directory")
             p.add_argument("--stdin", action="store_true", help="Read the prompt (or extra context) from stdin")
+            p.add_argument(
+                "--output-format",
+                choices=["text", "json", "jsonl"],
+                default="text",
+                help="Output mode: text, json, or event stream jsonl",
+            )
             p.add_argument("--json", action="store_true", help="Emit structured JSON output")
             parsed = p.parse_args(rest)
             return asyncio.run(_run_headless(parsed))
@@ -580,6 +710,15 @@ def main(argv: list[str] | None = None) -> int:
             parsed = p.parse_args(rest)
             return _run_init(_resolve_workspace(parsed.dir), parsed.force, parsed.json)
 
+        if sub == "commit":
+            p = argparse.ArgumentParser(prog="rbit commit", description="Draft a commit message from git diff")
+            p.add_argument("dir", nargs="?", help="Workspace directory")
+            p.add_argument("-m", "--message", help="Override the generated message")
+            p.add_argument("--apply", action="store_true", help="Stage all changes and create the commit")
+            p.add_argument("--json", action="store_true", help="Emit structured JSON output")
+            parsed = p.parse_args(rest)
+            return _run_commit(_resolve_workspace(parsed.dir), parsed.apply, parsed.message, parsed.json)
+
     # Default: Interactive Full-Screen TUI mode
     parser = argparse.ArgumentParser(
         prog="rbit",
@@ -595,7 +734,9 @@ def main(argv: list[str] | None = None) -> int:
             "  rbit export [id]       Export session transcript to Markdown\n"
             "  rbit map [dir]         Repository map with sizes, languages & token budget\n"
             "  rbit lint [dir]        Lint workspace; exit code 1 on issues (--json)\n"
-            "  rbit init [dir]        Create RBIT.md + .rbit/memory.md from project scan"
+            "  rbit init [dir]        Create RBIT.md + .rbit/memory.md from project scan\n"
+            "  rbit commit [dir]      Draft a commit message from git diff (--apply to commit)\n"
+            "  rbit --generate-completion bash|zsh|powershell   Print shell completion script"
         ),
     )
     parser.add_argument("target", nargs="?", help="Workspace directory path (defaults to current directory)")

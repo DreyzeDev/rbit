@@ -1259,3 +1259,81 @@ async def test_read_tool_rejects_oversized_file(tmp_path: Path) -> None:
     sliced = await executor.execute("read", {"filePath": "big.txt", "offset": 1, "limit": 3})
     assert sliced.ok is True
     assert sliced.output.count("\n") <= 2
+
+@pytest.mark.asyncio
+async def test_compact_mode_hides_sidebar_and_high_contrast_theme(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    app.config_data["theme"] = "rbit-contrast"
+    app.session.messages = [ChatMessage(id=short_id(), role="assistant", content="hello")]
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+        assert app._is_compact is True
+        assert app.query_one(SidebarPanel).display is False
+        theme_name = getattr(app.theme, "name", app.theme)
+        assert theme_name == "rbit-contrast"
+
+    wide = RbitApp(workspace=tmp_path)
+    wide.config_data["sidebar_visible"] = True
+    wide.session.messages = [ChatMessage(id=short_id(), role="assistant", content="hello")]
+    async with wide.run_test(size=(130, 40)) as pilot:
+        await pilot.pause()
+        assert wide._is_compact is False
+        assert wide.query_one(SidebarPanel).display is True
+
+
+def test_cli_commit_draft_json_and_apply(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    import subprocess
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", *args], cwd=tmp_path, capture_output=True, text=True)
+
+    git("init")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test User")
+    (tmp_path / "a.txt").write_text("one\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-m", "init")
+    (tmp_path / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
+
+    assert cli_main(["commit", str(tmp_path), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["applied"] is False
+    assert payload["message"].strip()
+
+    assert cli_main(["commit", str(tmp_path), "--apply", "-m", "chore: bump a.txt"]) == 0
+    assert "Committed" in capsys.readouterr().out
+    assert git("log", "-1", "--format=%s").stdout.strip() == "chore: bump a.txt"
+    assert git("status", "--porcelain").stdout.strip() == ""
+
+
+def test_cli_run_jsonl_event_stream(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    rc = cli_main(
+        [
+            "run",
+            "-m",
+            "rbit/smart-local",
+            "--output-format",
+            "jsonl",
+            "-d",
+            str(tmp_path),
+            "проанализируй проект",
+        ]
+    )
+    assert rc == 0
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    events = [item["event"] for item in lines]
+    assert "tool_start" in events
+    assert "tool_end" in events
+    assert "message" in events
+    assert events[-1] == "done"
+    assert lines[-1]["ok"] is True
+
+
+def test_generate_completion_scripts(capsys: pytest.CaptureFixture[str]) -> None:
+    for shell in ("bash", "zsh", "powershell"):
+        assert cli_main(["--generate-completion", shell]) == 0
+        out = capsys.readouterr().out
+        assert "rbit" in out
+        assert len(out) > 20
+    assert cli_main(["--generate-completion", "tcsh"]) == 2
