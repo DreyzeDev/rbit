@@ -38,6 +38,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/retry", "Re-run the last user prompt"),
     ("/fork", "Branch the session into a new one at message N"),
     ("/commit", "Draft a Git commit message from the current diff"),
+    ("/copy", "Copy the last assistant answer to the clipboard"),
     ("/diff", "Show modified files summary"),
     ("/init", "Analyze workspace and build initial Todo plan"),
     ("/connect", "Connect API provider (OpenRouter / OpenAI / Ollama)"),

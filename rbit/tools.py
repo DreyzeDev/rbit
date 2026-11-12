@@ -61,7 +61,9 @@ READONLY_BASH_PREFIXES = (
     "pytest",
 )
 
-READONLY_TOOLS: frozenset[str] = frozenset({"read", "glob", "grep", "webfetch", "diagnostics", "lint"})
+READONLY_TOOLS: frozenset[str] = frozenset(
+    {"read", "glob", "grep", "webfetch", "diagnostics", "lint", "symbols", "git"}
+)
 
 VIRTUAL_ATTACHMENTS: frozenset[str] = frozenset({"diff", "git", "staged", "tree"})
 
@@ -487,6 +489,10 @@ class ToolExecutor:
                 res = await asyncio.to_thread(self._tool_glob, args)
             elif name == "grep":
                 res = await asyncio.to_thread(self._tool_grep, args)
+            elif name == "symbols":
+                res = await asyncio.to_thread(self._tool_symbols, args)
+            elif name == "git":
+                res = await self._tool_git(args)
             elif name == "diagnostics":
                 res = await asyncio.to_thread(self._tool_diagnostics, args)
             elif name == "lint":
@@ -785,6 +791,148 @@ class ToolExecutor:
         out = "\n".join(hits) if hits else "No matches found."
         return ToolResult(True, f"{len(hits)} lines", out)
 
+    @staticmethod
+    def _symbols_for_content(rel: str, content: str) -> list[str]:
+        ext = Path(rel).suffix.lower()
+        found: list[str] = []
+        if ext in (".py", ".pyi", ".pyw"):
+            try:
+                tree = ast.parse(content)
+            except SyntaxError as err:
+                return [f"{rel}: syntax error at line {err.lineno or 1}: {err.msg}"]
+            seen: set[int] = set()
+
+            def visit(node: ast.AST, prefix: str = "") -> None:
+                for child in ast.iter_child_nodes(node):
+                    if id(child) in seen:
+                        continue
+                    seen.add(id(child))
+                    if isinstance(child, ast.ClassDef):
+                        bases = ", ".join(ast.unparse(b) for b in child.bases)
+                        label = f"class {child.name}" + (f"({bases})" if bases else "")
+                        found.append(f"{rel}:{child.lineno}: {prefix}{label}")
+                        visit(child, prefix + child.name + ".")
+                    elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        kind = "async def" if isinstance(child, ast.AsyncFunctionDef) else "def"
+                        try:
+                            sig = ast.unparse(child.args)
+                        except Exception:
+                            sig = "..."
+                        found.append(f"{rel}:{child.lineno}: {prefix}{kind} {child.name}({sig})")
+                        visit(child, prefix)
+                    else:
+                        visit(child, prefix)
+
+            visit(tree)
+        elif ext in (".js", ".jsx", ".ts", ".tsx"):
+            patterns = (
+                (re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)"), "function"),
+                (re.compile(r"^\s*(?:export\s+)?(?:default\s+)?class\s+(\w+)(?:\s+extends\s+([\w.]+))?"), "class"),
+                (re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>"), "const"),
+            )
+            for lineno, line in enumerate(content.splitlines(), start=1):
+                for pattern, kind in patterns:
+                    match = pattern.match(line)
+                    if not match:
+                        continue
+                    if kind == "class":
+                        label = f"class {match.group(1)}"
+                        if match.group(2):
+                            label += f" extends {match.group(2)}"
+                    else:
+                        args = (match.group(2) or "").strip()
+                        label = f"{kind} {match.group(1)}({args})"
+                    found.append(f"{rel}:{lineno}: {label}")
+                    break
+        elif ext in (".md", ".markdown"):
+            for lineno, line in enumerate(content.splitlines(), start=1):
+                match = re.match(r"^(#{1,6})\s+(.*)$", line)
+                if match:
+                    found.append(f"{rel}:{lineno}: {match.group(1)} {match.group(2).strip()[:90]}")
+        return found
+
+    def _tool_symbols(self, args: dict[str, Any]) -> ToolResult:
+        raw = str(args.get("filePath") or args.get("path") or ".").strip()
+        target = self.resolve_path(raw)
+        rel = self.rel_display(target)
+        if not target.exists():
+            return ToolResult(False, f"{rel} not found", f"Path not found: {rel}")
+
+        if target.is_file():
+            targets = [target]
+        else:
+            allowed = {".py", ".pyi", ".pyw", ".js", ".jsx", ".ts", ".tsx", ".md", ".markdown"}
+            targets = [
+                self.workspace / item
+                for item in self.list_workspace_files(limit=300)
+                if Path(item).suffix.lower() in allowed
+            ]
+
+        found: list[str] = []
+        for fpath in targets:
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            found.extend(self._symbols_for_content(self.rel_display(fpath), content))
+            if len(found) >= 300:
+                found = found[:300]
+                break
+
+        out = "\n".join(found) if found else "No symbols found."
+        return ToolResult(True, f"{len(found)} symbols", out)
+
+    async def _tool_git(self, args: dict[str, Any]) -> ToolResult:
+        action = str(args.get("action") or "status").strip().lower()
+        raw_path = str(args.get("path") or "").strip()
+        limit = max(1, min(int(args.get("limit", 20) or 20), 100))
+        staged = bool(args.get("staged", False))
+
+        path_args: list[str] = []
+        if raw_path:
+            target = self.resolve_path(raw_path)
+            try:
+                target.relative_to(self.workspace)
+            except ValueError:
+                return ToolResult(False, f"path outside workspace: {raw_path}", "`path` must stay inside the workspace.")
+            path_args = ["--", self.rel_display(target)]
+
+        if action == "status":
+            cmd = ["status", "--short"]
+        elif action == "diff":
+            cmd = ["diff"] + (["--staged"] if staged else []) + path_args
+        elif action == "log":
+            cmd = ["log", "--oneline", f"-{limit}"] + path_args
+        elif action == "show":
+            cmd = ["show", "--stat", "HEAD"] + path_args
+        elif action == "blame":
+            if not raw_path:
+                return ToolResult(False, "blame needs path", "`path` is required for git blame.")
+            cmd = ["blame", raw_path]
+        else:
+            return ToolResult(
+                False,
+                f"unsupported git action: {action}",
+                "Allowed read-only actions: status, diff, log, show, blame.",
+            )
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                *cmd,
+                cwd=str(self.workspace),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out_b, _err = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+        except Exception as exc:
+            return ToolResult(False, f"git {action} failed", f"git execution error: {exc}")
+
+        output = out_b.decode("utf-8", errors="replace").strip() or "(no output)"
+        ok = proc.returncode == 0
+        summary = f"git {action} · {len(output.splitlines())} line(s)"
+        return ToolResult(ok, summary, output[:6000])
+
     async def _tool_lint(self, args: dict[str, Any]) -> ToolResult:
         raw = str(args.get("filePath") or args.get("path") or ".").strip()
         target = self.resolve_path(raw)
@@ -1081,6 +1229,39 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                     "filesOnly": {"type": "boolean", "description": "Return only file names with matches (-l)."},
                 },
                 "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "symbols",
+            "description": "AST/regex symbol index: Python defs/classes, JS/TS functions, Markdown headings with line numbers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string", "description": "File or directory (defaults to workspace root)."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git",
+            "description": "Read-only Git helper: status, diff, log, show, blame.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "diff", "log", "show", "blame"],
+                    },
+                    "path": {"type": "string", "description": "Optional path filter (required for blame)."},
+                    "limit": {"type": "integer", "description": "Log entries limit (default 20)."},
+                    "staged": {"type": "boolean", "description": "Use --staged for diff."},
+                },
+                "required": ["action"],
             },
         },
     },

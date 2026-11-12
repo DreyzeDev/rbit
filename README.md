@@ -6,7 +6,7 @@
 [![Textual](https://img.shields.io/badge/TUI-Textual%208.x-fab283?style=flat-square)](https://textual.textualize.io/)
 [![License](https://img.shields.io/badge/License-MIT-7fd88f?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-5c9cf5?style=flat-square)](#)
-[![Tests](https://img.shields.io/badge/tests-pytest%2025%20passing-7fd88f?style=flat-square)](tests/test_app.py)
+[![Tests](https://img.shields.io/badge/tests-pytest%2030%20passing-7fd88f?style=flat-square)](tests/test_app.py)
 [![CI](https://github.com/DreyzeDev/rbit/actions/workflows/ci.yml/badge.svg)](https://github.com/DreyzeDev/rbit/actions/workflows/ci.yml)
 
 **Автономный полноэкранный AI-агент для терминала** — редактирует код, ищет по проекту, выполняет команды, хранит память проекта и откатывает время без Git.
@@ -45,7 +45,7 @@
 | **Память проекта** | `RBIT.md` + `/remember <правило>` — знания автоматически попадают в системный промпт каждой сессии |
 | **Real-time Streaming** | Настоящий SSE-стриминг ответов OpenAI-совместимого API в реальном времени, с повторами на 429/5xx и экспоненциальным backoff |
 | **Модели** | OpenRouter / OpenAI / DeepSeek / любой OpenAI-compatible endpoint + автообнаружение локальной **Ollama** (`Ctrl+M`) |
-| **Инструменты** | `read`, `write`, `edit` (fuzzy fallback), `multi_edit` (атомарно), `glob`, `grep` (контекст, `-l`, лимиты), `diagnostics`, `lint` (ruff), `webfetch`, `bash`, `todowrite`, `subagent(explore)` + undo/redo стек; `.gitignore` уважается |
+| **Инструменты** | `read`, `write`, `edit` (fuzzy fallback), `multi_edit` (атомарно), `glob`, `grep` (контекст, `-l`, лимиты), `symbols` (AST/JS/MD), `git` (status/diff/log/show/blame), `diagnostics`, `lint` (ruff), `webfetch`, `bash`, `todowrite`, `subagent(explore)` + undo/redo стек; `.gitignore` уважается |
 | **Виртуальные аттачи** | `@diff`, `@staged`, `@git`, `@tree` — git-diff, staged-изменения, состояние ветки и дерево проекта попадают в контекст без чтения файлов |
 | **Команды проекта** | Свои слэш-команды из `.rbit/commands/*.md` с подстановкой `{args}` и автодополнением в палитре |
 | **Всё локально** | Сессии, конфиг, память и чекпоинты — в скрытой папке `.rbit/` вашего проекта. Точный подсчёт токенов при установленном `tiktoken` (`pip install -e ".[tokens]"`) |
@@ -103,6 +103,7 @@ rbit                                  # TUI по умолчанию
 | `Ctrl+O` | Менеджер Todo |
 | `Ctrl+B` | Показать/скрыть сайдбар |
 | `Ctrl+N` | Новая сессия |
+| `Ctrl+Y` | Скопировать последний ответ |
 | `!` + строка | Мгновенный шелл (без токенов) |
 | `Esc` | Прервать агента |
 | `Ctrl+Q` | Выход |
@@ -120,6 +121,7 @@ rbit                                  # TUI по умолчанию
 /init                 Анализ проекта + план         /compact   Сжать контекст (LLM)
 /retry                Повторить последний промпт    /fork [N]  Ветка сессии от сообщения N
 /commit [yes]         Черновик коммита по diff       /commit yes  Подтвердить и закоммитить
+/copy                 Скопировать последний ответ    /help        Горячие клавиши и команды
 ```
 
 ## CLI (headless / CI)
@@ -130,6 +132,8 @@ rbit run --json "..."                         # структурированны
 rbit doctor                                   # диагностика окружения
 rbit stats                                    # аналитика токенов и расходов
 rbit sessions                                 # список сохранённых сессий
+rbit init                                      # создать RBIT.md и .rbit/memory.md
+rbit sessions --prune 30d                      # удалить сессии/чекпоинты старше 30 дней
 rbit export -o report.md                      # выгрузить переписку в Markdown
 rbit map                                      # карта проекта: файлы, языки, бюджет токенов
 rbit map --json --max-tokens 4000             # структурированный вывод для CI
@@ -151,7 +155,7 @@ Todo-лист, diff-карточки, undo/redo, чекпоинты, памят�
 ```
 rbit/
 ├── app.py         # Полноэкранное TUI-приложение (Home / Session / Bang Shell)
-├── cli.py         # CLI: run · doctor · stats · sessions · export · map · lint
+├── cli.py         # CLI: run · doctor · stats · sessions · export · map · lint · init
 ├── agent.py       # Движок: SSE-стриминг, Ollama discovery, Smart-агент
 ├── tools.py       # Инструменты агента + чекпоинты + undo/redo
 ├── storage.py     # Сессии, конфиг, память, чекпоинты, экспорт
@@ -179,7 +183,8 @@ rbit/
 - [x] CI: GitHub Actions — `pytest` + `ruff` на каждый push
 - [x] `.gitignore` для `glob`/`grep`, fuzzy-`edit`, контекстный `grep`, `rbit lint`
 - [x] Deny-паттерны для катастрофических shell-команд
-- [ ] AST-индекс и symbol-index
+- [x] `symbols`, read-only `git`, `/copy`, `rbit init`, `sessions --prune`
+- [ ] `apply_patch`, фоновый `bash`, session search
 
 ## Лицензия
 

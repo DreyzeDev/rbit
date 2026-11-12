@@ -7,9 +7,11 @@ import asyncio
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -361,6 +363,138 @@ def _run_lint(workspace: Path, as_json: bool = False) -> int:
     return 0 if ok else 1
 
 
+def _parse_age_spec(spec: str) -> float:
+    match = re.fullmatch(r"\s*(\d+)\s*([smhdw]?)\s*", spec.lower())
+    if not match:
+        raise ValueError(f"invalid age '{spec}' (use e.g. 30d, 12h, 2w)")
+    value = int(match.group(1))
+    unit = match.group(2) or "d"
+    factor = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
+    return float(value * factor)
+
+
+def _run_sessions_prune(workspace: Path, age_spec: str) -> int:
+    console = Console()
+    storage = StorageManager(workspace)
+    storage.ensure_dirs()
+    try:
+        seconds = _parse_age_spec(age_spec)
+    except ValueError as exc:
+        console.print(f"[bold #e06c75]{exc}[/]")
+        return 2
+
+    cutoff = time.time() - seconds
+    removed_sessions = 0
+    for path in storage.sessions_dir.glob("*.json"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed_sessions += 1
+        except OSError:
+            continue
+
+    removed_checkpoints = 0
+    for path in storage.checkpoints_dir.glob("*.json"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed_checkpoints += 1
+        except OSError:
+            continue
+
+    console.print(
+        f"[bold #7fd88f]Pruned[/] [#eeeeee]older than {age_spec}:[/] "
+        f"{removed_sessions} session(s), {removed_checkpoints} checkpoint(s)."
+    )
+    return 0
+
+
+def _run_init(workspace: Path, force: bool = False, as_json: bool = False) -> int:
+    from .tools import IGNORED_DIRS, GitIgnoreMatcher
+
+    console = Console()
+    ignore = GitIgnoreMatcher(workspace)
+    lang_by_ext = {
+        ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript", ".tsx": "TypeScript",
+        ".rs": "Rust", ".go": "Go", ".java": "Java", ".rb": "Ruby", ".php": "PHP",
+        ".cs": "C#", ".c": "C", ".cpp": "C++", ".md": "Markdown", ".html": "HTML",
+        ".css": "CSS", ".sh": "Shell", ".ps1": "PowerShell",
+    }
+    languages: dict[str, int] = {}
+    file_count = 0
+    for root, dirs, names in os.walk(workspace):
+        root_rel = Path(root).relative_to(workspace).as_posix() if root != str(workspace) else ""
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in IGNORED_DIRS and not ignore.is_ignored(f"{root_rel}/{d}" if root_rel else d, is_dir=True)
+        ]
+        for name in names:
+            rel = f"{root_rel}/{name}" if root_rel else name
+            if ignore.is_ignored(rel):
+                continue
+            file_count += 1
+            lang = lang_by_ext.get(Path(name).suffix.lower())
+            if lang:
+                languages[lang] = languages.get(lang, 0) + 1
+
+    commands: list[str] = []
+    if (workspace / "tests").is_dir() or (workspace / "pytest.ini").exists() or (workspace / "pyproject.toml").exists():
+        commands.append("- Tests: `pytest -q`")
+    if (workspace / "package.json").exists():
+        commands.append("- JS tests: `npm test`")
+    if (workspace / "pyproject.toml").exists() and (workspace / "rbit").is_dir():
+        commands.append("- Lint: `ruff check .`")
+    if not commands:
+        commands.append("- Add your build/test commands here")
+
+    langs_line = ", ".join(
+        f"{lang} ({count})" for lang, count in sorted(languages.items(), key=lambda kv: kv[1], reverse=True)[:8]
+    ) or "unknown"
+    title = workspace.name or "project"
+    rbit_md = (
+        f"# {title}\n\n"
+        "Project rules and context for `rbit` — loaded into every session.\n\n"
+        "## Overview\n"
+        f"- Files: {file_count}\n"
+        f"- Languages: {langs_line}\n"
+        "- Source root: `.`\n\n"
+        "## Commands\n"
+        + "\n".join(commands)
+        + "\n\n## Conventions\n"
+        "- Keep changes focused; prefer small edits over rewrites.\n"
+        "- Run relevant tests/lint before finishing a task.\n\n"
+        "## Notes\n"
+        "- Add durable project facts with `/remember <rule>`.\n"
+    )
+    memory = (
+        "# rbit Project Memory\n\n"
+        f"- Project: {title}\n"
+        "- Add persistent rules here or via `/remember`.\n"
+    )
+
+    rbit_path = workspace / "RBIT.md"
+    storage = StorageManager(workspace)
+    storage.ensure_dirs()
+    written: list[str] = []
+    skipped: list[str] = []
+    for path, content in ((rbit_path, rbit_md), (storage.memory_path, memory)):
+        if path.exists() and not force:
+            skipped.append(str(path))
+            continue
+        path.write_text(content, encoding="utf-8")
+        written.append(str(path))
+
+    if as_json:
+        print(json.dumps({"written": written, "skipped": skipped, "file_count": file_count}, indent=2))
+    else:
+        if written:
+            console.print("[bold #7fd88f]Initialized:[/] " + ", ".join(f"`{Path(p).name}`" for p in written))
+        if skipped:
+            console.print("[#808080]Skipped existing (use --force to overwrite): " + ", ".join(skipped) + "[/]")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
 
@@ -372,7 +506,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "export", "map", "lint"}
+    subcommands = {"run", "doctor", "stats", "sessions", "export", "map", "lint", "init"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -404,8 +538,12 @@ def main(argv: list[str] | None = None) -> int:
         if sub == "sessions":
             p = argparse.ArgumentParser(prog="rbit sessions")
             p.add_argument("dir", nargs="?", help="Workspace directory")
+            p.add_argument("--prune", metavar="AGE", help="Delete sessions/checkpoints older than e.g. 30d, 12h, 2w")
             parsed = p.parse_args(rest)
-            return _run_sessions_list(_resolve_workspace(parsed.dir))
+            workspace = _resolve_workspace(parsed.dir)
+            if parsed.prune:
+                return _run_sessions_prune(workspace, parsed.prune)
+            return _run_sessions_list(workspace)
 
         if sub == "export":
             p = argparse.ArgumentParser(prog="rbit export")
@@ -430,6 +568,14 @@ def main(argv: list[str] | None = None) -> int:
             parsed = p.parse_args(rest)
             return _run_lint(_resolve_workspace(parsed.dir), parsed.json)
 
+        if sub == "init":
+            p = argparse.ArgumentParser(prog="rbit init", description="Create RBIT.md and .rbit/memory.md from project analysis")
+            p.add_argument("dir", nargs="?", help="Workspace directory")
+            p.add_argument("--force", action="store_true", help="Overwrite existing RBIT.md / memory.md")
+            p.add_argument("--json", action="store_true", help="Emit structured JSON output")
+            parsed = p.parse_args(rest)
+            return _run_init(_resolve_workspace(parsed.dir), parsed.force, parsed.json)
+
     # Default: Interactive Full-Screen TUI mode
     parser = argparse.ArgumentParser(
         prog="rbit",
@@ -441,9 +587,11 @@ def main(argv: list[str] | None = None) -> int:
             "  rbit doctor [dir]      Diagnose environment, LLM API, Ollama & workspace health\n"
             "  rbit stats [dir]       Show token, cost & tool analytics across sessions\n"
             "  rbit sessions [dir]    List saved sessions in workspace\n"
+            "  rbit sessions --prune 30d   Delete sessions & checkpoints older than AGE\n"
             "  rbit export [id]       Export session transcript to Markdown\n"
             "  rbit map [dir]         Repository map with sizes, languages & token budget\n"
-            "  rbit lint [dir]        Lint workspace; exit code 1 on issues (--json)"
+            "  rbit lint [dir]        Lint workspace; exit code 1 on issues (--json)\n"
+            "  rbit init [dir]        Create RBIT.md + .rbit/memory.md from project scan"
         ),
     )
     parser.add_argument("target", nargs="?", help="Workspace directory path (defaults to current directory)")

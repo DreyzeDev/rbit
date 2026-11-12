@@ -44,7 +44,7 @@ Active Agent Mode: {agent_mode}
 {mode_note}
 {memory_section}
 Respond concisely in the user's language (Russian if the user writes in Russian) using GitHub-flavored Markdown.
-Use tools (`read`, `glob`, `grep`, `diagnostics`, `write`, `edit`, `multi_edit`, `webfetch`, `bash`, `todowrite`) proactively when working with files, URLs, or tasks.
+Use tools (`read`, `glob`, `grep`, `symbols`, `git`, `diagnostics`, `write`, `edit`, `multi_edit`, `webfetch`, `bash`, `todowrite`) proactively when working with files, URLs, or tasks.
 If `write`, `edit`, or `multi_edit` reports `Diagnostics` syntax errors in its tool output, fix them immediately in the same turn before finishing.
 """
 

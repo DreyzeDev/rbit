@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import platform
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -53,6 +55,40 @@ from .widgets import (
     UserMessageCard,
     detect_git_branch,
 )
+
+CLIPBOARD_COMMANDS: tuple[tuple[str, ...], ...] = tuple(
+    cmd
+    for cmd in (
+        ("pbcopy",) if sys.platform == "darwin" else (),
+        ("wl-copy",) if not sys.platform.startswith("win") else (),
+        ("xclip", "-selection", "clipboard") if not sys.platform.startswith("win") else (),
+        ("xsel", "--clipboard", "--input") if not sys.platform.startswith("win") else (),
+        ("clip",) if sys.platform.startswith("win") else (),
+    )
+    if cmd
+)
+
+
+def _write_clipboard(text: str) -> bool:
+    """Copies text using pyperclip when available, else native clipboard utilities."""
+    if not text:
+        return False
+    try:
+        import pyperclip  # type: ignore
+
+        pyperclip.copy(text)
+        return True
+    except Exception:
+        pass
+    for cmd in CLIPBOARD_COMMANDS:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            subprocess.run(cmd, input=text, text=True, timeout=5, check=True)
+            return True
+        except Exception:
+            continue
+    return False
 
 
 RBIT_TUI_CSS = """
@@ -363,6 +399,7 @@ class RbitApp(App[None]):
         Binding("ctrl+o", "open_todos", "Todos", show=False),
         Binding("ctrl+n", "new_session", "New Session", show=False),
         Binding("ctrl+l", "clear_chat", "Clear", show=False),
+        Binding("ctrl+y", "copy_last", "Copy", show=False),
         Binding("escape", "interrupt_or_close", "Interrupt", show=False),
         Binding("ctrl+q", "quit", "Quit", show=False),
     ]
@@ -675,6 +712,7 @@ class RbitApp(App[None]):
             "retry": self._cmd_retry,
             "fork": lambda: self._cmd_fork(""),
             "commit": lambda: self._cmd_commit(""),
+            "copy": self.action_copy_last,
             "init": lambda: self._submit_prompt("Проанализируй проект и создай подробный Todo-план"),
             "connect": self.action_open_connect,
             "clear": self.action_clear_chat,
@@ -788,6 +826,23 @@ class RbitApp(App[None]):
         self._sync_ui()
         self.query_one("#prompt-input", Input).focus()
 
+    def action_copy_last(self) -> None:
+        last = next(
+            (m for m in reversed(self.session.messages) if m.role == "assistant" and m.content.strip()),
+            None,
+        )
+        if last is None:
+            self.notify("Nothing to copy yet — no assistant answer in this session.", severity="warning")
+            return
+        if _write_clipboard(last.content):
+            self.notify("Copied the last answer to the clipboard.", timeout=2.0)
+        else:
+            self.notify(
+                "Clipboard helper not found (install pyperclip or xclip/wl-copy).",
+                severity="error",
+                timeout=3.0,
+            )
+
     def _load_session_into_ui(self, sess: Session) -> None:
         self.session = sess
         self.executor.session = sess
@@ -888,6 +943,9 @@ class RbitApp(App[None]):
             return True
         if cmd == "/commit":
             self._cmd_commit(arg)
+            return True
+        if cmd == "/copy":
+            self.action_copy_last()
             return True
         if cmd == "/init":
             self._submit_prompt("Проанализируй структуру этого проекта и создай стартовый Todo-план")
@@ -1139,8 +1197,9 @@ class RbitApp(App[None]):
             "  /remember <rule> Save persistent project memory     /export    Export session .md\n"
             "  /retry           Re-run the last user prompt        /fork [N]  Branch session at message N\n"
             "  /commit [yes]    Draft or confirm a Git commit      /doctor    Environment check\n"
-            "  /models /themes  Switch model or live theme         /todo      Todo checklist manager\n"
-            "  /undo /redo      Revert or reapply file edits       /diff      Modified files summary"
+            "  /copy · Ctrl+Y   Copy the last answer                /models /themes  Switch model or theme\n"
+            "  /todo [task]     Todo checklist manager             /undo /redo  Revert or reapply edits\n"
+            "  /diff            Modified files summary             /help      This screen"
         )
         self._post_notice(help_txt)
         self._post_notice(help_txt)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -1031,3 +1032,133 @@ def test_cli_lint_exit_codes_and_json(tmp_path: Path, capsys: pytest.CaptureFixt
     (tmp_path / "bad.py").write_text("x = 1\n", encoding="utf-8")
     assert cli_main(["lint", str(tmp_path)]) == 0
     assert "rbit lint" in capsys.readouterr().out
+
+@pytest.mark.asyncio
+async def test_symbols_index_python_js_and_markdown(tmp_path: Path) -> None:
+    (tmp_path / "lib.py").write_text(
+        "class Greeter:\n"
+        "    def hello(self, name: str) -> str:\n"
+        "        return name\n\n"
+        "def top(a, b=1):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "app.ts").write_text(
+        "export function run(x: number) {\n}\n"
+        "const go = async (y) => y;\n"
+        "class Box extends Base {}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "README.md").write_text("# Title\n## Section\n", encoding="utf-8")
+
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    py_res = await executor.execute("symbols", {"filePath": "lib.py"})
+    assert py_res.ok is True
+    assert "class Greeter" in py_res.output
+    assert "def hello(self, name: str)" in py_res.output
+    assert "def top(a, b=1)" in py_res.output
+
+    all_res = await executor.execute("symbols", {})
+    assert "app.ts:" in all_res.output
+    assert "function run(x: number)" in all_res.output
+    assert "class Box extends Base" in all_res.output
+    assert "# Title" in all_res.output
+
+
+@pytest.mark.asyncio
+async def test_git_tool_readonly_actions(tmp_path: Path) -> None:
+    import subprocess
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", *args], cwd=tmp_path, capture_output=True, text=True)
+
+    git("init")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test User")
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-m", "init")
+    (tmp_path / "a.py").write_text("x = 1\ny = 2\n", encoding="utf-8")
+
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    status = await executor.execute("git", {"action": "status"})
+    assert status.ok is True
+    assert "a.py" in status.output
+
+    diff = await executor.execute("git", {"action": "diff", "path": "a.py"})
+    assert diff.ok is True
+    assert "+y = 2" in diff.output
+
+    log = await executor.execute("git", {"action": "log", "limit": 1})
+    assert log.ok is True
+    assert "init" in log.output
+
+    bad = await executor.execute("git", {"action": "push"})
+    assert bad.ok is False
+
+    outside = await executor.execute("git", {"action": "diff", "path": "../outside.txt"})
+    assert outside.ok is False
+
+
+def test_cli_init_creates_rbit_md_and_memory(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    (tmp_path / "main.py").write_text("print(1)\n", encoding="utf-8")
+    assert cli_main(["init", str(tmp_path)]) == 0
+    rbit_md = (tmp_path / "RBIT.md").read_text(encoding="utf-8")
+    assert tmp_path.name in rbit_md
+    assert "Python (1)" in rbit_md
+    memory = (tmp_path / ".rbit" / "memory.md").read_text(encoding="utf-8")
+    assert "rbit Project Memory" in memory
+
+    (tmp_path / "RBIT.md").write_text("SENTINEL", encoding="utf-8")
+    assert cli_main(["init", str(tmp_path)]) == 0
+    assert (tmp_path / "RBIT.md").read_text(encoding="utf-8") == "SENTINEL"
+    assert cli_main(["init", str(tmp_path), "--force"]) == 0
+    assert (tmp_path / "RBIT.md").read_text(encoding="utf-8") != "SENTINEL"
+    capsys.readouterr()
+
+
+def test_cli_sessions_prune_removes_old_entries(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from rbit.storage import StorageManager
+
+    storage = StorageManager(tmp_path)
+    storage.ensure_dirs()
+    old = Session(title="old")
+    fresh = Session(title="fresh")
+    storage.save_session(old)
+    storage.save_session(fresh)
+    old_file = storage.sessions_dir / f"{old.id}.json"
+    fresh_file = storage.sessions_dir / f"{fresh.id}.json"
+    old_ts = time.time() - 90 * 86400
+    os.utime(old_file, (old_ts, old_ts))
+    checkpoint = storage.checkpoints_dir / "old-cp.json"
+    checkpoint.write_text("{}", encoding="utf-8")
+    os.utime(checkpoint, (old_ts, old_ts))
+
+    assert cli_main(["sessions", "--prune", "30d", str(tmp_path)]) == 0
+    assert not old_file.exists()
+    assert fresh_file.exists()
+    assert not checkpoint.exists()
+    assert "Pruned" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_copy_last_answer_and_slash_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app = RbitApp(workspace=tmp_path)
+    app.session.messages = [
+        ChatMessage(id=short_id(), role="assistant", content="hello copy"),
+    ]
+    copied: list[str] = []
+    monkeypatch.setattr("rbit.app._write_clipboard", lambda text: copied.append(text) or True)
+
+    async with app.run_test(size=(130, 40)) as pilot:
+        await pilot.press("ctrl+y")
+        await pilot.pause()
+        assert copied == ["hello copy"]
+
+        inp = app.query_one("#prompt-input")
+        inp.focus()
+        inp.value = "/copy"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert copied[-1] == "hello copy"
