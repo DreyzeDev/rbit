@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import difflib
+import fnmatch
 import html
 import json
 import os
@@ -65,6 +66,70 @@ READONLY_TOOLS: frozenset[str] = frozenset({"read", "glob", "grep", "webfetch", 
 VIRTUAL_ATTACHMENTS: frozenset[str] = frozenset({"diff", "git", "staged", "tree"})
 
 MAX_CHECKPOINT_FILE_BYTES = 256_000
+
+DANGEROUS_BASH_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\brm\s+-[a-z]*r[a-z]*f?[a-z]*\s+(?:/|~|\$HOME)\s*(?:$|[;&|])", re.IGNORECASE),
+    re.compile(r"\brm\s+-[a-z]*f[a-z]*r[a-z]*\s+(?:/|~|\$HOME)\s*(?:$|[;&|])", re.IGNORECASE),
+    re.compile(r"\bmkfs(?:\.\w+)?\b", re.IGNORECASE),
+    re.compile(r"\bdd\s+if=.*\bof=/dev/", re.IGNORECASE),
+    re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", re.IGNORECASE),
+    re.compile(r"\bgit\s+push\b[^\n]*--force\b|\bgit\s+push\b[^\n]*\s-f(?:\s|$)", re.IGNORECASE),
+    re.compile(r"\bformat\s+[a-z]:", re.IGNORECASE),
+    re.compile(r"\bdiskpart\b|\bshutdown\b", re.IGNORECASE),
+    re.compile(r"\bdel\s+/[sqf]{1,3}\b", re.IGNORECASE),
+    re.compile(r"\bRemove-Item\b[^\n]*-Recurse[^\n]*(?:[A-Za-z]:\\|/)", re.IGNORECASE),
+)
+
+
+def is_dangerous_command(command: str) -> str:
+    """Returns the matched deny-pattern when `command` is catastrophic, else an empty string."""
+    for pattern in DANGEROUS_BASH_PATTERNS:
+        match = pattern.search(command)
+        if match:
+            return match.group(0)
+    return ""
+
+
+class GitIgnoreMatcher:
+    """Lightweight `.gitignore` reader covering common patterns (globs, negations, dir rules)."""
+
+    def __init__(self, workspace: Path) -> None:
+        self.rules: list[tuple[str, bool, bool]] = []
+        path = workspace / ".gitignore"
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            negate = line.startswith("!")
+            if negate:
+                line = line[1:].strip()
+            if not line:
+                continue
+            dir_only = line.endswith("/")
+            line = line.strip("/")
+            if line:
+                self.rules.append((line, negate, dir_only))
+
+    def is_ignored(self, rel: str, is_dir: bool = False) -> bool:
+        rel = rel.replace("\\", "/").strip("/")
+        if not rel or not self.rules:
+            return False
+        ignored = False
+        for pattern, negate, dir_only in self.rules:
+            if dir_only and not is_dir and not rel.startswith(pattern + "/"):
+                continue
+            if "/" in pattern:
+                matched = fnmatch.fnmatchcase(rel, pattern) or fnmatch.fnmatchcase(rel, pattern + "/*")
+            else:
+                matched = any(fnmatch.fnmatchcase(part, pattern) for part in rel.split("/"))
+            if matched:
+                ignored = not negate
+        return ignored
+
 
 SAFE_TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".schema", ".dist")
 SECRET_EXACT_NAMES = frozenset(
@@ -169,6 +234,12 @@ class ToolExecutor:
         self.always_allow_bash: bool = False
         self.allow_secret_reads: bool = False
         self._auto_checkpoint_done: bool = False
+        self._gitignore: GitIgnoreMatcher | None = None
+
+    def _gitignore_matcher(self) -> GitIgnoreMatcher:
+        if self._gitignore is None:
+            self._gitignore = GitIgnoreMatcher(self.workspace)
+        return self._gitignore
 
     def begin_turn(self) -> None:
         """Resets per-turn state so the next mutation gets a fresh auto-checkpoint."""
@@ -206,11 +277,21 @@ class ToolExecutor:
 
     def list_workspace_files(self, limit: int = 250) -> list[str]:
         results: list[str] = []
+        ignore = self._gitignore_matcher()
         for root, dirs, files in os.walk(self.workspace):
-            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+            root_rel = self.rel_display(Path(root))
+            dirs[:] = [
+                d
+                for d in dirs
+                if d not in IGNORED_DIRS
+                and not ignore.is_ignored(f"{root_rel}/{d}" if root_rel != "." else d, is_dir=True)
+            ]
             for fname in sorted(files):
                 full = Path(root) / fname
-                results.append(self.rel_display(full))
+                rel = self.rel_display(full)
+                if ignore.is_ignored(rel):
+                    continue
+                results.append(rel)
                 if len(results) >= limit:
                     return results
         return results
@@ -496,6 +577,26 @@ class ToolExecutor:
         )
         return ToolResult(True, summary, output, diff=diff)
 
+    @staticmethod
+    def _fuzzy_spans(content: str, old: str) -> list[tuple[int, int]]:
+        """Finds whitespace-normalized line-block matches of `old` inside `content`."""
+        if not old.strip():
+            return []
+        c_lines = content.splitlines(keepends=True)
+        o_lines = old.splitlines()
+        if not o_lines or len(o_lines) > len(c_lines):
+            return []
+        offsets = [0]
+        for line in c_lines:
+            offsets.append(offsets[-1] + len(line))
+        normalized = [" ".join(line.split()) for line in c_lines]
+        target = [" ".join(line.split()) for line in o_lines]
+        spans: list[tuple[int, int]] = []
+        for start in range(len(c_lines) - len(o_lines) + 1):
+            if normalized[start : start + len(o_lines)] == target:
+                spans.append((offsets[start], offsets[start + len(o_lines)]))
+        return spans
+
     def _tool_edit(self, args: dict[str, Any]) -> ToolResult:
         raw = args.get("filePath") or args.get("path")
         old_str = str(args.get("oldString", ""))
@@ -511,20 +612,35 @@ class ToolExecutor:
 
         old_content = target.read_text(encoding="utf-8", errors="replace")
         count = old_content.count(old_str)
+        span: tuple[int, int] | None = None
+        notes: list[str] = []
         if count == 0:
-            return ToolResult(False, "oldString not found", "oldString not found in file content.")
-        if count > 1 and not replace_all:
+            spans = self._fuzzy_spans(old_content, old_str)
+            if not spans:
+                return ToolResult(False, "oldString not found", "oldString not found in file content.")
+            if len(spans) > 1 and not replace_all:
+                return ToolResult(
+                    False,
+                    f"{len(spans)} ambiguous fuzzy matches",
+                    f"Found {len(spans)} whitespace-normalized matches; add context or set replaceAll=true.",
+                )
+            span = spans[0]
+            notes.append("fuzzy match (whitespace normalized) — verify the diff")
+        elif count > 1 and not replace_all:
             return ToolResult(
                 False,
                 f"{count} ambiguous matches",
                 f"Found {count} matches for oldString; add context or set replaceAll=true.",
             )
 
-        new_content = (
-            old_content.replace(old_str, new_str)
-            if replace_all
-            else old_content.replace(old_str, new_str, 1)
-        )
+        if span is not None:
+            new_content = old_content[: span[0]] + new_str + old_content[span[1] :]
+        else:
+            new_content = (
+                old_content.replace(old_str, new_str)
+                if replace_all
+                else old_content.replace(old_str, new_str, 1)
+            )
         target.write_text(new_content, encoding="utf-8")
 
         self.undo_stack.append(
@@ -542,7 +658,8 @@ class ToolExecutor:
         self._record_file_change(rel, added, removed)
         summary, output = self._attach_diagnostics(
             f"(+{added} -{removed})",
-            f"Edited {rel} (+{added} -{removed} lines)",
+            f"Edited {rel} (+{added} -{removed} lines)"
+            + (f"\n\nNote: {notes[0]}" if notes else ""),
             rel,
             new_content,
         )
@@ -593,8 +710,11 @@ class ToolExecutor:
     def _tool_glob(self, args: dict[str, Any]) -> ToolResult:
         pattern = str(args.get("pattern", "*"))
         matches: list[str] = []
+        ignore = self._gitignore_matcher()
         for p in self.workspace.rglob(pattern if "**" not in pattern else pattern.replace("**/", "")):
             if any(part in IGNORED_DIRS for part in p.parts):
+                continue
+            if ignore.is_ignored(self.rel_display(p), is_dir=p.is_dir()):
                 continue
             if p.is_file():
                 matches.append(self.rel_display(p))
@@ -607,10 +727,21 @@ class ToolExecutor:
     def _tool_grep(self, args: dict[str, Any]) -> ToolResult:
         pattern = str(args.get("pattern", ""))
         include = str(args.get("include", "*"))
+        files_only = bool(args.get("filesOnly") or args.get("files_only") or args.get("-l"))
+        try:
+            context = max(0, min(8, int(args.get("context", 0) or 0)))
+        except (TypeError, ValueError):
+            context = 0
+        try:
+            raw_per_file = int(args.get("maxPerFile", 0) or 0)
+        except (TypeError, ValueError):
+            raw_per_file = 0
+        max_per_file = max(1, raw_per_file) if raw_per_file else 0
         if not pattern:
             return ToolResult(False, "empty pattern", "Regex pattern is required.")
         regex = re.compile(pattern, re.IGNORECASE)
         hits: list[str] = []
+        matched_files: list[str] = []
         for rel in self.list_workspace_files(limit=300):
             full = self.workspace / rel
             if not self._secret_reads_allowed() and is_secret_file(full):
@@ -621,15 +752,38 @@ class ToolExecutor:
                 text = full.read_text(encoding="utf-8", errors="ignore")
             except Exception:
                 continue
-            for idx, line in enumerate(text.splitlines(), start=1):
-                if regex.search(line):
+            lines = text.splitlines()
+            file_hits = 0
+            for idx, line in enumerate(lines, start=1):
+                if not regex.search(line):
+                    continue
+                file_hits += 1
+                if files_only:
+                    break
+                if context:
+                    start = max(1, idx - context)
+                    end = min(len(lines), idx + context)
+                    for n in range(start, end + 1):
+                        marker = ":" if n == idx else "-"
+                        hits.append(f"{rel}{marker}{n}{marker} {lines[n - 1].strip()[:140]}")
+                    hits.append("--")
+                else:
                     hits.append(f"{rel}:{idx}: {line.strip()[:140]}")
-                    if len(hits) >= 80:
-                        break
+                if max_per_file and file_hits >= max_per_file:
+                    break
+                if len(hits) >= 80:
+                    break
+            if file_hits:
+                matched_files.append(rel)
             if len(hits) >= 80:
                 break
+        if files_only:
+            out = "\n".join(matched_files) if matched_files else "No matches found."
+            return ToolResult(True, f"{len(matched_files)} files", out)
+        if context and hits and hits[-1] == "--":
+            hits.pop()
         out = "\n".join(hits) if hits else "No matches found."
-        return ToolResult(True, f"{len(hits)} matches", out)
+        return ToolResult(True, f"{len(hits)} lines", out)
 
     async def _tool_lint(self, args: dict[str, Any]) -> ToolResult:
         raw = str(args.get("filePath") or args.get("path") or ".").strip()
@@ -760,6 +914,15 @@ class ToolExecutor:
         if not command:
             return ToolResult(False, "empty command", "command is required.")
 
+        danger = is_dangerous_command(command)
+        if danger:
+            return ToolResult(
+                False,
+                f"blocked: dangerous command ({danger[:32]})",
+                "This command matches a destructive deny-pattern (rm -rf /, mkfs, disk formatting, "
+                "force-push, fork bomb, ...). Refusing to execute it even in build mode.",
+            )
+
         is_readonly = any(command.lower().startswith(pref.lower()) for pref in READONLY_BASH_PREFIXES)
         if agent_mode == "plan" and not is_readonly:
             return ToolResult(
@@ -852,7 +1015,7 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "edit",
-            "description": "Replace exact string in an existing file.",
+            "description": "Replace an exact string in an existing file (falls back to whitespace-normalized fuzzy matching when no exact match exists).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -907,12 +1070,15 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "grep",
-            "description": "Search file contents using regex.",
+            "description": "Search file contents using regex, with optional context lines, per-file caps, and file-only output.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string"},
                     "include": {"type": "string"},
+                    "context": {"type": "integer", "description": "Lines of context around each match (0-8)."},
+                    "maxPerFile": {"type": "integer", "description": "Maximum matched lines per file."},
+                    "filesOnly": {"type": "boolean", "description": "Return only file names with matches (-l)."},
                 },
                 "required": ["pattern"],
             },

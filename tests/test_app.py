@@ -938,3 +938,96 @@ async def test_commit_command_drafts_and_confirms(tmp_path: Path) -> None:
     subject = git("log", "-1", "--format=%s").stdout.strip()
     assert subject == draft.splitlines()[0]
     assert git("status", "--porcelain").stdout.strip() == ""
+
+@pytest.mark.asyncio
+async def test_gitignore_respected_by_glob_grep_and_listing(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("*.log\nsecret_dir/\n", encoding="utf-8")
+    (tmp_path / "keep.py").write_text("needle = 1\n", encoding="utf-8")
+    (tmp_path / "debug.log").write_text("needle in log\n", encoding="utf-8")
+    secret = tmp_path / "secret_dir"
+    secret.mkdir()
+    (secret / "hidden.py").write_text("needle in secret\n", encoding="utf-8")
+
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    listed = executor.list_workspace_files()
+    assert "keep.py" in listed
+    assert "debug.log" not in listed
+    assert not any(name.startswith("secret_dir/") for name in listed)
+
+    glob_res = await executor.execute("glob", {"pattern": "*.py"})
+    assert "keep.py" in glob_res.output
+    assert "hidden.py" not in glob_res.output
+
+    grep_res = await executor.execute("grep", {"pattern": "needle"})
+    assert "keep.py" in grep_res.output
+    assert "debug.log" not in grep_res.output
+    assert "hidden.py" not in grep_res.output
+
+
+@pytest.mark.asyncio
+async def test_grep_context_files_only_and_per_file_limit(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("l1\nhit two\nl3\nl4\nhit five\nl6\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("hit one\nx\ny\n", encoding="utf-8")
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+
+    ctx = await executor.execute("grep", {"pattern": r"\bhit\b", "context": 1})
+    assert ctx.ok is True
+    assert "a.py:2:" in ctx.output
+    assert "a.py-1-" in ctx.output
+    assert "--" in ctx.output
+
+    only = await executor.execute("grep", {"pattern": r"\bhit\b", "filesOnly": True})
+    names = set(only.output.split())
+    assert {"a.py", "b.py"} <= names
+    assert ":" not in only.output
+
+    limited = await executor.execute("grep", {"pattern": r"\bhit\b", "maxPerFile": 1})
+    assert sum(1 for line in limited.output.splitlines() if line.startswith("a.py:")) == 1
+
+
+@pytest.mark.asyncio
+async def test_edit_falls_back_to_fuzzy_whitespace_match(tmp_path: Path) -> None:
+    (tmp_path / "f.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+
+    res = await executor.execute(
+        "edit",
+        {"filePath": "f.py", "oldString": "def foo():\n  return 2", "newString": "def foo():\n    return 2"},
+    )
+    assert res.ok is False
+
+    res = await executor.execute(
+        "edit",
+        {"filePath": "f.py", "oldString": "def foo():\n  return 1", "newString": "def foo():\n    return 3"},
+    )
+    assert res.ok is True
+    assert "return 3" in (tmp_path / "f.py").read_text(encoding="utf-8")
+    assert "fuzzy" in res.output.lower()
+
+
+@pytest.mark.asyncio
+async def test_dangerous_bash_commands_are_denied(tmp_path: Path) -> None:
+    from rbit.tools import is_dangerous_command
+
+    assert is_dangerous_command("rm -rf /")
+    assert is_dangerous_command("git push --force origin main")
+    assert is_dangerous_command("mkfs.ext4 /dev/sda1")
+    assert is_dangerous_command("echo hello") == ""
+
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    res = await executor.execute("bash", {"command": "rm -rf /"})
+    assert res.ok is False
+    assert "dangerous" in f"{res.summary} {res.output}".lower()
+
+
+def test_cli_lint_exit_codes_and_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    (tmp_path / "bad.py").write_text("def broken(:\n    pass\n", encoding="utf-8")
+    assert cli_main(["lint", str(tmp_path), "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["issue_count"] >= 1
+    assert "syntax" in payload["output"].lower() or "error" in payload["output"].lower()
+
+    (tmp_path / "bad.py").write_text("x = 1\n", encoding="utf-8")
+    assert cli_main(["lint", str(tmp_path)]) == 0
+    assert "rbit lint" in capsys.readouterr().out

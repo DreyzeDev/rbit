@@ -7,6 +7,8 @@ import asyncio
 import json
 import os
 import platform
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -314,6 +316,51 @@ def _run_map(workspace: Path, max_tokens: int | None = None, as_json: bool = Fal
     return 0
 
 
+def _run_lint(workspace: Path, as_json: bool = False) -> int:
+    executor = ToolExecutor(workspace=workspace, session=Session())
+    ruff = shutil.which("ruff")
+    output = ""
+    ok = True
+    if ruff:
+        proc = subprocess.run(
+            [ruff, "check", "--output-format", "concise", "."],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+        )
+        ok = proc.returncode == 0
+        output = "\n".join(part for part in (proc.stdout.strip(), proc.stderr.strip()) if part)
+        output = output or "No lint issues."
+    else:
+        res = executor._tool_diagnostics({"filePath": "."})
+        ok = res.ok
+        output = res.output
+
+    issues = [
+        line
+        for line in output.splitlines()
+        if line.strip() and not line.lower().startswith(("no lint issues", "no syntax issues"))
+    ]
+    payload = {
+        "workspace": str(workspace),
+        "linter": "ruff" if ruff else "builtin-diagnostics",
+        "ok": ok,
+        "issue_count": len(issues),
+        "output": output,
+    }
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        console = Console()
+        console.print(
+            f"[bold #fab283]rbit lint[/] [#808080]{len(issues)} issue(s) · "
+            f"{'ruff' if ruff else 'builtin syntax diagnostics'}[/]"
+        )
+        if issues:
+            console.print(output)
+    return 0 if ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
 
@@ -325,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "export", "map"}
+    subcommands = {"run", "doctor", "stats", "sessions", "export", "map", "lint"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -376,6 +423,13 @@ def main(argv: list[str] | None = None) -> int:
             parsed = p.parse_args(rest)
             return _run_map(_resolve_workspace(parsed.dir), parsed.max_tokens, parsed.json)
 
+        if sub == "lint":
+            p = argparse.ArgumentParser(prog="rbit lint", description="Lint a workspace with ruff or built-in diagnostics")
+            p.add_argument("dir", nargs="?", help="Workspace directory")
+            p.add_argument("--json", action="store_true", help="Emit structured JSON output")
+            parsed = p.parse_args(rest)
+            return _run_lint(_resolve_workspace(parsed.dir), parsed.json)
+
     # Default: Interactive Full-Screen TUI mode
     parser = argparse.ArgumentParser(
         prog="rbit",
@@ -388,7 +442,8 @@ def main(argv: list[str] | None = None) -> int:
             "  rbit stats [dir]       Show token, cost & tool analytics across sessions\n"
             "  rbit sessions [dir]    List saved sessions in workspace\n"
             "  rbit export [id]       Export session transcript to Markdown\n"
-            "  rbit map [dir]         Repository map with sizes, languages & token budget"
+            "  rbit map [dir]         Repository map with sizes, languages & token budget\n"
+            "  rbit lint [dir]        Lint workspace; exit code 1 on issues (--json)"
         ),
     )
     parser.add_argument("target", nargs="?", help="Workspace directory path (defaults to current directory)")
