@@ -526,4 +526,50 @@ async def test_secret_guard_blocks_env_and_redacts_tokens(tmp_path: Path) -> Non
     assert redact_secrets("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9") == "Authorization: Bearer [REDACTED]"
 
 
+@pytest.mark.asyncio
+async def test_auto_checkpoint_before_first_edit_per_turn(tmp_path: Path) -> None:
+    target = tmp_path / "a.py"
+    target.write_text("v1 = 1\n", encoding="utf-8")
+
+    session = Session()
+    executor = ToolExecutor(workspace=tmp_path, session=session)
+    cps = executor.storage.list_checkpoints()
+    assert cps == []
+
+    executor.begin_turn()
+    first_write = await executor.execute("write", {"filePath": "b.py", "content": "b = 2\n"})
+    assert first_write.ok is True
+
+    cps = executor.storage.list_checkpoints()
+    assert len(cps) == 1
+    assert cps[0].label == "auto: before first edit of turn"
+    assert "b.py" not in str(executor.storage.load_checkpoint_files(cps[0].id)[1])
+    first_auto_cp_id = cps[0].id
+
+    # Second mutation in the same turn must NOT create another checkpoint
+    second_write = await executor.execute("write", {"filePath": "c.py", "content": "c = 3\n"})
+    assert second_write.ok is True
+    assert len(executor.storage.list_checkpoints()) == 1
+
+    # New turn -> fresh auto checkpoint captured BEFORE the edit (still holds pre-edit a.py)
+    executor.begin_turn()
+    edited = await executor.execute("edit", {"filePath": "a.py", "oldString": "v1 = 1", "newString": "v1 = 999"})
+    assert edited.ok is True
+    assert target.read_text(encoding="utf-8") == "v1 = 999\n"
+
+    cps = executor.storage.list_checkpoints()
+    assert len(cps) == 2
+    newest = cps[0] if cps[0].id != first_auto_cp_id else cps[1]
+    assert newest.label == "auto: before first edit of turn"
+    _, newest_files = executor.storage.load_checkpoint_files(newest.id)
+    assert newest_files["a.py"] == "v1 = 1\n"
+
+    # /rewind to the FIRST auto checkpoint restores v1 and drops files created after it
+    restored = executor.restore_checkpoint(first_auto_cp_id)
+    assert "Rewound workspace" in restored
+    assert target.read_text(encoding="utf-8") == "v1 = 1\n"
+    assert not (tmp_path / "b.py").exists()
+    assert not (tmp_path / "c.py").exists()
+
+
 

@@ -92,6 +92,7 @@ class AgentEngine:
     ) -> ChatMessage:
         t0 = time.perf_counter()
         cfg = self.get_config()
+        self.executor.begin_turn()
         model_info = get_model_info(model_id, self.extra_models)
         api_key = (cfg.get("api_key") or "").strip()
         api_base = (cfg.get("api_base") or "https://openrouter.ai/api/v1").rstrip("/")

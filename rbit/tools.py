@@ -165,6 +165,22 @@ class ToolExecutor:
         self.redo_stack: list[FileSnapshot] = []
         self.always_allow_bash: bool = False
         self.allow_secret_reads: bool = False
+        self._auto_checkpoint_done: bool = False
+
+    def begin_turn(self) -> None:
+        """Resets per-turn state so the next mutation gets a fresh auto-checkpoint."""
+        self._auto_checkpoint_done = False
+
+    def _maybe_auto_checkpoint(self) -> None:
+        """Snapshots the workspace once per turn, right before the first file mutation."""
+        if self._auto_checkpoint_done:
+            return
+        self._auto_checkpoint_done = True
+        try:
+            if self.list_workspace_files(limit=1):
+                self.create_checkpoint("auto: before first edit of turn")
+        except Exception:
+            pass
 
     def _secret_reads_allowed(self) -> bool:
         if self.allow_secret_reads:
@@ -372,6 +388,9 @@ class ToolExecutor:
             )
 
         try:
+            if name in ("write", "edit", "multi_edit"):
+                self._maybe_auto_checkpoint()
+
             if name == "read":
                 res = await asyncio.to_thread(self._tool_read, args)
             elif name == "write":
