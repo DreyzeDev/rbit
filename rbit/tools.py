@@ -67,6 +67,8 @@ READONLY_TOOLS: frozenset[str] = frozenset(
     {"read", "glob", "grep", "webfetch", "diagnostics", "lint", "symbols", "git"}
 )
 
+MUTATING_TOOLS: frozenset[str] = frozenset({"write", "edit", "multi_edit", "apply_patch"})
+
 VIRTUAL_ATTACHMENTS: frozenset[str] = frozenset({"diff", "git", "staged", "tree"})
 
 MAX_CHECKPOINT_FILE_BYTES = 256_000
@@ -275,6 +277,7 @@ class ToolResult:
     output: str
     diff: str = ""
     duration_ms: int = 0
+    pid: int = 0
 
 
 PermissionCallback = Callable[[str, str], Awaitable[bool]]
@@ -549,7 +552,7 @@ class ToolExecutor:
         agent_mode: str = "build",
     ) -> ToolResult:
         t0 = time.perf_counter()
-        if agent_mode == "plan" and name in ("write", "edit", "multi_edit"):
+        if agent_mode == "plan" and name in ("write", "edit", "multi_edit", "apply_patch"):
             return ToolResult(
                 ok=False,
                 summary=f"{name} blocked in Plan mode",
@@ -558,7 +561,7 @@ class ToolExecutor:
             )
 
         try:
-            if name in ("write", "edit", "multi_edit"):
+            if name in ("write", "edit", "multi_edit", "apply_patch"):
                 self._maybe_auto_checkpoint()
 
             if name == "read":
@@ -569,6 +572,8 @@ class ToolExecutor:
                 res = self._tool_edit(args)
             elif name == "multi_edit":
                 res = self._tool_multi_edit(args)
+            elif name == "apply_patch":
+                res = self._tool_apply_patch(args)
             elif name == "glob":
                 res = await asyncio.to_thread(self._tool_glob, args)
             elif name == "grep":
@@ -812,6 +817,135 @@ class ToolExecutor:
             updated,
         )
         return ToolResult(True, summary, output, diff=diff)
+
+    @staticmethod
+    def _parse_unified_diff(patch: str) -> tuple[str | None, list[tuple[int, int, list[str]]]]:
+        """Parses a unified diff into (target_path, [(old_start, old_len, hunk_lines)])."""
+        target: str | None = None
+        hunks: list[tuple[int, int, list[str]]] = []
+        cur: list[str] | None = None
+        old_start = 0
+        old_len = 0
+        for raw in patch.replace("\r\n", "\n").split("\n"):
+            if raw.startswith("--- "):
+                cur = None
+                continue
+            if raw.startswith("+++ "):
+                cur = None
+                name = raw[4:].strip().split("\t")[0].strip()
+                if name.startswith("b/"):
+                    name = name[2:]
+                if name and name != "/dev/null":
+                    target = name
+                continue
+            if raw.startswith("@@"):
+                cur = []
+                header = raw.split("@@")[1].strip()
+                old_part = header.split()[0] if header else "-0,0"
+                old_start = abs(int(old_part[1:].split(",")[0] or 0))
+                old_len = int(old_part.split(",")[1]) if "," in old_part else 1
+                hunks.append((old_start, old_len, cur))
+                continue
+            if cur is None:
+                continue
+            if raw.startswith("\\"):
+                continue
+            if raw == "":
+                continue
+            if raw[0] not in (" ", "+", "-"):
+                continue
+            cur.append(raw)
+        return target, hunks
+
+    def _tool_apply_patch(self, args: dict[str, Any]) -> ToolResult:
+        patch = str(args.get("patch", "")).strip("\n")
+        if not patch.strip():
+            return ToolResult(False, "empty patch", "`patch` must contain a unified diff.")
+
+        target_hint, hunks = self._parse_unified_diff(patch)
+        if not hunks:
+            return ToolResult(False, "no hunks", "No `@@` hunks found in the patch.")
+
+        raw = str(args.get("filePath") or args.get("path") or target_hint or "").strip()
+        if not raw:
+            return ToolResult(False, "missing filePath", "Provide `filePath` or a `+++ b/<path>` header.")
+
+        target = self.resolve_path(raw)
+        rel = self.rel_display(target)
+        existed = target.exists()
+        old_content = target.read_text(encoding="utf-8", errors="replace") if existed else ""
+        lines = old_content.split("\n") if old_content else []
+        if lines and lines[-1] == "":
+            lines.pop()
+
+        output = list(lines)
+        cursor = 0
+        for old_start, old_len, hunk_lines in hunks:
+            start = max(0, old_start - 1) if old_start > 0 else 0
+            if start < cursor:
+                return ToolResult(
+                    False,
+                    f"overlapping hunk at line {old_start}",
+                    f"Hunks are out of order or overlapping near line {old_start}.",
+                )
+            if start > len(output):
+                return ToolResult(
+                    False,
+                    f"hunk out of range at line {old_start}",
+                    f"Hunk targets line {old_start} but the file has {len(output)} lines.",
+                )
+            cursor = start
+            for hline in hunk_lines:
+                op, text = hline[0], hline[1:]
+                if op == "+":
+                    output.insert(cursor, text)
+                    cursor += 1
+                    continue
+                if cursor >= len(output):
+                    return ToolResult(
+                        False,
+                        f"patch context beyond EOF at line {cursor + 1}",
+                        f"Cannot match `{text}` — file ended at line {cursor}.",
+                    )
+                if output[cursor] != text and output[cursor].rstrip() != text.rstrip():
+                    return ToolResult(
+                        False,
+                        f"context mismatch at line {cursor + 1}",
+                        f"Expected `{text}` but found `{output[cursor]}` at line {cursor + 1}. "
+                        "Re-read the file and regenerate the patch.",
+                    )
+                if op == " ":
+                    cursor += 1
+                else:
+                    del output[cursor]
+
+        new_content = "\n".join(output)
+        if old_content.endswith("\n") or not existed:
+            new_content += "\n"
+
+        atomic_write_text(target, new_content)
+        self.invalidate_file_cache()
+
+        self.undo_stack.append(
+            FileSnapshot(
+                step_label=f"apply_patch {rel}",
+                path=str(target),
+                existed_before=existed,
+                previous_content=old_content,
+                new_content=new_content,
+            )
+        )
+        self.redo_stack.clear()
+
+        diff, added, removed = self._compute_diff(old_content, new_content, rel)
+        self._record_file_change(rel, added, removed)
+        summary, out = self._attach_diagnostics(
+            f"{len(hunks)} hunks (+{added} -{removed})",
+            f"Applied patch to {rel} (+{added} -{removed} lines)",
+            rel,
+            new_content,
+        )
+        return ToolResult(True, summary, out, diff=diff)
 
     def _tool_glob(self, args: dict[str, Any]) -> ToolResult:
         pattern = str(args.get("pattern", "*"))
@@ -1287,7 +1421,9 @@ class ToolExecutor:
             True,
             f"background pid {proc.pid}",
             f"Started in background (pid {proc.pid}): {command}\n"
-            "Output is discarded; poll the process or write results to a file.",
+            "Output is discarded; poll the process or write results to a file. "
+            "Click the card (or press Ctrl+X) to stop it.",
+            pid=proc.pid,
         )
 
     async def terminate_background(self) -> int:
@@ -1305,6 +1441,28 @@ class ToolExecutor:
                 pass
         self._background_procs.clear()
         return count
+
+    def background_pids(self) -> list[int]:
+        """Returns PIDs of still-running background shells started this session."""
+        return [p.pid for p in self._background_procs if p.returncode is None and p.pid]
+
+    async def terminate_background_pid(self, pid: int) -> bool:
+        """Terminates a single background process by pid; returns True when it was killed."""
+        for proc in list(self._background_procs):
+            if proc.pid != pid:
+                continue
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            self._background_procs.remove(proc)
+            return True
+        return False
 
     async def _run_subprocess(self, command: str, timeout_s: float = 30.0) -> ToolResult:
         if os.name == "nt":
@@ -1425,6 +1583,27 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["filePath", "edits"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": "Apply a unified diff (one `@@` hunk or many) to a file. Precise alternative to `edit` for larger multi-line changes; supports file creation when the file does not exist.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {
+                        "type": "string",
+                        "description": "Target file path (optional when the patch has a `+++ b/<path>` header).",
+                    },
+                    "patch": {
+                        "type": "string",
+                        "description": "Unified diff text with `@@ -old,count +new,count @@` hunk headers.",
+                    },
+                },
+                "required": ["patch"],
             },
         },
     },

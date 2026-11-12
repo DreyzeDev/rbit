@@ -405,6 +405,100 @@ def _run_lint(workspace: Path, as_json: bool = False) -> int:
     return 0 if ok else 1
 
 
+def _parse_version(text: str) -> tuple[int, ...]:
+    """Parses a dotted version like '1.2.3' into a comparable tuple."""
+    parts: list[int] = []
+    for chunk in re.split(r"[.\-+]", text.strip().lstrip("v")):
+        match = re.match(r"(\d+)", chunk)
+        if match:
+            parts.append(int(match.group(1)))
+        else:
+            break
+    return tuple(parts) or (0,)
+
+
+def _fetch_latest_pypi_version(name: str = "rbit", timeout: float = 4.0) -> str | None:
+    """Looks up the newest release on PyPI; returns None when offline or unpublished."""
+    import httpx
+
+    try:
+        resp = httpx.get(f"https://pypi.org/pypi/{name}/json", timeout=timeout)
+    except Exception:
+        return None
+    if resp.status_code >= 400:
+        return None
+    try:
+        return str(resp.json()["info"]["version"])
+    except Exception:
+        return None
+
+
+def _run_update(check_only: bool = False, as_json: bool = False) -> int:
+    """Checks PyPI for a newer release and optionally upgrades the installed package."""
+    console = Console()
+    latest = _fetch_latest_pypi_version()
+    current = __version__
+    if latest is None:
+        payload = {
+            "status": "unavailable",
+            "current": current,
+            "latest": None,
+            "up_to_date": False,
+            "message": "Could not reach PyPI (offline or the package is not published yet).",
+        }
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            console.print(
+                "[bold #fab283]rbit update[/] [#808080]could not reach PyPI — "
+                "check your network or install from source.[/]"
+            )
+        return 1
+
+    up_to_date = _parse_version(latest) <= _parse_version(current)
+    payload = {
+        "status": "up-to-date" if up_to_date else "update-available",
+        "current": current,
+        "latest": latest,
+        "up_to_date": up_to_date,
+    }
+
+    if up_to_date:
+        payload["message"] = f"rbit v{current} is the latest release."
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            console.print(f"[bold #7fd88f]✓[/] rbit v{current} is up to date.")
+        return 0
+
+    if check_only:
+        payload["message"] = f"rbit v{latest} is available (installed v{current})."
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            console.print(
+                f"[bold #fab283]rbit update[/] v{latest} is available (installed v{current}). "
+                "Run [bold]rbit update[/] without --check to install."
+            )
+        return 0
+
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "rbit"]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    ok = proc.returncode == 0
+    payload["status"] = "updated" if ok else "failed"
+    payload["message"] = (
+        f"Installed rbit v{latest}." if ok else (proc.stderr.strip()[-500:] or "pip install failed.")
+    )
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        if ok:
+            console.print(f"[bold #7fd88f]✓[/] Updated rbit {current} → {latest}. Restart to use it.")
+        else:
+            console.print(f"[bold #e06c75]✗[/] Update failed: {payload['message']}")
+    return 0 if ok else 1
+
+
 def _parse_age_spec(spec: str) -> float:
     match = re.fullmatch(r"\s*(\d+)\s*([smhdw]?)\s*", spec.lower())
     if not match:
@@ -537,7 +631,7 @@ def _run_init(workspace: Path, force: bool = False, as_json: bool = False) -> in
     return 0
 
 
-COMMANDS = "run doctor stats sessions export map lint init"
+COMMANDS = "run doctor stats sessions export map lint init commit update"
 
 COMPLETION_SCRIPTS: dict[str, str] = {
     "bash": (
@@ -659,7 +753,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "export", "map", "lint", "init", "commit"}
+    subcommands = {"run", "doctor", "stats", "sessions", "export", "map", "lint", "init", "commit", "update"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -745,6 +839,13 @@ def main(argv: list[str] | None = None) -> int:
             parsed = p.parse_args(rest)
             return _run_commit(_resolve_workspace(parsed.dir), parsed.apply, parsed.message, parsed.json)
 
+        if sub == "update":
+            p = argparse.ArgumentParser(prog="rbit update", description="Check PyPI and install a newer rbit")
+            p.add_argument("--check", action="store_true", help="Only report whether an update exists")
+            p.add_argument("--json", action="store_true", help="Emit structured JSON output")
+            parsed = p.parse_args(rest)
+            return _run_update(parsed.check, parsed.json)
+
     # Default: Interactive Full-Screen TUI mode
     parser = argparse.ArgumentParser(
         prog="rbit",
@@ -762,6 +863,7 @@ def main(argv: list[str] | None = None) -> int:
             "  rbit lint [dir]        Lint workspace; exit code 1 on issues (--json)\n"
             "  rbit init [dir]        Create RBIT.md + .rbit/memory.md from project scan\n"
             "  rbit commit [dir]      Draft a commit message from git diff (--apply to commit)\n"
+            "  rbit update            Check PyPI for a newer release (--check to skip install)\n"
             "  rbit --generate-completion bash|zsh|powershell   Print shell completion script\n"            "\n"
             "Global flags: --quiet (warnings only), --verbose (info), --trace (debug)\n"
             "              --profile <name> applies a named overlay from config.json"

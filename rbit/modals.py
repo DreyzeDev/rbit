@@ -12,7 +12,15 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Markdown, OptionList, Static
 from textual.widgets.option_list import Option
 
-from .models import AVAILABLE_MODELS, CheckpointMeta, ModelInfo, Session, TodoItem, short_id
+from .models import (
+    AVAILABLE_MODELS,
+    CheckpointMeta,
+    ModelInfo,
+    Session,
+    TodoItem,
+    search_session,
+    short_id,
+)
 from .themes import CURATED_THEMES
 
 
@@ -33,8 +41,10 @@ PALETTE_ITEMS: list[tuple[str, str, str, str]] = [
     ("Session", "fork", "Fork session into a new branch", "/fork"),
     ("Session", "commit", "Draft/confirm a Git commit", "/commit"),
     ("Session", "copy", "Copy the last answer", "ctrl+y"),
+    ("Session", "search", "Search session messages", "ctrl+f"),
     ("Session", "diff", "View modified files diff summary", "/diff"),
     ("Session", "clear", "Clear messages", "ctrl+l"),
+    ("System", "stop_background", "Stop background shells", "ctrl+x"),
     ("System", "toggle_sidebar", "Toggle sidebar", "ctrl+b"),
     ("System", "theme", "Switch theme", "ctrl+t"),
     ("System", "effort", "Switch reasoning effort", "/effort"),
@@ -677,6 +687,69 @@ class ConnectApiModal(ModalScreen[dict[str, str] | None]):
         self.dismiss({"api_base": "https://openrouter.ai/api/v1", "api_key": ""})
 
     @on(Button.Pressed, "#btn-cancel-api")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SearchResultsModal(ModalScreen[str | None]):
+    """Ctrl+F session search: queries messages and tool output, jumps to a hit."""
+
+    BINDINGS = [Binding("escape", "cancel", "Close")]
+
+    def __init__(self, session: Session, query: str = "") -> None:
+        super().__init__()
+        self.session = session
+        self._query = query
+        self._hits: list[tuple[str, str, str]] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="oc-modal"):
+            yield Static(_modal_header("Search session"), classes="oc-modal-header")
+            yield Input(
+                value=self._query,
+                placeholder="Search messages and tool output...",
+                id="search-session-input",
+                classes="oc-modal-search",
+            )
+            yield OptionList(id="search-session-list", classes="oc-modal-list")
+            yield Label("enter jump · esc close", id="search-session-foot", classes="oc-modal-foot")
+
+    def on_mount(self) -> None:
+        self._run_search(self._query)
+        self.query_one("#search-session-input", Input).focus()
+
+    def _run_search(self, query: str) -> None:
+        self._query = query
+        self._hits = search_session(self.session, query)
+        olist = self.query_one("#search-session-list", OptionList)
+        olist.clear_options()
+        if not query.strip():
+            self.query_one("#search-session-foot", Label).update("type to search messages and tool output")
+            return
+        for mid, label, snippet in self._hits:
+            olist.add_option(Option(_two_col_option(f"{label} · {snippet}", "") , id=mid))
+        foot = self.query_one("#search-session-foot", Label)
+        count = len(self._hits)
+        foot.update(f"{count} match{'es' if count != 1 else ''} · enter jump · esc close")
+        if self._hits:
+            olist.highlighted = 0
+
+    @on(Input.Changed, "#search-session-input")
+    def _on_query(self, event: Input.Changed) -> None:
+        self._run_search(event.value)
+
+    @on(Input.Submitted, "#search-session-input")
+    def _on_submit(self) -> None:
+        olist = self.query_one("#search-session-list", OptionList)
+        if self._hits and olist.highlighted is not None:
+            idx = min(olist.highlighted, len(self._hits) - 1)
+            self.dismiss(self._hits[idx][0])
+
+    @on(OptionList.OptionSelected, "#search-session-list")
+    def _on_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_id:
+            self.dismiss(event.option_id)
+
     def action_cancel(self) -> None:
         self.dismiss(None)
 

@@ -68,6 +68,7 @@ class ToolCallRecord:
     output: str = ""
     diff: str = ""
     duration_ms: int = 0
+    pid: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -279,3 +280,37 @@ def get_model_info(model_id: str, extra_models: list[ModelInfo] | None = None) -
         clean = model_id.split("/", 1)[1]
         return ModelInfo(id=model_id, name=f"{clean} (Local)", provider="Ollama", context_window=32_768, cost_per_1k=0.0)
     return ModelInfo(id=model_id, name=model_id, provider="Custom")
+
+def search_session(
+    session: Session, query: str, limit: int = 100
+) -> list[tuple[str, str, str]]:
+    """Case-insensitive search over message text and tool output.
+
+    Returns `(message_id, label, snippet)` triples in conversation order.
+    """
+    q = query.strip().lower()
+    if not q:
+        return []
+    hits: list[tuple[str, str, str]] = []
+    for m in session.messages:
+        if len(hits) >= limit:
+            break
+        body = m.content or ""
+        lowered = body.lower()
+        if q in lowered:
+            pos = lowered.find(q)
+            start = max(0, pos - 40)
+            snippet = " ".join(body[start : pos + len(q) + 60].split())
+            label = f"User ({m.timestamp})" if m.role == "user" else f"rbit ({m.timestamp})"
+            hits.append((m.id, label, snippet))
+        for tc in m.tool_calls:
+            if len(hits) >= limit:
+                break
+            haystack = f"{tc.name} {tc.summary} {tc.output} {tc.diff}"
+            pos = haystack.lower().find(q)
+            if pos < 0:
+                continue
+            start = max(0, pos - 40)
+            snippet = " ".join(haystack[start : pos + len(q) + 60].split())
+            hits.append((m.id, f"Tool {tc.name}", snippet))
+    return hits

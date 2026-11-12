@@ -6,7 +6,7 @@
 [![Textual](https://img.shields.io/badge/TUI-Textual%208.x-fab283?style=flat-square)](https://textual.textualize.io/)
 [![License](https://img.shields.io/badge/License-MIT-7fd88f?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-5c9cf5?style=flat-square)](#)
-[![Tests](https://img.shields.io/badge/tests-pytest%2058%20passing-7fd88f?style=flat-square)](tests/test_app.py)
+[![Tests](https://img.shields.io/badge/tests-pytest%2063%20passing-7fd88f?style=flat-square)](tests/test_app.py)
 [![CI](https://github.com/DreyzeDev/rbit/actions/workflows/ci.yml/badge.svg)](https://github.com/DreyzeDev/rbit/actions/workflows/ci.yml)
 
 **Автономный полноэкранный AI-агент для терминала** — редактирует код, ищет по проекту, выполняет команды, хранит память проекта и откатывает время без Git.
@@ -112,6 +112,8 @@ rbit C:\path\to\project               # открыть конкретный во
 | `Ctrl+B` | Показать/скрыть сайдбар |
 | `Ctrl+N` | Новая сессия |
 | `Ctrl+Y` | Скопировать последний ответ |
+| `Ctrl+F` | Поиск по сессии (сообщения и вывод инструментов) |
+| `Ctrl+X` | Остановить фоновые shell-процессы |
 | `F1` | Шпаргалка по клавишам и командам |
 | `!` + строка | Мгновенный шелл (без токенов) |
 | `Esc` | Прервать агента |
@@ -130,6 +132,7 @@ rbit C:\path\to\project               # открыть конкретный во
 /init                 Анализ проекта + план         /fork [N]  Ветка сессии от сообщения N
 /retry                Повторить последний промпт    /commit    Черновик коммита по diff
 /copy                 Скопировать последний ответ    /diff      Сводка изменений
+/search <запрос>      Поиск по сессии                  /todo      Чеклист задач
 /help                 Горячие клавиши и команды     /effort    Reasoning effort (o-серия / R1)
 ```
 
@@ -141,6 +144,7 @@ rbit run --stdin "ревью этого diff" < diff.txt
 rbit run --json "..."                         # структурированный JSON-вывод для CI
 rbit run --output-format jsonl "..."          # событийный поток tool_call/message/done
 rbit commit [dir]                             # черновик сообщения коммита (--apply)
+rbit update [--check] [--json]                # проверка/установка новой версии с PyPI
 rbit --generate-completion bash|zsh|powershell  # скрипт автодополнения
 rbit --profile work run "..."                 # оверлей настроек из config.json
 rbit --effort high run "..."                  # reasoning effort для reasoning-моделей
@@ -207,7 +211,8 @@ rbit/
 - [x] Импорт всех моделей провайдера в отдельную категорию при `/connect`
 - [x] Автопоиск моделей: кэш в конфиге, фоновое обновление при старте, `/connect` и открытии селектора
 - [x] Выбор reasoning effort (`/effort`, `--effort`) для o-серии, DeepSeek R и thinking-моделей
-- [ ] `apply_patch`, фоновый `bash`, session search
+- [x] `apply_patch` (unified diff), кнопка stop для фоновых `bash`, поиск по сессии (`Ctrl+F`)
+- [x] `rbit update` (PyPI), единый источник правды для Todo (todowrite ↔ сайдбар)
 
 ## Лицензия
 

@@ -26,6 +26,7 @@ from .modals import (
     HelpModal,
     ModelSelectorModal,
     PermissionModal,
+    SearchResultsModal,
     SessionPickerModal,
     ThemeSelectorModal,
     TodoManagerModal,
@@ -410,6 +411,8 @@ class RbitApp(App[None]):
         Binding("ctrl+n", "new_session", "New Session", show=False),
         Binding("ctrl+l", "clear_chat", "Clear", show=False),
         Binding("ctrl+y", "copy_last", "Copy", show=False),
+        Binding("ctrl+f", "search_session", "Search", show=False),
+        Binding("ctrl+x", "stop_background", "Stop background", show=False),
         Binding("f1", "show_help", "Help", show=False),
         Binding("escape", "interrupt_or_close", "Interrupt", show=False),
         Binding("ctrl+q", "quit", "Quit", show=False),
@@ -452,6 +455,8 @@ class RbitApp(App[None]):
             storage=self.storage,
             permission_cb=self._ask_permission,
             get_config=lambda: self.config_data,
+            on_todos_updated=self._on_todos_updated,
+            on_files_updated=self._on_files_updated,
         )
         self.engine = AgentEngine(
             workspace=self.workspace,
@@ -605,6 +610,16 @@ class RbitApp(App[None]):
         )
         self.query_one(BottomStatusBar).update_bar(self.workspace, self.git_branch)
 
+    def _on_todos_updated(self, todos: list[TodoItem]) -> None:
+        """Keeps sidebar + modal in sync when the agent rewrites the todo list."""
+        self.session.todos = todos
+        if todos:
+            self._sidebar_override_on_home = True
+        self._sync_ui()
+
+    def _on_files_updated(self) -> None:
+        self._sync_ui()
+
     async def _ask_permission(self, tool_name: str, detail: str) -> bool:
         choice = await self.push_screen_wait(PermissionModal(tool_name, detail))
         if choice == "always":
@@ -662,6 +677,17 @@ class RbitApp(App[None]):
     @on(PromptModelLabel.Clicked)
     def _on_model_label_clicked(self) -> None:
         self.action_open_models()
+
+    @on(ToolCallCard.StopRequested)
+    async def _on_stop_background_requested(self, event: ToolCallCard.StopRequested) -> None:
+        killed = await self.executor.terminate_background_pid(event.pid)
+        for card in self._tool_widgets.values():
+            if card.record.pid == event.pid:
+                card.mark_stopped()
+        if killed:
+            self.notify(f"Stopped background process {event.pid}.", timeout=2.0)
+        else:
+            self.notify(f"Background process {event.pid} is already gone.", severity="warning", timeout=2.0)
 
     def action_toggle_agent(self) -> None:
         self.agent_mode = "plan" if self.agent_mode == "build" else "build"
@@ -749,6 +775,7 @@ class RbitApp(App[None]):
             "doctor": self._cmd_doctor,
             "toggle_agent": self.action_toggle_agent,
             "toggle_sidebar": self.action_toggle_sidebar,
+            "stop_background": self.action_stop_background,
             "new_session": self.action_new_session,
             "sessions": self.action_open_sessions,
             "undo": self._cmd_undo,
@@ -759,6 +786,7 @@ class RbitApp(App[None]):
             "fork": lambda: self._cmd_fork(""),
             "commit": lambda: self._cmd_commit(""),
             "copy": self.action_copy_last,
+            "search": self.action_search_session,
             "init": lambda: self._submit_prompt("Проанализируй проект и создай подробный Todo-план"),
             "connect": self.action_open_connect,
             "clear": self.action_clear_chat,
@@ -912,6 +940,25 @@ class RbitApp(App[None]):
         self._sync_ui()
         self.query_one("#prompt-input", Input).focus()
 
+    @work
+    async def action_search_session(self, initial_query: str = "") -> None:
+        target = await self.push_screen_wait(SearchResultsModal(self.session, initial_query))
+        if target:
+            self._jump_to_message(target)
+        self.query_one("#prompt-input", Input).focus()
+
+    def _jump_to_message(self, message_id: str) -> None:
+        for idx, m in enumerate(self.session.messages):
+            if m.id != message_id:
+                continue
+            for card in self.query_one("#chat-scroll", VerticalScroll).children:
+                target = getattr(card, "msg", None)
+                if target is not None and getattr(target, "id", None) == message_id:
+                    card.scroll_visible(animate=False)
+                    self.notify(f"Jumped to message #{idx + 1}.", timeout=2.0)
+                    return
+            return
+
     def action_copy_last(self) -> None:
         last = next(
             (m for m in reversed(self.session.messages) if m.role == "assistant" and m.content.strip()),
@@ -928,6 +975,22 @@ class RbitApp(App[None]):
                 severity="error",
                 timeout=3.0,
             )
+
+    def action_stop_background(self) -> None:
+        pids = self.executor.background_pids()
+        if not pids:
+            self.notify("No background processes are running.", timeout=2.0)
+            return
+        self._stop_all_background(pids)
+
+    @work
+    async def _stop_all_background(self, pids: list[int]) -> None:
+        for pid in pids:
+            await self.executor.terminate_background_pid(pid)
+        for card in self._tool_widgets.values():
+            if card.record.pid in pids:
+                card.mark_stopped()
+        self.notify(f"Stopped {len(pids)} background process{'es' if len(pids) != 1 else ''}.", timeout=2.0)
 
     def _load_session_into_ui(self, sess: Session) -> None:
         self.session = sess
@@ -1035,6 +1098,9 @@ class RbitApp(App[None]):
             return True
         if cmd == "/commit":
             self._cmd_commit(arg)
+            return True
+        if cmd == "/search":
+            self.action_search_session(arg)
             return True
         if cmd == "/copy":
             self.action_copy_last()

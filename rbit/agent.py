@@ -96,8 +96,8 @@ Active Agent Mode: {agent_mode}
 {mode_note}
 {memory_section}
 Respond concisely in the user's language (Russian if the user writes in Russian) using GitHub-flavored Markdown.
-Use tools (`read`, `glob`, `grep`, `symbols`, `git`, `diagnostics`, `write`, `edit`, `multi_edit`, `webfetch`, `bash`, `todowrite`) proactively when working with files, URLs, or tasks.
-If `write`, `edit`, or `multi_edit` reports `Diagnostics` syntax errors in its tool output, fix them immediately in the same turn before finishing.
+Use tools (`read`, `glob`, `grep`, `symbols`, `git`, `diagnostics`, `write`, `edit`, `multi_edit`, `apply_patch`, `webfetch`, `bash`, `todowrite`) proactively when working with files, URLs, or tasks.
+If `write`, `edit`, `multi_edit`, or `apply_patch` reports `Diagnostics` syntax errors in its tool output, fix them immediately in the same turn before finishing.
 """
 
 
@@ -371,6 +371,7 @@ class AgentEngine:
             rec.output = res.output
             rec.diff = res.diff
             rec.duration_ms = res.duration_ms
+            rec.pid = res.pid
             await on_tool_end(rec)
             return res
 
@@ -439,7 +440,7 @@ class AgentEngine:
         on_stream_chunk: StreamHook | None = None,
     ) -> str:
         mode_note = (
-            "PLAN MODE ACTIVE: Do NOT modify files (`write`/`edit`/`multi_edit` disabled). Read code, analyze, and create a plan + `todowrite`."
+            "PLAN MODE ACTIVE: Do NOT modify files (`write`/`edit`/`multi_edit`/`apply_patch` disabled). Read code, analyze, and create a plan + `todowrite`."
             if agent_mode == "plan"
             else "BUILD MODE ACTIVE: Full access to read, search, edit/write files, fetch URLs, run commands, and manage todos."
         )
@@ -809,7 +810,7 @@ class AgentEngine:
         api_key: str,
     ) -> str:
         headers = self._build_headers(api_key)
-        writable = {"write", "edit", "multi_edit", "bash", "todowrite", "subagent"}
+        writable = {"write", "edit", "multi_edit", "apply_patch", "bash", "todowrite", "subagent"}
         tools = [t for t in OPENAI_TOOLS_SCHEMA if t["function"]["name"] not in writable]
         messages: list[dict[str, Any]] = [
             {
@@ -937,7 +938,7 @@ class AgentEngine:
         touched: list[str] = []
         for m in messages:
             for tc in m.tool_calls:
-                if tc.name in ("write", "edit", "multi_edit"):
+                if tc.name in ("write", "edit", "multi_edit", "apply_patch"):
                     path = tc.arguments.get("filePath") or tc.arguments.get("path")
                     if path and path not in touched:
                         touched.append(str(path))

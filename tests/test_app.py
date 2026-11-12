@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 import pytest
-from textual.widgets import Label, OptionList
+from textual.widgets import Label, OptionList, Static
 
 from rbit.agent import HTTP_LIMITS, AgentEngine, MAX_PARALLEL_TOOLS, is_reasoning_model
 from rbit.app import RbitApp
@@ -24,8 +24,9 @@ from rbit.modals import (
     EffortSelectorModal,
     HelpModal,
     ModelSelectorModal,
+    SearchResultsModal,
 )
-from rbit.models import ChatMessage, ModelInfo, Session, ToolCallRecord, short_id
+from rbit.models import ChatMessage, ModelInfo, Session, ToolCallRecord, search_session, short_id
 from rbit.tools import ToolExecutor, ToolResult, is_secret_file, redact_secrets
 from rbit.widgets import (
     AgentModeBadge,
@@ -1789,3 +1790,214 @@ async def test_effort_selector_and_command(tmp_path: Path) -> None:
         await pilot.pause()
         assert app.config_data["effort"] == "low"
 
+
+@pytest.mark.asyncio
+async def test_apply_patch_multihunk_create_and_validation(tmp_path: Path) -> None:
+    (tmp_path / "calc.py").write_text("a = 1\nb = 2\nc = 3\nd = 4\n", encoding="utf-8")
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+
+    patch = """--- a/calc.py
++++ b/calc.py
+@@ -1,2 +1,2 @@
+ a = 1
+-b = 2
++b = 20
+@@ -3,2 +3,2 @@
+ c = 3
+-d = 4
++d = 40
+"""
+    res = await executor.execute("apply_patch", {"patch": patch})
+    assert res.ok is True
+    assert "2 hunks" in res.summary
+    assert (tmp_path / "calc.py").read_text(encoding="utf-8") == "a = 1\nb = 20\nc = 3\nd = 40\n"
+    assert "calc.py" in executor.session.modified_files
+
+    created = """--- /dev/null
++++ b/new_mod.py
+@@ -0,0 +1,2 @@
++def hi():
++    return 1
+"""
+    made = await executor.execute("apply_patch", {"patch": created})
+    assert made.ok is True
+    assert (tmp_path / "new_mod.py").read_text(encoding="utf-8").startswith("def hi():")
+
+    broken = """--- a/calc.py
++++ b/calc.py
+@@ -1,2 +1,2 @@
+ a = 1
+-missing line
++nope
+"""
+    bad = await executor.execute("apply_patch", {"patch": broken})
+    assert bad.ok is False
+    assert "context mismatch" in bad.summary
+
+    # Undo restores the pre-patch content (snapshot stack, newest first)
+    executor.undo_last()
+    assert not (tmp_path / "new_mod.py").exists()
+    executor.undo_last()
+    assert (tmp_path / "calc.py").read_text(encoding="utf-8") == "a = 1\nb = 2\nc = 3\nd = 4\n"
+
+    blocked = await executor.execute("apply_patch", {"patch": patch}, agent_mode="plan")
+    assert blocked.ok is False
+    assert "Plan mode" in blocked.output
+
+
+def _flatten_render(widget: Any) -> str:
+    from rich.console import Group
+    from rich.text import Text
+
+    def parts(node: Any) -> str:
+        if isinstance(node, Group):
+            return "\n".join(parts(child) for child in node.renderables)
+        if isinstance(node, Text):
+            return node.plain
+        return getattr(node, "plain", str(node))
+
+    return parts(widget.render())
+
+
+@pytest.mark.asyncio
+async def test_background_pid_stop_controls(tmp_path: Path) -> None:
+    from rbit.widgets import ToolCallCard
+
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    bg = await executor.execute(
+        "bash",
+        {"command": 'python -c "import time; time.sleep(30)"', "background": True},
+    )
+    assert bg.ok is True
+    assert bg.pid > 0
+    assert bg.pid in executor.background_pids()
+
+    card = ToolCallCard(
+        ToolCallRecord(id="bg1", name="bash", arguments={"command": "sleep"}, pid=bg.pid, status="success")
+    )
+    assert card.stop_state == "running"
+    header = _flatten_render(card)
+    assert "stop (pid" in header
+    card.mark_stopped()
+    assert card.stop_state == "stopped"
+    assert "stopped (pid" in _flatten_render(card)
+
+    assert await executor.terminate_background_pid(bg.pid) is True
+    assert executor.background_pids() == []
+    assert await executor.terminate_background_pid(bg.pid) is False
+
+
+@pytest.mark.asyncio
+async def test_session_search_messages_and_tool_output(tmp_path: Path) -> None:
+    session = Session()
+    session.messages.append(
+        ChatMessage(id="m1", role="user", content="Please fix the LoginWidget bug")
+    )
+    session.messages.append(
+        ChatMessage(
+            id="m2",
+            role="assistant",
+            content="Done.",
+            tool_calls=[
+                ToolCallRecord(
+                    id="t1",
+                    name="grep",
+                    arguments={"pattern": "login"},
+                    summary="2 matches",
+                    output="src/auth.py:42: loginwidget",
+                ),
+                ToolCallRecord(
+                    id="t2",
+                    name="read",
+                    arguments={"filePath": "unrelated.py"},
+                    summary="1 lines",
+                    output="nothing interesting",
+                ),
+            ],
+        )
+    )
+    hits = search_session(session, "login")
+    assert len(hits) == 2
+    assert hits[0][0] == "m1"
+    assert hits[1][1] == "Tool grep"
+    assert search_session(session, "") == []
+    assert search_session(session, "zzz-none") == []
+
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        app.session = session
+        app.executor.session = session
+        await app.push_screen(SearchResultsModal(session, "login"))
+        await pilot.pause()
+        olist = app.screen.query_one("#search-session-list", OptionList)
+        assert olist.option_count == 2
+        foot = str(app.screen.query_one("#search-session-foot", Label).render())
+        assert "2 matches" in foot
+        await pilot.press("escape")
+        await pilot.pause()
+
+        inp = app.query_one("#prompt-input")
+        inp.focus()
+        inp.value = "/search login"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, SearchResultsModal)
+        await pilot.press("escape")
+        await pilot.pause()
+
+
+def test_cli_update_check_and_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from rbit import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_fetch_latest_pypi_version", lambda *a, **k: "99.0.0")
+    assert cli_main(["update", "--check"]) == 0
+    out = capsys.readouterr().out
+    assert "99.0.0" in out
+
+    assert cli_main(["update", "--check", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["up_to_date"] is False
+    assert payload["latest"] == "99.0.0"
+
+    monkeypatch.setattr(cli_mod, "_fetch_latest_pypi_version", lambda *a, **k: "1.0.0")
+    assert cli_main(["update", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "up-to-date"
+
+    monkeypatch.setattr(cli_mod, "_fetch_latest_pypi_version", lambda *a, **k: None)
+    assert cli_main(["update"]) == 1
+    assert "PyPI" in capsys.readouterr().out
+
+    installed: list[list[str]] = []
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> FakeProc:
+        installed.append(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(cli_mod, "_fetch_latest_pypi_version", lambda *a, **k: "99.1.0")
+    monkeypatch.setattr(cli_mod.subprocess, "run", fake_run)
+    assert cli_main(["update"]) == 0
+    assert installed and "rbit" in installed[0] and "--upgrade" in installed[0]
+    assert "99.1.0" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_agent_todowrite_syncs_sidebar_without_modal(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(130, 40)) as pilot:
+        await pilot.pause()
+        res = await app.executor.execute(
+            "todowrite",
+            {"todos": [{"content": "ship batch 9", "status": "in_progress", "priority": "high"}]},
+        )
+        assert res.ok is True
+        await pilot.pause()
+        assert app.session.todos and app.session.todos[0].content == "ship batch 9"
+        assert app.query_one(SidebarPanel).display is True
+        todo_text = str(app.query_one("#sb-todo", Static).render())
+        assert "ship batch 9" in todo_text

@@ -40,6 +40,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/fork", "Branch the session into a new one at message N"),
     ("/commit", "Draft a Git commit message from the current diff"),
     ("/copy", "Copy the last assistant answer to the clipboard"),
+    ("/search", "Search session messages and tool output"),
     ("/diff", "Show modified files summary"),
     ("/init", "Analyze workspace and build initial Todo plan"),
     ("/connect", "Connect API provider (OpenRouter / OpenAI / Ollama)"),
@@ -319,19 +320,37 @@ class ToolCallCard(Static):
 
     expanded: reactive[bool] = reactive(False)
 
+    class StopRequested(Message):
+        """Posted when the user asks to stop a background bash process from its card."""
+
+        def __init__(self, pid: int) -> None:
+            super().__init__()
+            self.pid = pid
+
     def __init__(self, record: ToolCallRecord) -> None:
         super().__init__(classes="tool-card")
         self.record = record
+        self.stop_state = "running" if record.pid else ""
         if record.diff or record.name in ("todowrite", "bash"):
             self.expanded = True
 
     def update_record(self, record: ToolCallRecord) -> None:
         self.record = record
+        if record.pid and not self.stop_state:
+            self.stop_state = "running"
         if record.diff or record.name in ("todowrite", "bash"):
             self.expanded = True
         self.refresh(layout=True)
 
+    def mark_stopped(self) -> None:
+        if self.record.pid:
+            self.stop_state = "stopped"
+            self.refresh(layout=True)
+
     def on_click(self, _event: events.Click) -> None:
+        if self.record.pid and self.stop_state == "running":
+            self.post_message(self.StopRequested(self.record.pid))
+            return
         self.expanded = not self.expanded
 
     def render(self) -> Group:
@@ -377,9 +396,9 @@ class ToolCallCard(Static):
             return Group(line, Text(preview, style="#686868"))
 
         # 2. Write / Edit / MultiEdit with inline diff block
-        if name in ("write", "edit", "multi_edit"):
+        if name in ("write", "edit", "multi_edit", "apply_patch"):
             fpath = args.get("filePath", "")
-            verb = {"write": "Write", "edit": "Edit", "multi_edit": "MultiEdit"}[name]
+            verb = {"write": "Write", "edit": "Edit", "multi_edit": "MultiEdit", "apply_patch": "Patch"}[name]
             header = Text()
             header.append("← " if not is_err else "✗ ", style="#808080" if not is_err else err_color)
             header.append(f"{verb} {fpath} ", style="#eeeeee" if not is_err else err_color)
@@ -424,6 +443,11 @@ class ToolCallCard(Static):
             header.append(cmd, style="#eeeeee" if not is_err else err_color)
             if rec.duration_ms:
                 header.append(f"  ({rec.duration_ms}ms)", style="#585858")
+            if rec.pid:
+                if self.stop_state == "stopped":
+                    header.append(f"  ⏹ stopped (pid {rec.pid})", style="#808080")
+                else:
+                    header.append(f"  ⏹ stop (pid {rec.pid})", style="bold #e06c75")
             if not self.expanded or not rec.output:
                 return Group(header)
             preview = "\n".join(rec.output.splitlines()[:24])
@@ -435,7 +459,7 @@ class ToolCallCard(Static):
     def _format_label(self, name: str, args: dict) -> str:
         if name == "read":
             return f"Reading {args.get('filePath', '')}"
-        if name in ("write", "edit", "multi_edit"):
+        if name in ("write", "edit", "multi_edit", "apply_patch"):
             return f"Writing {args.get('filePath', '')}"
         if name == "glob":
             return f"Searching files {args.get('pattern', '*')}"

@@ -23,6 +23,13 @@ All notable changes to rbit are documented here. The format follows
   background at startup, on `/connect`, and whenever the model picker opens.
 - Reasoning effort selection (`/effort`, `--effort`, picker modal) for o-series,
   DeepSeek R, QwQ, and other thinking models via `reasoning_effort`.
+- `apply_patch` tool: applies multi-hunk unified diffs with context validation and can
+  create files.
+- Background `bash` processes can be stopped from their card, with `Ctrl+X` as a
+  stop-all shortcut.
+- Session search via `Ctrl+F` / `/search` across messages and tool output.
+- `rbit update [--check] [--json]` checks PyPI and upgrades the installed package.
+- Agent `todowrite` updates now refresh the sidebar and todo manager immediately.
 
 ### Changed
 
