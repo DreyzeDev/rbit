@@ -326,7 +326,7 @@ class AgentEngine:
         """
         self.add_provider_models(self.load_cached_provider_models(cfg))
         api_base = str(cfg.get("api_base") or "").strip()
-        api_key = str(cfg.get("api_key") or "").strip()
+        api_key = self.storage.resolve_api_key(cfg).strip()
         if api_base and api_key:
             await self.sync_provider_models(api_base, api_key, force=force, timeout=6.0)
         ollama = await discover_ollama_models()
@@ -461,7 +461,7 @@ class AgentEngine:
                 model_id = routed
         self.executor.begin_turn()
         model_info = get_model_info(model_id, self.extra_models)
-        api_key = (cfg.get("api_key") or "").strip()
+        api_key = self.storage.resolve_api_key(cfg).strip()
         api_base = (cfg.get("api_base") or "https://openrouter.ai/api/v1").rstrip("/")
         if api_base.endswith("/chat/completions"):
             api_base = api_base[: -len("/chat/completions")]
@@ -1519,7 +1519,7 @@ class AgentEngine:
     async def summarize_session(self, messages: list[ChatMessage], model_id: str) -> str:
         """Summarizes older messages via the active LLM, with a deterministic fallback."""
         cfg = self.get_config()
-        api_key = (cfg.get("api_key") or "").strip()
+        api_key = self.storage.resolve_api_key(cfg).strip()
         api_base = (cfg.get("api_base") or "https://openrouter.ai/api/v1").rstrip("/")
         if api_base.endswith("/chat/completions"):
             api_base = api_base[: -len("/chat/completions")]
@@ -1602,7 +1602,7 @@ class AgentEngine:
     async def draft_commit_message(self, stat: str, diff: str, model_id: str) -> str:
         """Drafts a Conventional Commits message from git diff, with a deterministic fallback."""
         cfg = self.get_config()
-        api_key = (cfg.get("api_key") or "").strip()
+        api_key = self.storage.resolve_api_key(cfg).strip()
         api_base = (cfg.get("api_base") or "https://openrouter.ai/api/v1").rstrip("/")
         if api_base.endswith("/chat/completions"):
             api_base = api_base[: -len("/chat/completions")]

@@ -76,7 +76,6 @@ MUTATING_TOOLS: frozenset[str] = frozenset({"write", "edit", "multi_edit", "appl
 
 _STATEMENT_SPLIT = re.compile(r"(?:;|\|\||&&|\||\r?\n)")
 
-
 def is_readonly_bash_command(command: str) -> bool:
     """A command is read-only only if EVERY statement starts with a whitelisted
     prefix and there are no output redirects. `echo x; rm y` and `ls > f` are
@@ -1497,7 +1496,7 @@ class ToolExecutor:
                 return ToolResult(True, f"cell #{index} replaced", f"Cell #{index} of {rel} updated.")
             if index < 0 or index > len(cells):
                 index = len(cells)
-            new_cell = {
+            new_cell: dict[str, Any] = {
                 "cell_type": str(args.get("cellType") or "code"),
                 "metadata": {},
                 "source": source.splitlines(keepends=True),
@@ -1573,6 +1572,23 @@ class ToolExecutor:
             cleaned,
         )
 
+    def _sandbox_violation(self, command: str) -> str | None:
+        """Best-effort path sandbox: block workspace escapes in bash commands.
+
+        Best effort by design - it is not an OS-level sandbox; it stops the
+        common absolute-path and ``..`` escapes."""
+        if self.get_config is None or not self.get_config().get("bash_sandbox", False):
+            return None
+        for match in re.finditer(r"[A-Za-z]:[/\\][^\s\"'|;&]*", command):
+            try:
+                candidate = Path(match.group(0)).resolve()
+                candidate.relative_to(self.workspace)
+            except (ValueError, OSError):
+                return match.group(0)
+        if re.search(r"(?:^|[\s;|&=])\.\.[/\\]", command):
+            return ".."
+        return None
+
     async def _tool_bash(self, args: dict[str, Any], agent_mode: str = "build") -> ToolResult:
         command = str(args.get("command", "")).strip()
         if not command:
@@ -1585,6 +1601,15 @@ class ToolExecutor:
                 f"blocked: dangerous command ({danger[:32]})",
                 "This command matches a destructive deny-pattern (rm -rf /, mkfs, disk formatting, "
                 "force-push, fork bomb, ...). Refusing to execute it even in build mode.",
+            )
+
+        sandbox_violation = self._sandbox_violation(command)
+        if sandbox_violation:
+            return ToolResult(
+                False,
+                f"blocked by sandbox: {sandbox_violation[:40]}",
+                "Sandbox mode (config `bash_sandbox`) restricts commands to the workspace: "
+                "absolute paths outside it and `..` escapes are not allowed.",
             )
 
         is_readonly = is_readonly_bash_command(command)

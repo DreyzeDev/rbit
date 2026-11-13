@@ -26,3 +26,16 @@ rbit = "rbit.cli:main"
 [tool.pytest.ini_options]
 asyncio_default_fixture_loop_scope = "function"
 
+
+[tool.mypy]
+python_version = "3.11"
+files = ["rbit/models.py", "rbit/storage.py"]
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+exclude = ["build", "dist", ".venv"]
+
+[[tool.mypy.overrides]]
+module = ["tiktoken", "keyring", "keyring.*"]
+ignore_missing_imports = true

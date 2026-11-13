@@ -3407,3 +3407,39 @@ async def test_provider_models_parse_pricing_and_context(tmp_path: Path) -> None
     assert by_id["m/cheap"].cost_per_1k == 0.0015
     assert by_id["m/cheap"].context_window == 128000
     assert by_id["m/free"].cost_per_1k == 0.0
+
+
+@pytest.mark.asyncio
+async def test_bash_sandbox_blocks_workspace_escapes(tmp_path: Path) -> None:
+    executor = ToolExecutor(
+        workspace=tmp_path, session=Session(), get_config=lambda: {"bash_sandbox": True}
+    )
+    blocked = await executor.execute("bash", {"command": "type C:/Windows/notepad.exe"})
+    assert blocked.ok is False
+    assert "sandbox" in blocked.summary
+
+    ok = await executor.execute("bash", {"command": "Get-ChildItem"})
+    assert ok.ok is True
+
+    off = ToolExecutor(workspace=tmp_path, session=Session())
+    pass_through = await off.execute("bash", {"command": "Get-ChildItem"})
+    assert pass_through.ok is True
+
+
+def test_resolve_api_key_keyring_placeholder(tmp_path: Path) -> None:
+    from rbit.storage import StorageManager
+
+    storage = StorageManager(workspace=tmp_path)
+    assert storage.resolve_api_key({"api_key": "sk-test"}) == "sk-test"
+    # No keyring backend in CI: the placeholder degrades to an empty key.
+    assert storage.resolve_api_key({"api_key": "keyring"}) == ""
+
+
+def test_telemetry_disabled_is_noop() -> None:
+    from rbit.telemetry import track_event
+
+    track_event({}, "turn")  # disabled: must not raise or send
+    track_event(
+        {"telemetry": {"enabled": True, "endpoint": "http://127.0.0.1:9/nope"}},
+        "turn",
+    )  # unreachable endpoint swallowed

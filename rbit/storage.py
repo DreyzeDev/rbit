@@ -27,6 +27,39 @@ class StorageManager:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
+    def store_secret(self, name: str, value: str) -> bool:
+        """Stores a secret in the OS keyring when the `keyring` package exists."""
+        try:
+            import keyring
+
+            keyring.set_password("rbit", name, value)
+            return True
+        except Exception:
+            return False
+
+    def load_secret(self, name: str) -> str | None:
+        try:
+            import keyring
+
+            return keyring.get_password("rbit", name)
+        except Exception:
+            return None
+
+    def delete_secret(self, name: str) -> None:
+        try:
+            import keyring
+
+            keyring.delete_password("rbit", name)
+        except Exception:
+            pass
+
+    def resolve_api_key(self, cfg: dict[str, Any]) -> str:
+        """Returns the API key, resolving the `keyring` placeholder from the OS keyring."""
+        raw = str(cfg.get("api_key") or "").strip()
+        if raw == "keyring":
+            return (self.load_secret("api_key") or "").strip()
+        return raw
+
     def load_config(self) -> dict[str, Any]:
         raw_base = (
             os.environ.get("RBIT_API_BASE")
@@ -209,7 +242,7 @@ class StorageManager:
         self.prune_checkpoints(self.MAX_CHECKPOINTS)
         return CheckpointMeta(
             id=cid,
-            label=payload["label"],
+            label=str(payload["label"]),
             created_at=created,
             file_count=len(files_map),
         )
