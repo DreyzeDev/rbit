@@ -2542,6 +2542,25 @@ async def test_thinking_indicator_appears_and_clears(tmp_path: Path) -> None:
         assert len(list(app.query(ThinkingIndicator))) == 0
 
 
+def test_thinking_indicator_click_reveals_reasoning() -> None:
+    from rbit.widgets import ThinkingIndicator
+
+    ind = ThinkingIndicator()
+    assert "Thinking..." in ind.render().plain
+    ind.set_reasoning("secret chain of thought")
+    assert ind.has_reasoning is True
+    ind.toggle()
+    assert "secret chain of thought" in ind.render().plain
+    ind.finish()
+    collapsed = ind.render().plain
+    assert "Thought for" in collapsed
+    assert "secret chain of thought" not in collapsed
+    ind.toggle()
+    assert "secret chain of thought" in ind.render().plain
+    ind.set_reasoning("x" * 2000)
+    assert len(ind.render().plain) < 1800
+
+
 @pytest.mark.asyncio
 async def test_stream_updates_before_card_is_mounted_are_safe(tmp_path: Path) -> None:
     app = RbitApp(workspace=tmp_path)
@@ -2590,9 +2609,62 @@ async def test_reasoning_only_reply_is_used_as_content(tmp_path: Path) -> None:
         on_status=on_status,
         on_stream_chunk=None,
     )
-    await engine.http_client.aclose()
+    await     engine.http_client.aclose()
     engine.http_client = None
     assert text == "internal chain of thought"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_stream_reaches_hook(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "test"}
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        body = "\n".join(
+            [
+                'data: {"choices":[{"delta":{"reasoning":"Alpha"}}]}',
+                'data: {"choices":[{"delta":{"reasoning":"Beta"}}]}',
+                'data: {"choices":[{"delta":{"content":"Answer"}}]}',
+                "data: [DONE]",
+                "",
+            ]
+        )
+        return httpx.Response(
+            200, text=body, headers={"content-type": "text/event-stream"}
+        )
+
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    pieces: list[str] = []
+
+    async def invoke_tool(name: str, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(True, "ok", "ok")
+
+    async def on_status(_s: str) -> None:
+        pass
+
+    async def on_reasoning_chunk(piece: str) -> None:
+        pieces.append(piece)
+
+    async def on_stream_chunk(_partial_md: str) -> None:
+        pass
+
+    text = await engine._run_openai_compatible(
+        session=Session(),
+        user_msg=ChatMessage(id="u1", role="user", content="hi"),
+        agent_mode="build",
+        model_id="openai/gpt-4o-mini",
+        api_base="https://mock.local/v1",
+        api_key="test",
+        invoke_tool=invoke_tool,
+        on_status=on_status,
+        on_stream_chunk=on_stream_chunk,
+        on_reasoning_chunk=on_reasoning_chunk,
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert text == "Answer"
+    assert pieces == ["Alpha", "Beta"]
 
 
 @pytest.mark.asyncio

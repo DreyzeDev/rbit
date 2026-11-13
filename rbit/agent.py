@@ -324,6 +324,7 @@ class AgentEngine:
         on_status: StatusHook,
         on_stream_chunk: StreamHook | None = None,
         on_thinking: ThinkingHook | None = None,
+        on_reasoning_chunk: StreamHook | None = None,
     ) -> ChatMessage:
         t0 = time.perf_counter()
         cfg = self.get_config()
@@ -393,6 +394,7 @@ class AgentEngine:
                 on_status=on_status,
                 on_stream_chunk=on_stream_chunk,
                 on_thinking=on_thinking,
+                on_reasoning_chunk=on_reasoning_chunk,
             )
         else:
             if not model_info.is_local_smart and not api_key:
@@ -446,6 +448,7 @@ class AgentEngine:
         on_status: StatusHook,
         on_stream_chunk: StreamHook | None = None,
         on_thinking: ThinkingHook | None = None,
+        on_reasoning_chunk: StreamHook | None = None,
     ) -> str:
         mode_note = (
             "PLAN MODE ACTIVE: Do NOT modify files (`write`/`edit`/`multi_edit`/`apply_patch` disabled). Read code, analyze, and create a plan + `todowrite`."
@@ -554,6 +557,7 @@ class AgentEngine:
                             messages=api_messages,
                             on_stream_chunk=on_stream_chunk,
                             on_status=on_status,
+                            on_reasoning_chunk=on_reasoning_chunk,
                         )
                         if not ok:
                             return content
@@ -565,6 +569,7 @@ class AgentEngine:
                             model_id=model_id,
                             messages=api_messages,
                             on_status=on_status,
+                            on_reasoning_chunk=on_reasoning_chunk,
                         )
                         if not ok:
                             return content
@@ -676,6 +681,7 @@ class AgentEngine:
         messages: list[dict[str, Any]],
         on_stream_chunk: StreamHook,
         on_status: StatusHook | None = None,
+        on_reasoning_chunk: StreamHook | None = None,
     ) -> tuple[bool, str, list[dict[str, Any]]]:
         payload: dict[str, Any] = {
             "model": model_id,
@@ -728,6 +734,11 @@ class AgentEngine:
                         reasoning_piece = delta.get("reasoning_content") or delta.get("reasoning")
                         if isinstance(reasoning_piece, str) and reasoning_piece:
                             reasoning_text.append(reasoning_piece)
+                            if on_reasoning_chunk is not None:
+                                try:
+                                    await on_reasoning_chunk(reasoning_piece)
+                                except Exception:
+                                    logger.debug("reasoning hook failed", exc_info=True)
                         txt_piece = delta.get("content")
                         if txt_piece:
                             full_text.append(txt_piece)
@@ -790,6 +801,7 @@ class AgentEngine:
         model_id: str,
         messages: list[dict[str, Any]],
         on_status: StatusHook | None = None,
+        on_reasoning_chunk: StreamHook | None = None,
     ) -> tuple[bool, str, list[dict[str, Any]]]:
         payload: dict[str, Any] = {
             "model": model_id,
@@ -837,10 +849,14 @@ class AgentEngine:
             choice = data["choices"][0]["message"]
             content = choice.get("content") or ""
             tool_calls = choice.get("tool_calls") or []
-            if not content and not tool_calls:
-                reasoning = choice.get("reasoning")
-                if isinstance(reasoning, str):
-                    content = reasoning
+            reasoning = choice.get("reasoning")
+            if isinstance(reasoning, str) and reasoning and on_reasoning_chunk is not None:
+                try:
+                    await on_reasoning_chunk(reasoning)
+                except Exception:
+                    logger.debug("reasoning hook failed", exc_info=True)
+            if not content and not tool_calls and isinstance(reasoning, str):
+                content = reasoning
             return True, content, tool_calls
         return False, f"Не удалось получить ответ от `{url}` после повторных попыток.", []
 

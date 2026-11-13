@@ -14,7 +14,9 @@ All notable changes to rbit are documented here. The format follows
 - Config profiles with `--profile <name>` overlays from `config.json`.
 - `F1` help screen, Ollama sidebar status, high-contrast theme, compact mode.
 - Inline `Thinking...` spinner in the chat feed, shown only while a model
-  request is in flight.
+  request is in flight. Click it (or the collapsed `Thought for Ns` line) to
+  reveal the model's reasoning in gray; reasoning deltas are streamed from the
+  provider via `on_reasoning_chunk`.
 - `bash` timeout argument and background execution.
 - Readable Markdown `webfetch` output with a 10-minute cache.
 - ripgrep-backed `grep` when `rg` is available.

@@ -198,7 +198,7 @@ Screen {
 }
 
 .thinking-line {
-    height: 1;
+    height: auto;
     padding: 0 0 0 2;
     margin: 0 0 1 0;
 }
@@ -497,6 +497,7 @@ class RbitApp(App[None]):
         self._save_timer: Timer | None = None
         self._live_card: AssistantMessageCard | None = None
         self._thinking: ThinkingIndicator | None = None
+        self._reasoning_acc: str = ""
         self._interrupted_turn: bool = False
         self._history_window: int = 30
         self._last_error: str = ""
@@ -1125,9 +1126,26 @@ class RbitApp(App[None]):
     def _show_thinking(self) -> None:
         if self._thinking is not None:
             return
+        self._reasoning_acc = ""
         self._thinking = ThinkingIndicator()
         self.query_one("#chat-scroll", ChatScroll).mount(self._thinking)
         self._smart_scroll_end()
+
+    def _settle_thinking(self) -> None:
+        """Stops the spinner; keeps a collapsed 'Thought for Ns' line if reasoning arrived."""
+        widget = self._thinking
+        self._thinking = None
+        self._reasoning_acc = ""
+        if widget is None:
+            return
+        if widget.has_reasoning:
+            widget.finish()
+            self._smart_scroll_end()
+            return
+        try:
+            widget.remove()
+        except Exception:
+            pass
 
     def _hide_thinking(self) -> None:
         widget = self._thinking
@@ -1632,7 +1650,7 @@ class RbitApp(App[None]):
         self._schedule_save_session(delay=0.05)
 
         async def on_tool_start(rec: ToolCallRecord) -> None:
-            self._hide_thinking()
+            self._settle_thinking()
             card = ToolCallCard(rec)
             self._tool_widgets[rec.id] = card
             if self._thinking is not None:
@@ -1656,11 +1674,18 @@ class RbitApp(App[None]):
             if active:
                 self._show_thinking()
             else:
-                self._hide_thinking()
+                self._settle_thinking()
+
+        async def on_reasoning_chunk(piece: str) -> None:
+            ind = self._thinking
+            if ind is None:
+                return
+            self._reasoning_acc += piece
+            ind.set_reasoning(self._reasoning_acc)
 
         async def on_stream_chunk(partial_md: str) -> None:
             if self._live_card is None:
-                self._hide_thinking()
+                self._settle_thinking()
                 draft = ChatMessage(
                     id=short_id(),
                     role="assistant",
@@ -1691,6 +1716,7 @@ class RbitApp(App[None]):
                 on_status=on_status,
                 on_stream_chunk=on_stream_chunk,
                 on_thinking=on_thinking,
+                on_reasoning_chunk=on_reasoning_chunk,
             )
             if self._interrupted_turn:
                 self._live_card = None
@@ -1714,7 +1740,7 @@ class RbitApp(App[None]):
                 hint = " Check the provider with `/connect`."
             self._post_notice(f"✗ Error: {exc}\n\nPress `Ctrl+R` to retry the last prompt.{hint}")
         finally:
-            self._hide_thinking()
+            self._settle_thinking()
             self.session.finished = True
             self._schedule_save_session(delay=0.05)
             self.is_busy = False

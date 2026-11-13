@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from rich.console import Group
@@ -224,22 +225,78 @@ class PromptSubHints(Static):
 
 
 class ThinkingIndicator(Static):
-    """Inline chat line shown while the agent is reasoning or running a tool."""
+    """Inline chat line: spins while the model thinks; click to reveal gray reasoning."""
+
+    MAX_REASONING_CHARS = 1600
 
     def __init__(self) -> None:
         super().__init__(classes="thinking-line")
         self._frame = 0
+        self._reasoning = ""
+        self._expanded = False
+        self._active = True
+        self._elapsed = 0.0
+        self._started = time.monotonic()
+
+    def set_reasoning(self, text: str) -> None:
+        self._reasoning = text
+        if self._expanded:
+            self.refresh()
+
+    @property
+    def has_reasoning(self) -> bool:
+        return bool(self._reasoning.strip())
 
     def tick(self, frame: int) -> None:
         self._frame = frame
+        if self._active:
+            self._elapsed = time.monotonic() - self._started
+            self.refresh()
+
+    def finish(self) -> None:
+        self._active = False
+        self._elapsed = time.monotonic() - self._started
+        self._expanded = False
         self.refresh()
 
+    def toggle(self) -> None:
+        if not self.has_reasoning:
+            return
+        self._expanded = not self._expanded
+        self.refresh()
+
+    def on_click(self, _event: events.Click) -> None:
+        self.toggle()
+
+    def _header(self) -> Text:
+        head = Text()
+        if self._active:
+            spin = SPINNER_FRAMES[self._frame % len(SPINNER_FRAMES)]
+            head.append(f"{spin} Thinking...", style="bold #f5a742")
+            if self.has_reasoning:
+                head.append("  click to show reasoning", style="#808080")
+            return head
+        head.append("▾ " if self._expanded else "▸ ", style="bold #808080")
+        head.append(f"Thought for {self._elapsed:.0f}s", style="#808080")
+        if self.has_reasoning:
+            head.append(
+                "  click to hide" if self._expanded else "  click to show reasoning",
+                style="#606060",
+            )
+        return head
+
     def render(self) -> Text:
-        spin = SPINNER_FRAMES[self._frame % len(SPINNER_FRAMES)]
-        t = Text()
-        t.append(f"{spin} ", style="bold #f5a742")
-        t.append("Thinking...", style="bold #f5a742")
-        return t
+        head = self._header()
+        if not self._expanded or not self.has_reasoning:
+            return head
+        body = self._reasoning.strip()
+        if len(body) > self.MAX_REASONING_CHARS:
+            body = "…" + body[-self.MAX_REASONING_CHARS:]
+        text = Text()
+        text.append_text(head)
+        text.append("\n")
+        text.append(body, style="#8f8f8f")
+        return text
 
 
 class SessionHeaderBar(Static):
