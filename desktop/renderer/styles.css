@@ -43,7 +43,6 @@ code, pre { font-family: ui-monospace, Consolas, monospace; }
 }
 .tab .close { color: var(--dim); font-size: 11px; padding: 0 2px; }
 .tab .close:hover { color: var(--red); }
-#tab-drag { width: 120px; }
 
 #layout { flex: 1; display: flex; min-height: 0; }
 
@@ -122,7 +121,8 @@ button.ghost {
   background: transparent; color: var(--dim); border: 0; cursor: pointer;
   font-size: 13px; padding: 5px 9px; border-radius: 7px;
 }
-button.ghost:hover { background: #2a2a2a; color: var(--text); }
+span.ghost { color: var(--dim); font-size: 13px; }
+span.dot { color: #4a4a4a; }
 #send {
   background: #2a2a2a; color: #e8e8e8; border: 0; border-radius: 9px;
   width: 36px; height: 34px; cursor: pointer; font-size: 15px; line-height: 1;
