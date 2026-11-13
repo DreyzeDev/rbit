@@ -1530,6 +1530,48 @@ class AgentEngine:
         files_line = ", ".join(f"`{f}`" for f in touched[:20]) or "none"
         return f"**Goals**\n{goal_lines}\n\n**Files touched**\n{files_line}"
 
+    async def generate_title(self, first_user_text: str) -> str | None:
+        """One-shot cheap LLM call producing a 3-5 word session title (or None)."""
+        cfg = self.get_config()
+        api_key = self.storage.resolve_api_key(cfg).strip()
+        if not api_key:
+            return None
+        api_base = (cfg.get("api_base") or "https://openrouter.ai/api/v1").rstrip("/")
+        if api_base.endswith("/chat/completions"):
+            api_base = api_base[: -len("/chat/completions")]
+        model_id = str(cfg.get("model") or "openai/gpt-4.1-mini")
+        try:
+            own_client = self.http_client is None
+            client = self.http_client or httpx.AsyncClient(timeout=20.0, limits=HTTP_LIMITS)
+            try:
+                resp = await client.post(
+                    f"{api_base}/chat/completions",
+                    headers=self._build_headers(api_key),
+                    json={
+                        "model": model_id,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "Generate a 3-5 word session title in the user's language. Reply with the title only, no quotes, no period.",
+                            },
+                            {"role": "user", "content": first_user_text[:600]},
+                        ],
+                        "max_tokens": 24,
+                        "temperature": 0.3,
+                    },
+                )
+            finally:
+                if own_client:
+                    await client.aclose()
+            if resp.status_code != 200:
+                return None
+            text = str((resp.json()["choices"][0]["message"] or {}).get("content") or "").strip()
+            text = text.strip('"').strip("'").splitlines()[0][:48].strip()
+            return text or None
+        except Exception:
+            logger.debug("title generation failed", exc_info=True)
+            return None
+
     async def summarize_session(self, messages: list[ChatMessage], model_id: str) -> str:
         """Summarizes older messages via the active LLM, with a deterministic fallback."""
         cfg = self.get_config()

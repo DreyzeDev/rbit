@@ -1251,6 +1251,29 @@ class RbitApp(App[None]):
         scroll.mount(Static(text, classes="system-notice"))
         self._smart_scroll_end()
 
+    async def _auto_title(self, session: Session, first_user_text: str) -> None:
+        derived = " ".join(first_user_text.split())[:40] or "New Session"
+        title = await self.engine.generate_title(first_user_text) or derived
+        session.title = title
+        self.storage.save_session(session)
+        self._sync_ui()
+
+    def _maybe_auto_compact(self, model_id: str) -> None:
+        if not self.config_data.get("auto_compact", True) or self.is_busy:
+            return
+        if len(self.session.messages) < 8:
+            return
+        from rbit.models import get_model_info
+
+        info = get_model_info(model_id, self.engine.extra_models)
+        threshold = int(self.config_data.get("auto_compact_at", 85))
+        if not info.context_window:
+            return
+        pct = self.session.total_tokens / info.context_window * 100
+        if pct >= threshold:
+            self.notify(f"Контекст {pct:.0f}% — авто-компакция…", timeout=3.0)
+            self._busy_worker = self._compact_context()
+
     def _cmd_mcp(self, arg: str) -> None:
         """Manages configured MCP server entries in config (launching is a future step)."""
         servers = self.config_data.get("mcp_servers")
@@ -1345,6 +1368,73 @@ class RbitApp(App[None]):
         graph = self.executor.import_graph()
         lines = [f"`{k}` → {', '.join(sorted(v)) or '(no local imports)'}" for k, v in list(graph.items())[:30]]
         self._post_notice("# Import graph\n\n" + "\n".join(lines))
+
+    def _get_editor(self) -> list[str]:
+        """Editor command: $VISUAL/$EDITOR → config `editor` → platform default."""
+        import os as _os
+        import shlex
+
+        cfg_editor = str(self.config_data.get("editor") or "").strip()
+        for candidate in (_os.environ.get("VISUAL"), _os.environ.get("EDITOR"), cfg_editor):
+            if candidate and candidate.strip():
+                return shlex.split(candidate)
+        return ["notepad"] if _os.name == "nt" else ["vi"]
+
+    async def _cmd_edit(self, path: str) -> None:
+        """/edit — open the prompt buffer (or a file) in an external editor."""
+        editor = self._get_editor()
+        editing_prompt = not path.strip()
+        if editing_prompt:
+            tmp = self.workspace / ".rbit" / "prompt-edit.md"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            current = self.query_one("#prompt-input", Input).value
+            tmp.write_text(current, encoding="utf-8")
+            target = tmp
+        else:
+            try:
+                target = self.executor.resolve_path(path.strip())
+            except Exception:
+                self.notify(f"Cannot resolve path: {path}", severity="warning")
+                return
+            if not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("", encoding="utf-8")
+        try:
+            with self.suspend():
+                await asyncio.to_thread(
+                    subprocess.run, [*editor, str(target)], check=False
+                )
+        except Exception as exc:
+            self.notify(f"Editor failed: {exc}", severity="error")
+            return
+        if editing_prompt:
+            new_text = target.read_text(encoding="utf-8", errors="replace").strip()
+            inp = self.query_one("#prompt-input", Input)
+            inp.value = new_text
+            inp.cursor_position = len(new_text)
+            inp.focus()
+            if new_text:
+                self.notify("Промпт подставлен — Enter для отправки.", timeout=2.0)
+        else:
+            self.notify(f"Saved: {self.executor.rel_display(target)}", timeout=2.0)
+        self._sync_ui()
+
+    async def _cmd_fix(self, command: str) -> None:
+        """/fix <cmd> — run a command; when it fails, feed the output to the agent."""
+        command = command.strip()
+        if not command:
+            self.notify("Usage: /fix <command>", severity="warning")
+            return
+        self.notify(f"Running: {command[:60]}", timeout=2.0)
+        res = await self.executor.execute("bash", {"command": command, "timeout": 300})
+        tail = "\n".join(res.output.splitlines()[-30:]) or "(no output)"
+        if res.ok:
+            self._post_notice(f"✓ Command succeeded — nothing to fix\n\n{tail}")
+            return
+        self._post_notice(f"✗ Command failed — отправляю вывод агенту\n\n{tail}")
+        self._submit_prompt(
+            f"[fix] Команда `{command}` упала с выводом:\n\n{tail}\n\nНайди причину и исправь."
+        )
 
     async def _cmd_macro(self, name: str) -> None:
         import json as _json
@@ -1573,6 +1663,12 @@ class RbitApp(App[None]):
             return True
         if cmd == "/remember":
             self._cmd_remember(arg)
+            return True
+        if cmd == "/edit":
+            self._run_coro(self._cmd_edit(arg))
+            return True
+        if cmd == "/fix":
+            self._run_coro(self._cmd_fix(arg))
             return True
         if cmd == "/export":
             self._cmd_export(arg)
@@ -2172,3 +2268,14 @@ class RbitApp(App[None]):
                     self._os_notify("Ход завершён")
             if queued:
                 self.call_after_refresh(self._submit_prompt, queued)
+            elif self.config_data.get("auto_title", True) and len(session.messages) <= 2 and session.title in (
+                "New Session",
+                "Новая сессия",
+            ):
+                first_user = next((m.content for m in session.messages if m.role == "user"), "")
+                if first_user and not first_user.startswith(("/", "!")):
+                    self._run_coro(self._auto_title(session, first_user))
+                else:
+                    self._maybe_auto_compact(model_id)
+            else:
+                self._maybe_auto_compact(model_id)
