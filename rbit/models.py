@@ -91,6 +91,7 @@ class ChatMessage:
     interrupted: bool = False
     attachments: list[str] = field(default_factory=list)
     tool_calls: list[ToolCallRecord] = field(default_factory=list)
+    pinned: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

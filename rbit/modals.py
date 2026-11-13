@@ -118,6 +118,49 @@ HELP_MARKDOWN = """
 """
 
 
+class PromptHistoryModal(ModalScreen[str | None]):
+    """Searchable prompt history (ctrl+h). Enter picks a prompt into the input."""
+
+    BINDINGS = [Binding("escape", "cancel", "Close")]
+
+    def __init__(self, history: list[str]) -> None:
+        super().__init__()
+        self._all = list(dict.fromkeys(history))  # newest first, deduped
+        self._query = ""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="oc-modal"):
+            yield Static(_modal_header("Prompt history"), classes="oc-modal-header")
+            yield Input(placeholder="Filter history…", id="history-filter")
+            yield OptionList(id="history-list")
+            yield Label("enter pick · esc close", classes="oc-modal-foot")
+
+    def on_mount(self) -> None:
+        self.query_one("#history-filter", Input).focus()
+        self._refresh_list()
+
+    def _refresh_list(self) -> None:
+        ol = self.query_one("#history-list", OptionList)
+        ol.clear_options()
+        for item in self._all:
+            if self._query.lower() in item.lower():
+                ol.add_option(Option(item[:160], id=str(abs(hash(item)))))
+        if ol.option_count:
+            ol.highlighted = 0
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "history-filter":
+            self._query = event.value
+            self._refresh_list()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option is not None and event.option.prompt is not None:
+            self.dismiss(str(event.option.prompt))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class DiffViewerModal(ModalScreen[None]):
     """Unified diff for one modified file (opened from the sidebar)."""
 

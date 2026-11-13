@@ -60,6 +60,44 @@ class StorageManager:
             return (self.load_secret("api_key") or "").strip()
         return raw
 
+    def acquire_lock(self) -> tuple[bool, int | None]:
+        """Marks a running instance via .rbit/lock; returns (acquired, other_pid)."""
+        import hashlib
+        import tempfile
+
+        key = hashlib.sha256(str(self.workspace).lower().encode("utf-8", errors="replace")).hexdigest()[:16]
+        lock = Path(tempfile.gettempdir()) / f"rbit-lock-{key}.lock"
+        self.ensure_dirs()
+        pid = os.getpid()
+        if lock.exists():
+            try:
+                other = int(lock.read_text(encoding="utf-8").strip() or 0)
+                if other and other != pid and Path(f"/proc/{other}").exists() is False and os.name != "nt":
+                    return False, other
+                if other and other != pid and os.name == "nt":
+                    # Windows: check the process exists via tasklist-free heuristic
+                    import ctypes
+
+                    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+                    handle = kernel32.OpenProcess(0x100000, False, other)  # PROCESS_QUERY_LIMITED_INFORMATION
+                    if handle:
+                        kernel32.CloseHandle(handle)
+                        return False, other
+            except (ValueError, OSError):
+                pass
+        lock.write_text(str(pid), encoding="utf-8")
+        return True, None
+
+    def release_lock(self) -> None:
+        try:
+            import hashlib
+            import tempfile
+
+            key = hashlib.sha256(str(self.workspace).lower().encode("utf-8", errors="replace")).hexdigest()[:16]
+            Path(tempfile.gettempdir(), f"rbit-lock-{key}.lock").unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def load_config(self) -> dict[str, Any]:
         raw_base = (
             os.environ.get("RBIT_API_BASE")

@@ -454,6 +454,24 @@ class ToolExecutor:
         )
         added = sum(1 for ln in diff_lines if ln.startswith("+") and not ln.startswith("+++"))
         removed = sum(1 for ln in diff_lines if ln.startswith("-") and not ln.startswith("---"))
+        # Move detection: identical lines removed on one side and added on the
+        # other are likely relocations, not separate edits.
+        sm = difflib.SequenceMatcher(None, [ln.strip() for ln in old_lines], [ln.strip() for ln in new_lines])
+        old_bag: dict[str, int] = {}
+        for op in sm.get_opcodes():
+            if op[0] == "delete":
+                for ln in old_lines[op[1] : op[2]]:
+                    old_bag[ln.strip()] = old_bag.get(ln.strip(), 0) + 1
+        moved = 0
+        for op in sm.get_opcodes():
+            if op[0] == "insert":
+                for ln in new_lines[op[3] : op[4]]:
+                    key = ln.strip()
+                    if key and old_bag.get(key):
+                        old_bag[key] -= 1
+                        moved += 1
+        if moved:
+            diff_lines.append(f"# ⇄ ~{moved} line(s) moved")
         return "\n".join(ln.rstrip("\r\n") for ln in diff_lines), added, removed
 
     def _record_file_change(self, rel_path: str, added: int, removed: int) -> None:
@@ -534,6 +552,40 @@ class ToolExecutor:
         if self.on_files_updated:
             self.on_files_updated()
         return f"Reverted `{rel}` ({snap.step_label})"
+
+    def import_graph(self, limit: int = 200) -> dict[str, set[str]]:
+        """Python-only import graph: local file → local modules it imports."""
+        import ast as _ast
+
+        graph: dict[str, set[str]] = {}
+        py_files = [rel for rel in self.list_workspace_files(limit=limit) if rel.endswith(".py")]
+        module_names = {rel[:-3].replace("/", ".").replace("\\", ".") for rel in py_files}
+        for rel in py_files:
+            full = self.workspace / rel
+            try:
+                tree = _ast.parse(full.read_text(encoding="utf-8", errors="replace"))
+            except SyntaxError:
+                continue
+            imports: set[str] = set()
+            for node in _ast.walk(tree):
+                if isinstance(node, _ast.Import):
+                    for alias in node.names:
+                        if alias.name in module_names:
+                            imports.add(alias.name)
+                elif isinstance(node, _ast.ImportFrom) and node.module and node.level == 0:
+                    if node.module in module_names:
+                        imports.add(node.module)
+            if imports:
+                graph[rel] = imports
+        return graph
+
+    def undo_to_count(self, mark: int) -> int:
+        """Reverts file snapshots until the undo stack is back to `mark` length."""
+        reverted = 0
+        while len(self.undo_stack) > max(0, mark):
+            self.undo_last()
+            reverted += 1
+        return reverted
 
     def redo_last(self) -> str:
         if not self.redo_stack:
@@ -2045,3 +2097,25 @@ OPENAI_TOOLS_SCHEMA.append(
         },
     }
 )
+
+
+def detect_test_command(workspace: Path) -> str | None:
+    """Picks the project's test command: pytest / npm test / cargo test / make test."""
+    ws = Path(workspace)
+    if (ws / "pyproject.toml").exists() or (ws / "pytest.ini").exists() or any(ws.glob("test_*.py")):
+        return "pytest -q"
+    pkg = ws / "package.json"
+    if pkg.exists():
+        try:
+            scripts = (json.loads(pkg.read_text(encoding="utf-8")).get("scripts") or {})
+            if "test" in scripts:
+                return "npm test"
+        except ValueError:
+            pass
+    if (ws / "Cargo.toml").exists():
+        return "cargo test"
+    if (ws / "Makefile").exists():
+        return "make test"
+    if any(ws.glob("test_*.py")):
+        return "pytest -q"
+    return None

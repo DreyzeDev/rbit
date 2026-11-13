@@ -228,6 +228,7 @@ class AgentEngine:
         self.retry_base_delay = 0.6
         self.retry_max_delay = 8.0
         self._provider_models_synced_at = 0.0
+        self.last_api_latency: float | None = None
         self._active_profile_tools: set[str] | None = None
         self._active_profile_readonly: bool = False
 
@@ -953,6 +954,7 @@ class AgentEngine:
             finish_reason = None
             args_progress: dict[int, tuple[str, int]] = {}
             try:
+                _t_req = time.perf_counter()
                 async with client.stream("POST", url, headers=headers, json=payload) as resp:
                     if (
                         resp.status_code in RETRYABLE_STATUS
@@ -1059,6 +1061,7 @@ class AgentEngine:
                         await on_status("")
                     except Exception:
                         logger.debug("status hook failed", exc_info=True)
+                self.last_api_latency = time.perf_counter() - _t_req
                 ordered_tcs = [tc_acc[k] for k in sorted(tc_acc.keys())]
                 if finish_reason == "length":
                     for entry in ordered_tcs:
@@ -1119,7 +1122,9 @@ class AgentEngine:
             payload["reasoning_effort"] = effort
         for attempt in range(1, self.retry_attempts + 1):
             try:
+                _t_req = time.perf_counter()
                 resp = await client.post(url, headers=headers, json=payload)
+                self.last_api_latency = time.perf_counter() - _t_req
             except httpx.HTTPError as exc:
                 if attempt < self.retry_attempts:
                     delay = self._retry_delay(attempt)

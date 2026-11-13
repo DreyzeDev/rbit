@@ -27,6 +27,7 @@ from .modals import (
     CommandPaletteModal,
     ConnectApiModal,
     DiffViewerModal,
+    PromptHistoryModal,
     EffortSelectorModal,
     HelpModal,
     ModelSelectorModal,
@@ -47,7 +48,7 @@ from .models import (
 )
 from .storage import StorageManager
 from .themes import RBIT_DARK, RBIT_HIGH_CONTRAST, RBIT_LIGHT
-from .tools import MUTATING_TOOLS, VIRTUAL_ATTACHMENTS, ToolExecutor
+from .tools import MUTATING_TOOLS, VIRTUAL_ATTACHMENTS, ToolExecutor, detect_test_command
 from .widgets import (
     AgentModeBadge,
     AssistantMessageCard,
@@ -461,6 +462,7 @@ class RbitApp(App[None]):
         Binding("ctrl+shift+x", "stop_background", "Stop background", show=False),
         Binding("ctrl+shift+e", "collapse_all_cards", "Collapse cards", show=False),
         Binding("ctrl+r", "retry_last", "Retry", show=False),
+        Binding("ctrl+h", "history_search", "Prompt history", show=False),
         Binding("f1", "show_help", "Help", show=False),
         Binding("escape", "interrupt_or_close", "Interrupt", show=False),
         Binding("ctrl+q", "quit", "Quit", show=False),
@@ -551,6 +553,15 @@ class RbitApp(App[None]):
         yield BottomStatusBar()
 
     def on_mount(self) -> None:
+        acquired, other_pid = self.storage.acquire_lock()
+        if not acquired:
+            self.notify(
+                f"Внимание: другой rbit уже работает в этом воркспейсе (pid {other_pid}).",
+                severity="warning",
+                timeout=5.0,
+            )
+        self._plugins_loaded = False
+        self._maybe_show_doctor_hint()
         self.register_theme(RBIT_DARK)
         self.register_theme(RBIT_LIGHT)
         self.register_theme(RBIT_HIGH_CONTRAST)
@@ -581,7 +592,26 @@ class RbitApp(App[None]):
         if self.initial_prompt:
             self.set_timer(0.15, lambda: self._submit_prompt(self.initial_prompt or ""))
 
+    def _maybe_show_doctor_hint(self) -> None:
+        hint_file = self.workspace / ".rbit" / ".doctor_hint_shown"
+        if hint_file.exists():
+            return
+        has_key = bool((self.config_data.get("api_key") or "").strip())
+        if has_key:
+            return
+        try:
+            hint_file.parent.mkdir(parents=True, exist_ok=True)
+            hint_file.write_text("1", encoding="utf-8")
+        except OSError:
+            pass
+        self.notify(
+            "API-ключ не задан — работает встроенный Smart-агент. "
+            "Откройте /connect или проверьте `rbit doctor`.",
+            timeout=6.0,
+        )
+
     def on_unmount(self) -> None:
+        self.storage.release_lock()
         if self._save_timer is None:
             return
         self._save_timer.stop()
@@ -726,7 +756,9 @@ class RbitApp(App[None]):
             mode=self.agent_mode,
             frame=self._spin_frame,
         )
-        self.query_one(SessionHeaderBar).update_header(self.session, model_id, self.engine.extra_models)
+        self.query_one(SessionHeaderBar).update_header(
+            self.session, model_id, self.engine.extra_models, api_latency=self.engine.last_api_latency
+        )
         self.query_one(SidebarPanel).refresh_all(
             self.session,
             model_id,
@@ -1172,6 +1204,10 @@ class RbitApp(App[None]):
         messages = self.session.messages
         truncated = len(messages) > window
         visible = messages[-window:] if truncated else messages
+        if truncated:
+            pinned_early = [m for m in messages[:-window] if m.pinned]
+            if pinned_early:
+                visible = [*pinned_early, *visible]
         widgets: list[Any] = []
         if truncated:
             widgets.append(
@@ -1203,6 +1239,115 @@ class RbitApp(App[None]):
         scroll = self.query_one("#chat-scroll", ChatScroll)
         scroll.mount(Static(text, classes="system-notice"))
         self._smart_scroll_end()
+
+    def action_history_search(self) -> None:
+        self.push_screen(PromptHistoryModal(self.prompt_history), self._on_history_picked)
+
+    def _on_history_picked(self, prompt: str | None) -> None:
+        if prompt:
+            inp = self.query_one("#prompt-input", Input)
+            inp.value = prompt
+            inp.cursor_position = len(prompt)
+            inp.focus()
+
+    def _cmd_pin(self) -> None:
+        for msg in reversed(self.session.messages):
+            if msg.role == "assistant":
+                msg.pinned = not msg.pinned
+                self.storage.save_session(self.session)
+                self._rebuild_chat_view()
+                self.notify("📌 Pinned." if msg.pinned else "Unpinned.", timeout=1.5)
+                return
+        self.notify("No assistant message to pin.", severity="warning")
+
+    def _cmd_undo_turn(self) -> None:
+        n = self.executor.undo_to_count(getattr(self, "_turn_undo_mark", 0))
+        self.notify(f"Undone {n} change(s) from this turn." if n else "Nothing to undo.", timeout=2.0)
+        self._sync_ui()
+
+    async def _cmd_test(self, path: str) -> None:
+        cmd = path.strip() or detect_test_command(self.workspace)
+        if not cmd:
+            self.notify("No test command detected; use /test <command>.", severity="warning")
+            return
+        self.notify(f"Running: {cmd}", timeout=2.0)
+        res = await self.executor.execute("bash", {"command": cmd, "timeout": 300})
+        tail = "\n".join(res.output.splitlines()[-25:]) or "(no output)"
+        if res.ok:
+            self._post_notice(f"✓ Tests passed\n\n{tail}")
+        else:
+            self._post_notice(f"✗ Tests failed — отправляю падения агенту\n\n{tail}")
+            self._submit_prompt(
+                "[test failures] Тесты упали. Вот вывод:\n\n" + tail + "\n\nНайди причину и исправь."
+            )
+
+    def _cmd_review(self) -> None:
+        self.agent_mode = "plan"
+        self._submit_prompt(
+            "Проведи код-ревью текущих изменений. @diff\n"
+            "Сфокусируйся на корректности, безопасности, производительности и читаемости. "
+            "Приоритизируй находки: [P0] блокеры, [P1] важно, [P2] полировка. Отвечай по-русски."
+        )
+
+    def _cmd_explain(self, path: str) -> None:
+        path = path.strip()
+        if not path:
+            self.notify("Usage: /explain <file>", severity="warning")
+            return
+        self._submit_prompt(
+            f"Объясни файл `{path}`: назначение, ключевые функции/классы, связи с остальным кодом. @ {path}"
+        )
+
+    def _cmd_deps(self) -> None:
+        graph = self.executor.import_graph()
+        lines = [f"`{k}` → {', '.join(sorted(v)) or '(no local imports)'}" for k, v in list(graph.items())[:30]]
+        self._post_notice("# Import graph\n\n" + "\n".join(lines))
+
+    async def _cmd_macro(self, name: str) -> None:
+        import json as _json
+
+        path = self.workspace / ".rbit" / "macros" / f"{name.strip()}.json"
+        if not name.strip() or not path.exists():
+            self.notify(f"Macro not found: {path}", severity="warning")
+            return
+        try:
+            steps = _json.loads(path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            self.notify(f"Bad macro JSON: {exc}", severity="error")
+            return
+        for step in steps if isinstance(steps, list) else []:
+            tool = str(step.get("tool") or "")
+            if not tool:
+                continue
+            res = await self.executor.execute(tool, step.get("args") or {})
+            self._post_notice(f"▸ {tool}: {res.summary}\n\n{res.output[:1200]}")
+
+    def _run_coro(self, coro) -> None:
+        self.run_worker(coro, exclusive=False)
+
+    def _os_notify(self, text: str) -> None:
+        try:
+            if os.name == "nt":
+                try:
+                    import winsound
+
+                    winsound.MessageBeep()
+                except Exception:
+                    pass
+            elif sys.platform == "darwin":
+                subprocess.Popen(
+                    ["osascript", "-e", f'display notification "{text}" with title "rbit"'],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.Popen(
+                    ["notify-send", "rbit", text],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except Exception:
+            pass
 
     @staticmethod
     def _phrase_is_build(lowered: str) -> bool:
@@ -1339,6 +1484,17 @@ class RbitApp(App[None]):
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
 
+        # Custom project commands (from .rbit/commands) take priority over built-ins.
+        custom = self.storage.load_custom_commands()
+        custom_name = cmd.lstrip("/")
+        if custom_name in custom:
+            template = custom[custom_name]["template"]
+            prompt = template.replace("{args}", arg) if "{args}" in template else (
+                template + (f"\n\n{arg}" if arg else "")
+            )
+            self._submit_prompt(prompt.strip())
+            return True
+
         if cmd in ("/exit", "/quit", "/q"):
             self.exit()
             return True
@@ -1392,6 +1548,30 @@ class RbitApp(App[None]):
             else:
                 self.action_open_todos()
             return True
+        if cmd == "/pin":
+            self._cmd_pin()
+            return True
+        if cmd == "/test":
+            self._run_coro(self._cmd_test(arg))
+            return True
+        if cmd == "/review":
+            self._cmd_review()
+            return True
+        if cmd == "/explain":
+            self._cmd_explain(arg)
+            return True
+        if cmd == "/deps":
+            self._cmd_deps()
+            return True
+        if cmd == "/macro":
+            self._run_coro(self._cmd_macro(arg))
+            return True
+        if cmd == "/undoturn":
+            self._cmd_undo_turn()
+            return True
+        if cmd in ("/history", "/hist"):
+            self.action_history_search()
+            return True
         if cmd == "/undo":
             self._cmd_undo()
             return True
@@ -1426,16 +1606,6 @@ class RbitApp(App[None]):
             self._cmd_help()
             return True
 
-        custom = self.storage.load_custom_commands()
-        custom_name = cmd.lstrip("/")
-        if custom_name in custom:
-            template = custom[custom_name]["template"]
-            prompt = template.replace("{args}", arg) if "{args}" in template else (
-                template + (f"\n\n{arg}" if arg else "")
-            )
-            self._submit_prompt(prompt.strip())
-            return True
-        return False
 
     def _cmd_checkpoint(self, label: str) -> None:
         meta = self.executor.create_checkpoint(label or f"Step {len(self.session.messages) + 1}")
@@ -1805,6 +1975,10 @@ class RbitApp(App[None]):
     @work(exclusive=True, group="rbit-turn")
     async def _execute_agent_turn(self, user_msg: ChatMessage) -> None:
         scroll = self.query_one("#chat-scroll", ChatScroll)
+        self._turn_undo_mark = len(self.executor.undo_stack)
+        import time as _time
+
+        self._turn_started = _time.monotonic()
         # Bind the turn to the session it started with, so a mid-turn session
         # switch can never route the reply into the wrong session.
         session = self.session
@@ -1814,8 +1988,12 @@ class RbitApp(App[None]):
         session.finished = False
         self._schedule_save_session(delay=0.05)
 
+        quiet = bool(self.config_data.get("quiet"))
+
         async def on_tool_start(rec: ToolCallRecord) -> None:
             self._settle_thinking()
+            if quiet:
+                return
             card = ToolCallCard(rec)
             self._tool_widgets[rec.id] = card
             if self._thinking is not None:
@@ -1941,5 +2119,10 @@ class RbitApp(App[None]):
             queued = self._queued_prompt
             self._queued_prompt = None
             self._sync_ui()
+            if self.config_data.get("notify_done", True) and getattr(self, "_turn_started", 0):
+                import time as _time
+
+                if _time.monotonic() - self._turn_started > 30:
+                    self._os_notify("Ход завершён")
             if queued:
                 self.call_after_refresh(self._submit_prompt, queued)

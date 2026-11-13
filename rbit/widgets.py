@@ -347,6 +347,7 @@ class SessionHeaderBar(Static):
         session: Session,
         model_id: str,
         extra_models: list[ModelInfo] | None = None,
+        api_latency: float | None = None,
     ) -> None:
         info = get_model_info(model_id, extra_models)
         used = session.total_tokens
@@ -354,6 +355,8 @@ class SessionHeaderBar(Static):
         cost = (used / 1000.0) * info.cost_per_1k
         self._title = session.title or "New Session"
         self._stats = f"{used:,}  {pct}% (${cost:.2f})"
+        if api_latency is not None:
+            self._stats += f" · api {api_latency:.1f}s"
         self._used = used
         self._pct = pct
         self._cost = cost
@@ -714,6 +717,8 @@ class AssistantMessageCard(Vertical):
         else:
             suffix = ""
         meta.append(f"{self.msg.agent.capitalize()} · {info.name}{suffix}", style="#808080")
+        if self.msg.pinned:
+            meta.append(" 📌", style="#f5a742")
         if self.msg.tokens and info.cost_per_1k:
             meta.append(f" · ${self.msg.tokens / 1000 * info.cost_per_1k:.4f}", style="#808080")
         if self.msg.interrupted:
