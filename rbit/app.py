@@ -1180,7 +1180,22 @@ class RbitApp(App[None]):
                     return
             return
 
-    def action_copy_last(self) -> None:
+    def action_copy_last(self, arg: str = "") -> None:
+        arg = (arg or "").strip().lower()
+        if arg in ("diff", "patch"):
+            diffs = [tc.diff for m in self.session.messages for tc in m.tool_calls if tc.diff]
+            if not diffs:
+                self.notify("No diffs recorded in this session.", severity="warning")
+                return
+            if _write_clipboard("\n\n".join(diffs)):
+                self.notify(f"Copied {len(diffs)} diff(s) to the clipboard.", timeout=2.0)
+            else:
+                self.notify(
+                    "Clipboard helper not found (install pyperclip or xclip/wl-copy).",
+                    severity="error",
+                    timeout=3.0,
+                )
+            return
         last = next(
             (m for m in reversed(self.session.messages) if m.role == "assistant" and m.content.strip()),
             None,
@@ -1761,7 +1776,7 @@ class RbitApp(App[None]):
             self.action_search_session(arg)
             return True
         if cmd == "/copy":
-            self.action_copy_last()
+            self.action_copy_last(arg)
             return True
         if cmd == "/init":
             self._submit_prompt("Проанализируй структуру этого проекта и создай стартовый Todo-план")
