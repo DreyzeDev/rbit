@@ -1630,9 +1630,9 @@ class RbitApp(App[None]):
         self._interrupted_turn = False
         self.session.finished = False
         self._schedule_save_session(delay=0.05)
-        self._show_thinking()
 
         async def on_tool_start(rec: ToolCallRecord) -> None:
+            self._hide_thinking()
             card = ToolCallCard(rec)
             self._tool_widgets[rec.id] = card
             if self._thinking is not None:
@@ -1652,8 +1652,15 @@ class RbitApp(App[None]):
             self.busy_status = status_text
             self._sync_ui()
 
+        async def on_thinking(active: bool) -> None:
+            if active:
+                self._show_thinking()
+            else:
+                self._hide_thinking()
+
         async def on_stream_chunk(partial_md: str) -> None:
             if self._live_card is None:
+                self._hide_thinking()
                 draft = ChatMessage(
                     id=short_id(),
                     role="assistant",
@@ -1683,6 +1690,7 @@ class RbitApp(App[None]):
                 on_tool_end=on_tool_end,
                 on_status=on_status,
                 on_stream_chunk=on_stream_chunk,
+                on_thinking=on_thinking,
             )
             if self._interrupted_turn:
                 self._live_card = None

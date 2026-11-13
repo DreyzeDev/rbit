@@ -13,6 +13,8 @@ All notable changes to rbit are documented here. The format follows
 - Shell completion via `rbit --generate-completion bash|zsh|powershell`.
 - Config profiles with `--profile <name>` overlays from `config.json`.
 - `F1` help screen, Ollama sidebar status, high-contrast theme, compact mode.
+- Inline `Thinking...` spinner in the chat feed, shown only while a model
+  request is in flight.
 - `bash` timeout argument and background execution.
 - Readable Markdown `webfetch` output with a 10-minute cache.
 - ripgrep-backed `grep` when `rg` is available.

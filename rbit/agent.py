@@ -90,6 +90,7 @@ ToolStartHook = Callable[[ToolCallRecord], Awaitable[None]]
 ToolEndHook = Callable[[ToolCallRecord], Awaitable[None]]
 StatusHook = Callable[[str], Awaitable[None]]
 StreamHook = Callable[[str], Awaitable[None]]
+ThinkingHook = Callable[[bool], Awaitable[None]]
 
 
 SYSTEM_PROMPT_TEMPLATE = """You are rbit, an autonomous interactive CLI coding agent.
@@ -320,6 +321,7 @@ class AgentEngine:
         on_tool_end: ToolEndHook,
         on_status: StatusHook,
         on_stream_chunk: StreamHook | None = None,
+        on_thinking: ThinkingHook | None = None,
     ) -> ChatMessage:
         t0 = time.perf_counter()
         cfg = self.get_config()
@@ -388,6 +390,7 @@ class AgentEngine:
                 invoke_tool=invoke_tool,
                 on_status=on_status,
                 on_stream_chunk=on_stream_chunk,
+                on_thinking=on_thinking,
             )
         else:
             if not model_info.is_local_smart and not api_key:
@@ -440,6 +443,7 @@ class AgentEngine:
         invoke_tool: Callable[[str, dict[str, Any]], Awaitable[ToolResult]],
         on_status: StatusHook,
         on_stream_chunk: StreamHook | None = None,
+        on_thinking: ThinkingHook | None = None,
     ) -> str:
         mode_note = (
             "PLAN MODE ACTIVE: Do NOT modify files (`write`/`edit`/`multi_edit`/`apply_patch` disabled). Read code, analyze, and create a plan + `todowrite`."
@@ -528,29 +532,35 @@ class AgentEngine:
             nonlocal spent_usd
             await on_status(f"Запрос к {model_id}...")
             for _step in range(max_steps):
-                if on_stream_chunk is not None:
-                    ok, content, tool_calls = await self._stream_chat_step(
-                        client=client,
-                        url=f"{api_base}/chat/completions",
-                        headers=headers,
-                        model_id=model_id,
-                        messages=api_messages,
-                        on_stream_chunk=on_stream_chunk,
-                        on_status=on_status,
-                    )
-                    if not ok:
-                        return content
-                else:
-                    ok, content, tool_calls = await self._non_stream_chat_step(
-                        client=client,
-                        url=f"{api_base}/chat/completions",
-                        headers=headers,
-                        model_id=model_id,
-                        messages=api_messages,
-                        on_status=on_status,
-                    )
-                    if not ok:
-                        return content
+                if on_thinking is not None:
+                    await on_thinking(True)
+                try:
+                    if on_stream_chunk is not None:
+                        ok, content, tool_calls = await self._stream_chat_step(
+                            client=client,
+                            url=f"{api_base}/chat/completions",
+                            headers=headers,
+                            model_id=model_id,
+                            messages=api_messages,
+                            on_stream_chunk=on_stream_chunk,
+                            on_status=on_status,
+                        )
+                        if not ok:
+                            return content
+                    else:
+                        ok, content, tool_calls = await self._non_stream_chat_step(
+                            client=client,
+                            url=f"{api_base}/chat/completions",
+                            headers=headers,
+                            model_id=model_id,
+                            messages=api_messages,
+                            on_status=on_status,
+                        )
+                        if not ok:
+                            return content
+                finally:
+                    if on_thinking is not None:
+                        await on_thinking(False)
 
                 if not tool_calls:
                     return content or "(пустой ответ модели)"

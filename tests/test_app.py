@@ -2232,6 +2232,47 @@ async def test_max_steps_budget_stops_the_loop(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_thinking_hook_toggles_around_each_model_request(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "test"}
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "done"}}]}
+        )
+
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    events: list[bool] = []
+
+    async def invoke_tool(name: str, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(True, "ok", "ok")
+
+    async def on_status(_s: str) -> None:
+        pass
+
+    async def on_thinking(active: bool) -> None:
+        events.append(active)
+
+    text = await engine._run_openai_compatible(
+        session=Session(),
+        user_msg=ChatMessage(id="u1", role="user", content="hi"),
+        agent_mode="build",
+        model_id="openai/gpt-4o-mini",
+        api_base="https://mock.local/v1",
+        api_key="test",
+        invoke_tool=invoke_tool,
+        on_status=on_status,
+        on_stream_chunk=None,
+        on_thinking=on_thinking,
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert text == "done"
+    assert events == [True, False]
+
+
+@pytest.mark.asyncio
 async def test_max_cost_budget_stops_the_loop(tmp_path: Path) -> None:
     executor = ToolExecutor(workspace=tmp_path, session=Session())
     cfg: dict[str, Any] = {"max_cost_usd": 0.000001, "api_key": "test", "max_steps": 9}
