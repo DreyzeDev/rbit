@@ -3443,3 +3443,35 @@ def test_telemetry_disabled_is_noop() -> None:
         {"telemetry": {"enabled": True, "endpoint": "http://127.0.0.1:9/nope"}},
         "turn",
     )  # unreachable endpoint swallowed
+
+
+@pytest.mark.asyncio
+async def test_readonly_session_blocks_mutations(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    executor.session_readonly = True
+    blocked = await executor.execute("write", {"filePath": "x.txt", "content": "hi"})
+    assert blocked.ok is False
+    assert "read-only session" in blocked.summary
+    bash = await executor.execute("bash", {"command": "echo hi"})
+    assert bash.ok is False
+    read = await executor.execute("read", {"filePath": "x.txt"})
+    assert "read-only" not in read.summary
+
+
+@pytest.mark.asyncio
+async def test_phrase_switches_agent_mode(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        app.agent_mode = "build"
+
+        async def fake_run_turn(**kwargs):
+            return ChatMessage(id="a1", role="assistant", content="план готов", agent=kwargs["agent_mode"], model="m", duration_s=0.1)
+
+        app.engine.run_turn = fake_run_turn
+        app._submit_prompt("спланируй рефакторинг модуля")
+        for _ in range(100):
+            await pilot.pause()
+            if not app.is_busy:
+                break
+        assert app.agent_mode == "plan"

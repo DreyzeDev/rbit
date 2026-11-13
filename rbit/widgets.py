@@ -714,6 +714,8 @@ class AssistantMessageCard(Vertical):
         else:
             suffix = ""
         meta.append(f"{self.msg.agent.capitalize()} · {info.name}{suffix}", style="#808080")
+        if self.msg.tokens and info.cost_per_1k:
+            meta.append(f" · ${self.msg.tokens / 1000 * info.cost_per_1k:.4f}", style="#808080")
         if self.msg.interrupted:
             meta.append(" · interrupted", style="italic #e5c07b")
         return meta

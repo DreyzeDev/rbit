@@ -519,6 +519,8 @@ class RbitApp(App[None]):
         )
         if allow_outside_paths:
             self.executor.allow_outside_paths = True
+        if self.config_data.get("readonly"):
+            self.executor.session_readonly = True
         self.engine = AgentEngine(
             workspace=self.workspace,
             executor=self.executor,
@@ -1202,6 +1204,10 @@ class RbitApp(App[None]):
         scroll.mount(Static(text, classes="system-notice"))
         self._smart_scroll_end()
 
+    @staticmethod
+    def _phrase_is_build(lowered: str) -> bool:
+        return lowered.startswith(("начни делать", "реализуй", "исправь", "делай", "fix:", "implement:"))
+
     def _build_self_check_message(self, reply: ChatMessage) -> ChatMessage | None:
         """Runs diagnostics on files mutated this turn; returns a fix prompt when broken."""
         mutated: list[str] = []
@@ -1743,6 +1749,15 @@ class RbitApp(App[None]):
             scroll.scroll_end(animate=False)
 
     def _submit_prompt(self, raw_text: str) -> None:
+        # Phrase-based mode switch: planning words route the turn to Plan mode.
+        lowered = raw_text.lower()
+        if lowered.startswith(("спланируй", "составь план", "план:", "plan:")) and self.agent_mode != "plan":
+            self.agent_mode = "plan"
+            self.notify("Plan mode (по фразе в промпте).", timeout=2.0)
+        elif self._phrase_is_build(lowered) and self.agent_mode != "build":
+            self.agent_mode = "build"
+            self.notify("Build mode (по фразе в промпте).", timeout=2.0)
+
         if self.is_busy:
             # Prompt queue: let the user type the next task while the agent works;
             # it is dispatched automatically when the current turn finishes.

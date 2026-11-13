@@ -356,6 +356,7 @@ class ToolExecutor:
         self._background_procs: list[asyncio.subprocess.Process] = []
         self._webfetch_cache: dict[str, tuple[float, str]] = {}
         self._file_cache: tuple[float, list[str]] | None = None
+        self.session_readonly: bool = False
 
     def _gitignore_matcher(self) -> GitIgnoreMatcher:
         if self._gitignore is None:
@@ -632,6 +633,13 @@ class ToolExecutor:
         agent_mode: str = "build",
     ) -> ToolResult:
         t0 = time.perf_counter()
+        if self.session_readonly and (name in ("write", "edit", "multi_edit", "apply_patch", "notebook") or name == "bash"):
+            return ToolResult(
+                ok=False,
+                summary=f"{name} blocked: read-only session",
+                output="This session was started with --readonly: no mutating tools are allowed.",
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+            )
         if agent_mode == "plan" and name in ("write", "edit", "multi_edit", "apply_patch"):
             return ToolResult(
                 ok=False,

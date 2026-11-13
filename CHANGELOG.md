@@ -8,6 +8,39 @@ All notable changes to rbit are documented here. The format follows
 
 ### Added
 
+- `rbit serve` — local HTTP endpoint: `POST /v1/turns` streams a full agent turn as
+  NDJSON (status/thinking/delta/tool_call/message), `GET /health` for readiness.
+- `rbit backup` — zips the `.rbit` state directory; `rbit describe` — project
+  structure, languages and README head.
+- `rbit run --readonly` (and `readonly` config): read-only session — mutating tools
+  and bash are rejected; `rbit run --prompt-profile fast|careful|reviewer|docs`.
+- Prompt profiles: `fast` (terse), `careful` (defensive), `reviewer` (read-only,
+  mutating tools rejected), `docs` (no bash/subagent).
+- Turn planner: build-mode prompts ask for a 1-3 line plan before the first tool call;
+  the first plan line appears in the status line.
+- Self-check: after a turn that mutated files, diagnostics run over them; a single
+  automatic fix round is dispatched when issues are found (`self_check` config).
+- Prompt caching: system message carries `cache_control: ephemeral` for
+  OpenRouter/Anthropic bases (`prompt_caching: auto|on|off`).
+- Native Ollama `/api/chat` path (NDJSON streaming, `thinking`, dict tool arguments)
+  when the base points at :11434.
+- `model_routing` (light/heavy) by task size, attachments and keywords;
+  `model_capabilities` overrides the tools heuristic (gemma/phi/tiny families get no
+  tools in the payload).
+- Provider model listings parse `context_length` and OpenRouter-style per-token
+  pricing into `cost_per_1k`.
+- `notebook` tool: cell-level read/set/insert/delete for `.ipynb` with undo snapshots.
+- Cost estimate in the assistant card meta (tokens × provider price).
+- Phrase-based mode switch: prompts starting with "спланируй/составь план/plan:" run
+  in Plan mode, "делай/исправь/implement:" in Build mode.
+- Distribution: Dockerfile + ghcr workflow, release + PyPI publish workflow, composite
+  GitHub Action (`action.yml`), Scoop/winget/Homebrew manifests, MkDocs site,
+  vhs demo tape (`demo/demo.tape`).
+
+### Changed
+
+- bash sandbox (`bash_sandbox` config): best-effort path restriction to the workspace.
+- `rbit/stats` items and the full IMPROVEMENTS.md backlog are closed (76 → 100 items).
 - Prompt queue: a prompt submitted while the agent is working is queued (preview in
   the status line) and runs automatically when the current turn finishes; Esc clears
   the queue.

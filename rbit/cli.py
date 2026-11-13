@@ -73,6 +73,7 @@ async def _run_headless(args: argparse.Namespace) -> int:
     executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=lambda: cfg)
     executor.always_allow_bash = True  # Non-interactive CLI run
     executor.allow_outside_paths = bool(getattr(args, "allow_outside", False))
+    executor.session_readonly = bool(getattr(args, "readonly", False))
     engine = AgentEngine(
         workspace=workspace,
         executor=executor,
@@ -760,7 +761,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "export", "map", "lint", "init", "commit", "update"}
+    subcommands = {"run", "doctor", "stats", "sessions", "export", "map", "lint", "init", "commit", "update", "backup", "describe", "serve"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -786,6 +787,11 @@ def main(argv: list[str] | None = None) -> int:
                 help="Allow file tools to touch paths outside the workspace",
             )
             p.add_argument(
+                "--readonly",
+                action="store_true",
+                help="Read-only session: mutating tools and bash are blocked",
+            )
+            p.add_argument(
                 "--output-format",
                 choices=["text", "json", "jsonl"],
                 default="text",
@@ -802,6 +808,65 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("dir", nargs="?", help="Workspace directory")
             parsed = p.parse_args(rest)
             return asyncio.run(_run_doctor(_resolve_workspace(parsed.dir)))
+
+        if sub == "serve":
+            p = argparse.ArgumentParser(prog="rbit serve", description="Local HTTP endpoint exposing rbit turns as NDJSON")
+            p.add_argument("--port", type=int, default=8333)
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            p.add_argument("--allow-outside", action="store_true")
+            parsed = p.parse_args(rest)
+            return _run_serve(parsed)
+
+        if sub == "backup":
+            p = argparse.ArgumentParser(prog="rbit backup", description="Archive the .rbit state directory")
+            p.add_argument("dir", nargs="?", help="Workspace directory")
+            p.add_argument("-o", "--output", help="Output zip path (default rbit-backup-<ts>.zip)")
+            parsed = p.parse_args(rest)
+            workspace = _resolve_workspace(parsed.dir)
+            import zipfile
+
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            out = Path(parsed.output) if parsed.output else workspace / f"rbit-backup-{stamp}.zip"
+            state_dir = workspace / ".rbit"
+            if not state_dir.exists():
+                Console().print("No .rbit directory to back up.")
+                return 1
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in sorted(state_dir.rglob("*")):
+                    if f.is_file():
+                        zf.write(f, f.relative_to(workspace))
+            Console().print(f"Backed up .rbit → {out}")
+            return 0
+
+        if sub == "describe":
+            p = argparse.ArgumentParser(prog="rbit describe", description="Describe the project structure and README")
+            p.add_argument("dir", nargs="?", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            workspace = _resolve_workspace(parsed.dir)
+            from rbit.tools import ToolExecutor as _TE
+            from rbit.models import Session as _Session
+
+            executor = _TE(workspace=workspace, session=_Session())
+            files = executor.list_workspace_files(limit=60)
+            exts: dict[str, int] = {}
+            for f in files:
+                exts[Path(f).suffix.lower() or "(none)"] = exts.get(Path(f).suffix.lower() or "(none)", 0) + 1
+            top = sorted(exts.items(), key=lambda kv: -kv[1])[:6]
+            readme = next(
+                (workspace / n for n in ("README.md", "readme.md", "README.rst", "README.txt") if (workspace / n).exists()),
+                None,
+            )
+            print(f"Project: {workspace.name}")
+            print(f"Files (top {min(60, len(files))}): {len(files)}")
+            print("Languages:", ", ".join(f"{k or 'plain'}×{v}" for k, v in top) or "n/a")
+            if readme is not None:
+                head = readme.read_text(encoding="utf-8", errors="replace").splitlines()
+                head = [ln for ln in head if ln.strip()][:6]
+                print(f"--- {readme.name} (head) ---")
+                print("\n".join(head))
+            else:
+                print("No README found.")
+            return 0
 
         if sub == "stats":
             p = argparse.ArgumentParser(prog="rbit stats")
@@ -935,6 +1000,139 @@ def main(argv: list[str] | None = None) -> int:
         allow_outside_paths=allow_outside or bool(getattr(parsed, "allow_outside", False)),
     )
     app.run()
+    return 0
+
+
+
+
+def _run_serve(args: argparse.Namespace) -> int:
+    """Local HTTP endpoint: POST /v1/turns streams a full agent turn as NDJSON."""
+    import json as _json
+    import queue as _queue
+    import threading as _threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from rbit.agent import AgentEngine
+    from rbit.models import ChatMessage, Session, ToolCallRecord, short_id
+    from rbit.tools import ToolExecutor
+
+    workspace = _resolve_workspace(args.dir)
+    storage = StorageManager(workspace)
+    cfg = storage.load_config()
+    model_id = str(cfg.get("model", "rbit/smart-local"))
+    sessions: dict[str, Session] = {}
+
+    def run_turn_events(prompt_text: str, session: Session, sink: " _queue.Queue"):  # type: ignore[name-defined]
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=lambda: cfg)
+            executor.always_allow_bash = True
+            executor.allow_outside_paths = bool(getattr(args, "allow_outside", False))
+            engine = AgentEngine(workspace=workspace, executor=executor, storage=storage, get_config=lambda: cfg)
+
+            async def on_status(text: str) -> None:
+                if text:
+                    sink.put({"type": "status", "text": text})
+
+            async def on_tool_start(rec: ToolCallRecord) -> None:
+                sink.put({"type": "tool_call", "name": rec.name, "arguments": rec.arguments})
+
+            async def on_tool_end(rec: ToolCallRecord) -> None:
+                sink.put({"type": "tool_result", "name": rec.name, "summary": rec.summary})
+
+            async def on_stream_chunk(partial: str) -> None:
+                sink.put({"type": "delta", "text": partial})
+
+            async def on_thinking(active: bool) -> None:
+                sink.put({"type": "thinking", "active": active})
+
+            async def on_reasoning_chunk(piece: str) -> None:
+                sink.put({"type": "reasoning", "text": piece})
+
+            async def _turn() -> None:
+                user = ChatMessage(id=short_id(), role="user", content=prompt_text)
+                session.messages.append(user)
+                reply = await engine.run_turn(
+                    session=session,
+                    user_msg=user,
+                    agent_mode="build",
+                    model_id=model_id,
+                    on_tool_start=on_tool_start,
+                    on_tool_end=on_tool_end,
+                    on_status=on_status,
+                    on_stream_chunk=on_stream_chunk,
+                    on_thinking=on_thinking,
+                    on_reasoning_chunk=on_reasoning_chunk,
+                )
+                sink.put({"type": "message", "content": reply.content, "session_id": session.id})
+
+            loop.run_until_complete(_turn())
+        except Exception as exc:  # noqa: BLE001 - surfaced to the HTTP client
+            sink.put({"type": "error", "text": str(exc)})
+        finally:
+            sink.put(None)
+            loop.close()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a) -> None:  # quiet
+            return
+
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path == "/health":
+                body = _json.dumps({"status": "ok", "workspace": str(workspace)}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_POST(self) -> None:  # noqa: N802
+            if self.path != "/v1/turns":
+                self.send_response(404)
+                self.end_headers()
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                req = _json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                self.send_response(400)
+                self.end_headers()
+                return
+            prompt_text = str(req.get("prompt") or "").strip()
+            if not prompt_text:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error": "prompt is required"}')
+                return
+            sid = str(req.get("session_id") or "")
+            session = sessions.get(sid) or Session()
+            sessions[session.id] = session
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            events: _queue.Queue = _queue.Queue()
+            worker = _threading.Thread(target=run_turn_events, args=(prompt_text, session, events), daemon=True)
+            worker.start()
+            while True:
+                item = events.get()
+                if item is None:
+                    break
+                self.wfile.write((_json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
+                self.wfile.flush()
+
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    Console().print(f"rbit serve on http://127.0.0.1:{args.port}  (POST /v1/turns, GET /health)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     return 0
 
 
