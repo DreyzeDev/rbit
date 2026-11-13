@@ -54,10 +54,9 @@ All notable changes to rbit are documented here. The format follows
 - Bash output is dimmed and gutter-prefixed so commands stand out from their results.
 - The `шаг N/M` counter was removed from the status bar; the agent loop now runs up to
   50 tool rounds by default (`max_steps` still overrides it).
-- Visual polish toward a flatter, opencode-like layout: boxed session header, boxed user
-  messages and prompt with a blue accent rail, square panels, dimmer sidebar sections,
-  subtle gray scrollbars, terminal window title set to the session name, and a refreshed
-  set of screenshots in `docs/screenshots`.
+- Visual polish toward a flatter, opencode-like layout: rounded prompt border, compact
+  single-line session header, transparent user messages with an accent rail, slimmer
+  sidebar showing the workspace name, and subtle gray scrollbars.
 - Restored messages no longer show a stale `streaming...` suffix; it is reserved for
   the live card and replaced by the duration once the turn finishes.
 

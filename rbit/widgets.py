@@ -209,8 +209,9 @@ class PromptSubHints(Static):
             spin = SPINNER_FRAMES[self._frame % len(SPINNER_FRAMES)]
             accent = agent_accent(self._mode)
             left.append(f" {spin} ", style=f"bold {accent}")
-            left.append("esc", style="bold #eeeeee")
-            left.append(" interrupt", style="#808080")
+            left.append(self._status or "Working...", style="#808080")
+            right.append("esc", style="bold #eeeeee")
+            right.append(" interrupt", style="#808080")
         else:
             right.append("tab", style="#eeeeee")
             right.append(" agents   ", style="#808080")
@@ -259,7 +260,7 @@ class SessionHeaderBar(Static):
         right = Text()
         right.append(f"{self._used:,}", style="#c8c8c8")
         right.append(f"  {self._pct}%", style="#808080")
-        right.append(f"  (${self._cost:.2f})", style="#808080")
+        right.append(f"  ${self._cost:.2f}", style="#808080")
         grid.add_row(left, right)
         return grid
 
@@ -670,7 +671,7 @@ class SidebarPanel(Vertical):
 
         # 2. Context
         ctx = Text()
-        ctx.append("Context\n", style="bold #8a8a8a")
+        ctx.append("Context\n", style="bold #eeeeee")
         ctx.append(f"{used:,} tokens\n", style="#808080")
         ctx.append(f"{pct}% used\n", style="#808080")
         ctx.append(f"${cost:.2f} spent", style="#808080")
@@ -680,7 +681,7 @@ class SidebarPanel(Vertical):
 
         # 3. MCP
         mcp = Text()
-        mcp.append("MCP\n", style="bold #8a8a8a")
+        mcp.append("MCP\n", style="bold #eeeeee")
         mcp.append("• ", style="bold #7fd88f")
         mcp.append("rbit-tools ", style="#eeeeee")
         mcp.append("Connected", style="#808080")
@@ -692,7 +693,7 @@ class SidebarPanel(Vertical):
 
         # 4. LSP
         lsp = Text()
-        lsp.append("LSP\n", style="bold #8a8a8a")
+        lsp.append("LSP\n", style="bold #eeeeee")
         lsp.append("• ", style="bold #7fd88f")
         lsp.append("python ", style="#eeeeee")
         lsp.append("Ready", style="#808080")
@@ -701,7 +702,7 @@ class SidebarPanel(Vertical):
         # 4b. Ollama
         local_models = [m for m in (extra_models or []) if "ollama" in m.provider.lower()]
         ollama = Text()
-        ollama.append("Ollama\n", style="bold #8a8a8a")
+        ollama.append("Ollama\n", style="bold #eeeeee")
         if ollama_online is False:
             ollama.append("• ", style="bold #e06c75")
             ollama.append("offline ", style="#eeeeee")
@@ -717,7 +718,7 @@ class SidebarPanel(Vertical):
         todo = Text()
         done = sum(1 for t in session.todos if t.status == "completed")
         if session.todos:
-            todo.append(f"Todo ({done}/{len(session.todos)})\n", style="bold #8a8a8a")
+            todo.append(f"Todo ({done}/{len(session.todos)})\n", style="bold #eeeeee")
             for item in session.todos:
                 if item.status == "completed":
                     todo.append("[✓] ", style="bold #7fd88f")
@@ -732,14 +733,14 @@ class SidebarPanel(Vertical):
                     todo.append("[ ] ", style="#686868")
                     todo.append(f"{item.content}\n", style="#808080")
         else:
-            todo.append("Todo\n", style="bold #8a8a8a")
+            todo.append("Todo\n", style="bold #eeeeee")
             todo.append("No active tasks (/todo)", style="#686868")
         self.query_one("#sb-todo", Static).update(todo)
 
         # 6. Modified Files
         files = session.modified_files
         fblock = Text()
-        fblock.append("Modified Files\n", style="bold #8a8a8a")
+        fblock.append("Modified Files\n", style="bold #eeeeee")
         if not files:
             fblock.append("No modified files", style="#686868")
         else:
