@@ -2177,10 +2177,10 @@ class RbitApp(App[None]):
 
         self._turn_started = _time.monotonic()
         self._stream_chars = 0
-        self._files_at_turn_start = dict(session.modified_files)
         # Bind the turn to the session it started with, so a mid-turn session
         # switch can never route the reply into the wrong session.
         session = self.session
+        self._files_at_turn_start = dict(session.modified_files)
         model_id = self.config_data.get("model", "rbit/smart-local")
         self._live_card = None
         self._interrupted_turn = False
