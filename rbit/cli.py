@@ -42,6 +42,8 @@ async def _run_headless(args: argparse.Namespace) -> int:
     workspace = _resolve_workspace(args.dir)
     storage = StorageManager(workspace)
     cfg = storage.load_config()
+    if getattr(args, "prompt_profile", None):
+        cfg["prompt_profile"] = args.prompt_profile
 
     model_id = args.model or cfg.get("model", "rbit/smart-local")
     agent_mode = args.agent or "build"
@@ -767,6 +769,12 @@ def main(argv: list[str] | None = None) -> int:
             p = argparse.ArgumentParser(prog="rbit run", description="Run rbit non-interactively in headless mode")
             p.add_argument("prompt", nargs="*", help="Prompt to execute")
             p.add_argument("-m", "--model", help="Model ID")
+            p.add_argument(
+                "--prompt-profile",
+                choices=["default", "fast", "careful", "reviewer", "docs"],
+                default=None,
+                help="System prompt profile: fast | careful | reviewer | docs",
+            )
             p.add_argument("-a", "--agent", choices=["build", "plan"], default="build", help="Agent mode")
             p.add_argument("-c", "--continue", dest="continue_last", action="store_true", help="Continue latest session")
             p.add_argument("-s", "--session", help="Continue specific session ID")

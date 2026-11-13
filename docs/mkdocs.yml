@@ -1,0 +1,36 @@
+site_name: rbit
+site_description: "rbit — автономный полноэкранный AI-агент для терминала"
+site_author: DreyzeDev
+site_url: https://dreyzedev.github.io/rbit/
+
+repo_url: https://github.com/DreyzeDev/rbit
+repo_name: DreyzeDev/rbit
+edit_uri: edit/main/docs/site/
+
+docs_dir: site
+
+theme:
+  name: material
+  language: ru
+  palette:
+    - scheme: slate
+      primary: teal
+      accent: lime
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.tracking
+    - search.highlight
+    - search.share
+
+nav:
+  - Обзор: index.md
+  - Рецепты: recipes.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - toc:
+      permalink: true

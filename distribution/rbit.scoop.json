@@ -1,0 +1,26 @@
+{
+    "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json",
+    "version": "0.0.0",
+    "description": "rbit - Next-Gen Full-Screen Terminal AI Coding Agent & CLI",
+    "homepage": "https://github.com/DreyzeDev/rbit",
+    "license": "MIT",
+    "notes": [
+        "Placeholder manifest: update 'version', the release URL and the hash for every release.",
+        "After install run 'rbit --help' to verify the binary is on PATH."
+    ],
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/DreyzeDev/rbit/releases/download/v0.0.0/rbit-0.0.0-windows-x64.zip",
+            "hash": "<SHA256-PLACEHOLDER>"
+        }
+    },
+    "bin": "rbit.exe",
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/DreyzeDev/rbit/releases/download/v$version/rbit-$version-windows-x64.zip"
+            }
+        }
+    }
+}

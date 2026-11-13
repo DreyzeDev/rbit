@@ -38,6 +38,42 @@ RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 logger = logging.getLogger("rbit.agent")
 HTTP_LIMITS = httpx.Limits(max_keepalive_connections=10, max_connections=20)
 
+# Prompt profiles: accent + optionally restricted toolset. Selected via config
+# `prompt_profile` (or `--prompt-profile` on the CLI).
+PROMPT_PROFILES: dict[str, dict[str, Any]] = {
+    "default": {"prompt": ""},
+    "fast": {
+        "prompt": (
+            "PROFILE: fast — be maximally terse: minimal narration, the fewest tool calls "
+            "that solve the task, no summaries unless asked."
+        ),
+    },
+    "careful": {
+        "prompt": (
+            "PROFILE: careful — be defensive: re-read files before editing, verify changes "
+            "with diagnostics/tests, briefly state trade-offs before acting."
+        ),
+    },
+    "reviewer": {
+        "prompt": (
+            "PROFILE: reviewer — read-only code review. Inspect code and diffs, report findings "
+            "with file:line references and priorities; never modify anything."
+        ),
+        "read_only": True,
+        "allowed_tools": set(READONLY_TOOLS) | {"todowrite"},
+    },
+    "docs": {
+        "prompt": (
+            "PROFILE: docs — documentation focus: work on Markdown files, comments and docstrings; "
+            "keep terminology consistent and examples runnable."
+        ),
+        "allowed_tools": {
+            "read", "glob", "grep", "webfetch", "diagnostics", "lint", "symbols", "git",
+            "write", "edit", "multi_edit", "apply_patch", "todowrite",
+        },
+    },
+}
+
 PROVIDER_LABELS = {
     "openrouter.ai": "OpenRouter",
     "api.openai.com": "OpenAI",
@@ -151,6 +187,37 @@ class AgentEngine:
         self.retry_base_delay = 0.6
         self.retry_max_delay = 8.0
         self._provider_models_synced_at = 0.0
+        self._active_profile_tools: set[str] | None = None
+        self._active_profile_readonly: bool = False
+
+    def _tools_for_payload(self) -> list[dict[str, Any]]:
+        allowed = self._active_profile_tools
+        if allowed is None:
+            return OPENAI_TOOLS_SCHEMA
+        return [t for t in OPENAI_TOOLS_SCHEMA if t["function"]["name"] in allowed]
+
+    def _cached_messages(self, url: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Marks the stable system prefix cacheable for providers with prompt
+        caching (OpenRouter/Anthropic `cache_control`), when enabled."""
+        mode = str(self.get_config().get("prompt_caching", "auto")).lower()
+        if mode == "off" or not messages or messages[0].get("role") != "system":
+            return messages
+        if mode != "on" and not any(host in url for host in ("openrouter.ai", "anthropic")):
+            return messages
+        if not isinstance(messages[0].get("content"), str):
+            return messages
+        cached = list(messages)
+        cached[0] = {
+            **messages[0],
+            "content": [
+                {
+                    "type": "text",
+                    "text": messages[0]["content"],
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+        return cached
 
     def _retry_delay(self, attempt: int, resp: httpx.Response | None = None) -> float:
         if resp is not None:
@@ -494,6 +561,22 @@ class AgentEngine:
             }
         ]
 
+        cfg_prompt = self.get_config()
+        profile = PROMPT_PROFILES.get(
+            str(cfg_prompt.get("prompt_profile", "default")).lower(), PROMPT_PROFILES["default"]
+        )
+        self._active_profile_tools = profile.get("allowed_tools")
+        self._active_profile_readonly = bool(profile.get("read_only"))
+        system_text = api_messages[0]["content"]
+        if agent_mode == "build" and cfg_prompt.get("plan_first", True):
+            system_text += (
+                "\n\nWORK STYLE: For multi-step tasks, begin your reply with a 1-3 line plan "
+                "(short bullets) before the first tool call."
+            )
+        if profile["prompt"]:
+            system_text += f"\n\n{profile['prompt']}"
+        api_messages[0]["content"] = system_text
+
         units: list[list[dict[str, Any]]] = []
         for m in session.messages:
             if m.role == "user":
@@ -601,6 +684,14 @@ class AgentEngine:
                     if on_thinking is not None:
                         await on_thinking(False)
 
+                if _step == 0 and content and tool_calls and on_status is not None:
+                    first_line = next((ln.strip() for ln in content.splitlines() if ln.strip()), "")
+                    if first_line:
+                        try:
+                            await on_status(f"план: {first_line[:64]}")
+                        except Exception:
+                            logger.debug("status hook failed", exc_info=True)
+
                 if not tool_calls:
                     # The reply must carry the text of every step of the turn,
                     # not just the last one (search/export/next-context depend on it).
@@ -635,10 +726,14 @@ class AgentEngine:
 
             return f"Достигнут лимит шагов вызова инструментов ({max_steps})."
 
-        if self.http_client is not None:
-            return await _drive_steps(self.http_client)
-        async with httpx.AsyncClient(timeout=75.0, limits=HTTP_LIMITS) as client:
-            return await _drive_steps(client)
+        try:
+            if self.http_client is not None:
+                return await _drive_steps(self.http_client)
+            async with httpx.AsyncClient(timeout=75.0, limits=HTTP_LIMITS) as client:
+                return await _drive_steps(client)
+        finally:
+            self._active_profile_tools = None
+            self._active_profile_readonly = False
 
     @staticmethod
     def _parse_tool_args(raw_args: Any) -> dict[str, Any]:
@@ -677,6 +772,18 @@ class AgentEngine:
         async def _safe_invoke(name: str, args: dict[str, Any]) -> ToolResult:
             # One crashed tool must not kill the whole turn: report it to the
             # model as a failed tool result and keep going.
+            if self._active_profile_readonly and name in {"write", "edit", "multi_edit", "apply_patch"}:
+                return ToolResult(
+                    False,
+                    "rejected by profile",
+                    "The active prompt profile is read-only; the tool was not run.",
+                )
+            if self._active_profile_tools is not None and name not in self._active_profile_tools:
+                return ToolResult(
+                    False,
+                    "rejected by profile",
+                    f"Tool `{name}` is not allowed by the active prompt profile.",
+                )
             try:
                 return await invoke_tool(name, args)
             except asyncio.CancelledError:
@@ -751,8 +858,8 @@ class AgentEngine:
     ) -> tuple[bool, str, list[dict[str, Any]]]:
         payload: dict[str, Any] = {
             "model": model_id,
-            "messages": messages,
-            "tools": OPENAI_TOOLS_SCHEMA,
+            "messages": self._cached_messages(url, messages),
+            "tools": self._tools_for_payload(),
             "tool_choice": "auto",
             "stream": True,
         }
@@ -925,8 +1032,8 @@ class AgentEngine:
     ) -> tuple[bool, str, list[dict[str, Any]]]:
         payload: dict[str, Any] = {
             "model": model_id,
-            "messages": messages,
-            "tools": OPENAI_TOOLS_SCHEMA,
+            "messages": self._cached_messages(url, messages),
+            "tools": self._tools_for_payload(),
             "tool_choice": "auto",
         }
         effort = self._reasoning_effort(model_id)

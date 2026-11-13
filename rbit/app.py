@@ -47,7 +47,7 @@ from .models import (
 )
 from .storage import StorageManager
 from .themes import RBIT_DARK, RBIT_HIGH_CONTRAST, RBIT_LIGHT
-from .tools import VIRTUAL_ATTACHMENTS, ToolExecutor
+from .tools import MUTATING_TOOLS, VIRTUAL_ATTACHMENTS, ToolExecutor
 from .widgets import (
     AgentModeBadge,
     AssistantMessageCard,
@@ -495,6 +495,7 @@ class RbitApp(App[None]):
         self.busy_status: str = ""
         self._busy_worker: Any = None
         self._queued_prompt: str | None = None
+        self._auto_fix_round: bool = False
         self._spin_frame: int = 0
         self._has_inline_notices: bool = False
         self._sidebar_override_on_home: bool = False
@@ -1201,6 +1202,49 @@ class RbitApp(App[None]):
         scroll.mount(Static(text, classes="system-notice"))
         self._smart_scroll_end()
 
+    def _build_self_check_message(self, reply: ChatMessage) -> ChatMessage | None:
+        """Runs diagnostics on files mutated this turn; returns a fix prompt when broken."""
+        mutated: list[str] = []
+        seen: set[str] = set()
+        for tc in reply.tool_calls:
+            if tc.name not in MUTATING_TOOLS:
+                continue
+            args = tc.arguments or {}
+            raw = args.get("filePath") or args.get("path")
+            if not raw:
+                continue
+            try:
+                rel = self.executor.rel_display(self.executor.resolve_path(str(raw)))
+            except Exception:
+                continue
+            if rel not in seen:
+                seen.add(rel)
+                mutated.append(rel)
+        if not mutated:
+            return None
+        problems: list[str] = []
+        for rel in mutated:
+            res = self.executor._tool_diagnostics({"filePath": rel})
+            m = re.search(r"(\d+) issues", (res.summary or "").lower())
+            if m and int(m.group(1)) > 0:
+                problems.append(f"`{rel}` — {res.output[:400]}")
+        if not problems:
+            return None
+        self._post_notice(
+            "⚠ Self-check: проблемы в изменённых файлах — запускаю авто-фикс (1 круг):\n\n"
+            + "\n\n".join(problems)
+        )
+        return ChatMessage(
+            id=short_id(),
+            role="user",
+            content=(
+                "[auto] Self-check found problems in the files you just changed:\n\n"
+                + "\n\n".join(problems)
+                + "\n\nFix them. Do not touch unrelated files."
+            ),
+            agent=self.agent_mode,
+        )
+
     def _show_thinking(self) -> None:
         if self._thinking is not None:
             return
@@ -1811,10 +1855,10 @@ class RbitApp(App[None]):
                 await self._live_card.update_stream(partial_md)
             self._smart_scroll_end()
 
-        try:
-            reply = await self.engine.run_turn(
+        async def run_engine_once(msg: ChatMessage) -> ChatMessage:
+            return await self.engine.run_turn(
                 session=session,
-                user_msg=user_msg,
+                user_msg=msg,
                 agent_mode=self.agent_mode,
                 model_id=model_id,
                 on_tool_start=on_tool_start,
@@ -1824,6 +1868,9 @@ class RbitApp(App[None]):
                 on_thinking=on_thinking,
                 on_reasoning_chunk=on_reasoning_chunk,
             )
+
+        try:
+            reply = await run_engine_once(user_msg)
             if self._interrupted_turn:
                 self._live_card = None
                 return
@@ -1836,6 +1883,31 @@ class RbitApp(App[None]):
             else:
                 scroll.mount(AssistantMessageCard(reply, self.engine.extra_models))
             self._smart_scroll_end()
+
+            # Self-check: diagnostics over files mutated this turn; a single
+            # automatic fix round when something is broken.
+            if (
+                self.config_data.get("self_check", True)
+                and not self._auto_fix_round
+                and any(tc.name in MUTATING_TOOLS for tc in reply.tool_calls)
+            ):
+                fix_msg = self._build_self_check_message(reply)
+                if fix_msg is not None:
+                    self._auto_fix_round = True
+                    try:
+                        session.messages.append(fix_msg)
+                        self._schedule_save_session(delay=0.05)
+                        scroll.mount(UserMessageCard(fix_msg))
+                        self._smart_scroll_end()
+                        fix_reply = await run_engine_once(fix_msg)
+                        if not self._interrupted_turn:
+                            session.messages.append(fix_reply)
+                            self._schedule_save_session(delay=0.05)
+                            self._live_card = None
+                            scroll.mount(AssistantMessageCard(fix_reply, self.engine.extra_models))
+                            self._smart_scroll_end()
+                    finally:
+                        self._auto_fix_round = False
         except asyncio.CancelledError:
             raise
         except Exception as exc:

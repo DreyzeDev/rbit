@@ -1,0 +1,67 @@
+name: "rbit run"
+description: >-
+  Run the rbit AI coding agent headless on a task inside your workflow
+  and collect its JSONL event stream as an artifact.
+author: "DreyzeDev"
+
+branding:
+  icon: "terminal"
+  color: "teal"
+
+inputs:
+  task:
+    description: "Task for rbit to perform, e.g. 'fix the failing test in tests/test_app.py'."
+    required: true
+  model:
+    description: "Model ID override passed to `rbit run -m` (OpenRouter / OpenAI / DeepSeek / Ollama). Optional."
+    required: false
+    default: ""
+  github-token:
+    description: "Token used for checking out the repository."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  output-file:
+    description: "Path to the JSONL event stream produced by rbit."
+    value: rbit-output.jsonl
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        token: ${{ inputs.github-token }}
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install rbit
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install .
+
+    # The agent reads RBIT_API_KEY / OPENROUTER_API_KEY / OPENAI_API_KEY from the
+    # environment, or falls back to the built-in offline smart-local agent.
+    # Provide the key on the calling workflow step:
+    #   secrets: inherit  (with RBIT_API_KEY in repo secrets)
+    #   env: RBIT_API_KEY: ${{ secrets.RBIT_API_KEY }}
+    - name: Run rbit
+      shell: bash
+      env:
+        RBIT_TASK: ${{ inputs.task }}
+        RBIT_MODEL: ${{ inputs.model }}
+      run: |
+        args=(run --output-format jsonl)
+        if [ -n "$RBIT_MODEL" ]; then
+          args+=(-m "$RBIT_MODEL")
+        fi
+        rbit "${args[@]}" "$RBIT_TASK" | tee rbit-output.jsonl
+
+    - name: Upload rbit output
+      uses: actions/upload-artifact@v4
+      with:
+        name: rbit-output
+        path: rbit-output.jsonl

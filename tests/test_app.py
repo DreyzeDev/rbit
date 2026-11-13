@@ -3136,3 +3136,128 @@ async def test_tool_args_streaming_status_hint(tmp_path: Path) -> None:
     assert any("стрим аргументов: write" in s for s in statuses)
     assert statuses[-1] == ""
     assert tool_calls and len(tool_calls[0]["function"]["arguments"]) == 600
+
+
+@pytest.mark.asyncio
+async def test_prompt_profile_filters_tools_and_prompt(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "test", "prompt_profile": "reviewer"}
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        tool_names = [t["function"]["name"] for t in body["tools"]]
+        assert "write" not in tool_names and "bash" not in tool_names
+        assert "PROFILE: reviewer" in body["messages"][0]["content"]
+        assert "1-3 line plan" in body["messages"][0]["content"]
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ок, план готов"}}]})
+
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def _noop_status(_s: str) -> None:
+        return None
+
+    async def _noop_tool(name: str, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(True, "ok", "ok")
+
+    reply = await engine._run_openai_compatible(
+        session=Session(),
+        user_msg=ChatMessage(id="u1", role="user", content="review this"),
+        agent_mode="build",
+        model_id="openai/gpt-4.1",
+        api_base="https://mock.local/v1",
+        api_key="test",
+        invoke_tool=_noop_tool,
+        on_status=_noop_status,
+        on_stream_chunk=None,
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert "ок, план готов" in reply
+    assert engine._active_profile_tools is None  # reset after the run
+
+
+@pytest.mark.asyncio
+async def test_profile_readonly_blocks_mutating_tool(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "test", "prompt_profile": "reviewer"}
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+    engine._active_profile_readonly = True
+    messages: list[dict[str, Any]] = []
+    tool_calls = [
+        {"id": "c1", "type": "function", "function": {"name": "write", "arguments": "{}"}}
+    ]
+
+    async def must_not_run(name: str, args: dict[str, Any]) -> ToolResult:
+        raise AssertionError("mutating tool must not run under reviewer profile")
+
+    await engine._dispatch_tool_calls(
+        tool_calls=tool_calls, api_messages=messages, invoke_tool=must_not_run, on_status=None
+    )
+    assert messages[-1]["role"] == "tool"
+    assert "read-only" in messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_prompt_caching_marks_system_for_openrouter(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "test", "prompt_caching": "auto"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        system = body["messages"][0]
+        assert isinstance(system["content"], list)
+        assert system["content"][0]["cache_control"] == {"type": "ephemeral"}
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ok, text, _ = await engine._non_stream_chat_step(
+        client=engine.http_client,
+        url="https://openrouter.ai/api/v1/chat/completions",
+        headers={},
+        model_id="openai/gpt-4.1",
+        messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}],
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_self_check_runs_one_fix_round(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    app.config_data["model"] = "rbit/smart-local"
+    (tmp_path / "broken.py").write_text("def f(:\n", encoding="utf-8")
+    calls = {"n": 0}
+
+    async def fake_run_turn(**kwargs):
+        calls["n"] += 1
+        user_content = kwargs["user_msg"].content
+        if calls["n"] == 1:
+            assert "[auto]" not in user_content
+            return ChatMessage(
+                id="a1", role="assistant", content="правлю",
+                agent="build", model="m", duration_s=0.1,
+                tool_calls=[ToolCallRecord(
+                    id="t1", name="write", arguments={"filePath": "broken.py"},
+                    status="success", summary="(+1 -1)", output="ok", diff="",
+                    duration_ms=1,
+                )],
+            )
+        assert "[auto]" in user_content and "broken.py" in user_content
+        return ChatMessage(id="a2", role="assistant", content="исправлено", agent="build", model="m", duration_s=0.1)
+
+    app.engine.run_turn = fake_run_turn
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        user = ChatMessage(id="u1", role="user", content="почини файл")
+        app.session.messages.append(user)
+        app._execute_agent_turn(user)
+        for _ in range(300):
+            await pilot.pause()
+            if not app.is_busy:
+                break
+        await pilot.pause()
+    assert calls["n"] == 2
+    assert any("[auto]" in m.content for m in app.session.messages if m.role == "user")

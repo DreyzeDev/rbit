@@ -1,0 +1,44 @@
+# Winget manifest TEMPLATE for rbit (DreyzeDev.rbit)
+#
+# This is a starting point, not a publishable manifest. Before submitting to
+# microsoft/winget-pkgs (manifests/d/DreyzeDev/rbit/<version>/DreyzeDev.rbit.yaml):
+#   1. Replace PackageVersion with the real release version (tag without the "v" prefix).
+#   2. Point InstallerUrl at the actual GitHub release asset (zip with rbit.exe inside).
+#   3. Compute InstallerSha256:  powershell -c "Get-FileHash <installer-zip> -Algorithm SHA256"
+#   4. Validate locally:        winget validate --manifest <this-file>
+#
+# PackageVersion: 0.0.0 is a placeholder.
+
+PackageIdentifier: DreyzeDev.rbit
+PackageName: rbit
+PackageVersion: 0.0.0
+Publisher: DreyzeDev
+PublisherUrl: https://github.com/DreyzeDev
+PublisherSupportUrl: https://github.com/DreyzeDev/rbit/issues
+Author: DreyzeDev
+Moniker: rbit
+License: MIT
+LicenseUrl: https://github.com/DreyzeDev/rbit/blob/main/LICENSE
+ShortDescription: Next-Gen Full-Screen Terminal AI Coding Agent & CLI
+Description: >-
+  rbit is an autonomous full-screen terminal AI coding agent. It edits code,
+  searches projects, runs commands, keeps project memory and rewinds changes
+  without Git. Includes a headless CLI mode (rbit run) for CI automation.
+Tags:
+  - ai
+  - agent
+  - cli
+  - terminal
+  - coding
+  - tui
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: rbit.exe
+        PortableCommandAlias: rbit
+    InstallerUrl: https://github.com/DreyzeDev/rbit/releases/download/v0.0.0/rbit-0.0.0-windows-x64.zip
+    InstallerSha256: "<SHA256-PLACEHOLDER>"
+ManifestType: singleton
+ManifestVersion: 1.6.0
