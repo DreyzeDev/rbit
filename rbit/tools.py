@@ -69,7 +69,7 @@ READONLY_BASH_PREFIXES = (
 )
 
 READONLY_TOOLS: frozenset[str] = frozenset(
-    {"read", "glob", "grep", "webfetch", "diagnostics", "lint", "symbols", "git"}
+    {"read", "glob", "grep", "webfetch", "diagnostics", "lint", "symbols", "git", "list_changes"}
 )
 
 MUTATING_TOOLS: frozenset[str] = frozenset({"write", "edit", "multi_edit", "apply_patch"})
@@ -739,6 +739,8 @@ class ToolExecutor:
                 res = await self._tool_lint(args)
             elif name == "notebook":
                 res = self._tool_notebook(args)
+            elif name == "list_changes":
+                res = self._tool_list_changes(args)
             elif name == "todowrite":
                 res = self._tool_todowrite(args)
             elif name == "webfetch":
@@ -1590,6 +1592,18 @@ class ToolExecutor:
             return ToolResult(True, f"cell #{index} deleted", f"Cell #{index} removed from {rel}.")
         return ToolResult(False, "unknown action", "action must be read | set_cell | insert_cell | delete_cell.")
 
+    def _tool_list_changes(self, args: dict[str, Any]) -> ToolResult:
+        """Summary of the files this session has modified (for the agent's own awareness)."""
+        files = self.session.modified_files
+        if not files:
+            return ToolResult(True, "no changes", "No files modified in this session yet.")
+        lines = ["Files modified in this session:"]
+        for rel, st in list(files.items())[-30:]:
+            lines.append(f"  {rel}  [+{st.added} -{st.removed}]")
+        if self.undo_stack:
+            lines.append(f"\nLast change: {self.undo_stack[-1].step_label}")
+        return ToolResult(True, f"{len(files)} file(s) modified", "\n".join(lines))
+
     def _tool_todowrite(self, args: dict[str, Any]) -> ToolResult:
         raw_todos = args.get("todos", [])
         items: list[TodoItem] = []
@@ -2033,8 +2047,9 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "goal": {"type": "string", "description": "What to investigate in the workspace."},
+                    "goal": {"type": "string"},
                     "agent": {"type": "string", "enum": ["explore"]},
+                    "background": {"type": "boolean", "description": "Run without blocking the current turn."}
                 },
                 "required": ["goal"],
             },
@@ -2101,6 +2116,16 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
     },
 ]
 
+OPENAI_TOOLS_SCHEMA.append(
+    {
+        "type": "function",
+        "function": {
+            "name": "list_changes",
+            "description": "Summary of the files modified in this session (paths and +/- line stats), for self-awareness.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+)
 OPENAI_TOOLS_SCHEMA.append(
     {
         "type": "function",

@@ -464,6 +464,8 @@ class RbitApp(App[None]):
         Binding("ctrl+shift+e", "collapse_all_cards", "Collapse cards", show=False),
         Binding("ctrl+r", "retry_last", "Retry", show=False),
         Binding("ctrl+h", "history_search", "Prompt history", show=False),
+        Binding("ctrl+shift+right", "sidebar_wider", "Sidebar wider", show=False),
+        Binding("ctrl+shift+left", "sidebar_narrower", "Sidebar narrower", show=False),
         Binding("f1", "show_help", "Help", show=False),
         Binding("escape", "interrupt_or_close", "Interrupt", show=False),
         Binding("ctrl+q", "quit", "Quit", show=False),
@@ -499,6 +501,7 @@ class RbitApp(App[None]):
         self._busy_worker: Any = None
         self._queued_prompt: str | None = None
         self._auto_fix_round: bool = False
+        self._sidebar_width: int = max(24, min(60, int(self.config_data.get("sidebar_width", 34))))
         self._stream_chars: int = 0
         self._spin_frame: int = 0
         self._has_inline_notices: bool = False
@@ -532,6 +535,18 @@ class RbitApp(App[None]):
             get_config=lambda: self.config_data,
             storage=self.storage,
         )
+
+        async def _on_background_done(msg: ChatMessage) -> None:
+            self.session.messages.append(msg)
+            self.storage.save_session(self.session)
+            try:
+                scroll = self.query_one("#chat-scroll", ChatScroll)
+                scroll.mount(AssistantMessageCard(msg, self.engine.extra_models))
+                self._smart_scroll_end()
+            except NoMatches:
+                pass
+
+        self.engine.on_background_done = _on_background_done
         self._pending_commit: str = ""
 
     def compose(self) -> ComposeResult:
@@ -706,6 +721,7 @@ class RbitApp(App[None]):
             header.display = True
             scroll.display = True
             sidebar.display = bool(self.config_data.get("sidebar_visible", True)) and not self._is_compact
+            sidebar.styles.width = self._sidebar_width
 
     def on_resize(self, event: events.Resize) -> None:
         self._update_layout_mode()
@@ -1337,6 +1353,110 @@ class RbitApp(App[None]):
             self.notify(f"Контекст {pct:.0f}% — авто-компакция…", timeout=3.0)
             self._busy_worker = self._compact_context()
 
+    @work
+    async def _cmd_continue_session(self, arg: str) -> None:
+        """/continue <id|prefix> — вплетает выжимку другой сессии в текущую."""
+        arg = arg.strip()
+        if not arg:
+            self.notify("Usage: /continue <session-id|prefix>", severity="warning")
+            return
+        other = self.storage.find_session(arg)
+        if not other:
+            self.notify(f"Session not found: {arg}", severity="warning")
+            return
+        if other.id == self.session.id:
+            self.notify("Это и есть текущая сессия.", timeout=2.0)
+            return
+        self.notify("Собираю выжимку…", timeout=2.0)
+        msgs = other.messages[-12:] if len(other.messages) > 12 else other.messages
+        summary = await self.engine.summarize_session(
+            msgs, self.config_data.get("model", "rbit/smart-local")
+        )
+        ctx = ChatMessage(
+            id=short_id(),
+            role="user",
+            agent=self.agent_mode,
+            content=(
+                f"[Контекст из сессии «{other.title}»]\n\n{summary}\n\n"
+                "Учитывай это в дальнейшей работе."
+            ),
+        )
+        self.session.messages.append(ctx)
+        self.storage.save_session(self.session)
+        scroll = self.query_one("#chat-scroll", ChatScroll)
+        scroll.mount(UserMessageCard(ctx))
+        self._smart_scroll_end()
+
+    def _skills_dir(self) -> Path:
+        return self.workspace / ".rbit" / "skills"
+
+    def _load_skills(self) -> dict[str, dict[str, str]]:
+        """name → meta (description/mode/attach) + body, from .rbit/skills/*.md."""
+        skills: dict[str, dict[str, str]] = {}
+        d = self._skills_dir()
+        if not d.exists():
+            return skills
+        for f in sorted(d.glob("*.md")):
+            text = f.read_text(encoding="utf-8", errors="replace")
+            meta = {"description": "", "mode": "", "attach": "", "body": text}
+            if text.startswith("---"):
+                end = text.find("---", 3)
+                if end != -1:
+                    header = text[3:end]
+                    meta["body"] = text[end + 3:].strip()
+                    for line in header.splitlines():
+                        if ":" in line:
+                            k, v = line.split(":", 1)
+                            meta[k.strip().lower()] = v.strip()
+            skills[f.stem] = meta
+        return skills
+
+    def _cmd_skill(self, arg: str) -> None:
+        skills = self._load_skills()
+        parts = arg.split(maxsplit=1)
+        if not parts or not parts[0]:
+            if not skills:
+                self.notify("Нет скиллов. Создай .rbit/skills/<name>.md", severity="warning")
+                return
+            lines = ["[bold #eeeeee]Skills[/]"]
+            for name, meta in skills.items():
+                lines.append(
+                    f"  • [bold]{name}[/] — {meta.get('description') or '(no description)'}"
+                    f"  → /skill {name}"
+                )
+            self._post_notice("\n".join(lines))
+            return
+        name = parts[0].strip()
+        if name not in skills:
+            self.notify(f"Skill not found: {name}", severity="warning")
+            return
+        meta = skills[name]
+        args_text = parts[1].strip() if len(parts) > 1 else ""
+        body = meta.get("body", "")
+        prompt = body.replace("{args}", args_text)
+        if args_text and "{args}" not in body:
+            prompt = f"{prompt}\n\n{args_text}"
+        if meta.get("mode") in ("build", "plan"):
+            self.agent_mode = meta["mode"]
+        attach_refs = " ".join(
+            f"@{a.strip()}" for a in meta.get("attach", "").split(",") if a.strip()
+        )
+        if attach_refs:
+            prompt = f"{prompt}\n\n{attach_refs}"
+        self._submit_prompt(prompt)
+
+    def action_sidebar_wider(self) -> None:
+        self._resize_sidebar(+6)
+
+    def action_sidebar_narrower(self) -> None:
+        self._resize_sidebar(-6)
+
+    def _resize_sidebar(self, delta: int) -> None:
+        self._sidebar_width = max(24, min(60, self._sidebar_width + delta))
+        self.config_data["sidebar_width"] = self._sidebar_width
+        self.storage.save_config(self.config_data)
+        self._update_layout_mode()
+
     def _cmd_mcp(self, arg: str) -> None:
         """Manages configured MCP server entries in config (launching is a future step)."""
         servers = self.config_data.get("mcp_servers")
@@ -1793,6 +1913,12 @@ class RbitApp(App[None]):
             return True
         if cmd in ("/mcp", "/mcp-servers"):
             self._cmd_mcp(arg)
+            return True
+        if cmd == "/continue":
+            self._run_coro(self._cmd_continue_session(arg))
+            return True
+        if cmd in ("/skill", "/skills"):
+            self._cmd_skill(arg)
             return True
         if cmd == "/macro":
             self._run_coro(self._cmd_macro(arg))

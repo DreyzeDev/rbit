@@ -377,8 +377,33 @@ class SessionHeaderBar(Static):
         return grid
 
 
+def _image_halfblocks(path: Path, cols: int = 28) -> Text:
+    """Renders an image as terminal halfblock art (requires Pillow)."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return Text("(preview unavailable: pip install Pillow)", style="#8a8a8a")
+    im = Image.open(path).convert("RGB")
+    rows = max(8, cols // 2)
+    im = im.resize((cols, rows * 2))
+    px = im.load()
+    t = Text()
+    for y in range(0, rows * 2, 2):
+        for x in range(cols):
+            top = px[x, y]
+            bottom = px[x, min(y + 1, rows * 2 - 1)]
+            t.append(
+                "▀",
+                style=f"#{top[0]:02x}{top[1]:02x}{top[2]:02x} on #{bottom[0]:02x}{bottom[1]:02x}{bottom[2]:02x}",
+            )
+        t.append("\n")
+    return t
+
+
 class UserMessageCard(Static):
     """User message block: #141414 panel with thick agent-colored left border."""
+
+    IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
     def __init__(self, msg: ChatMessage) -> None:
         super().__init__(classes=f"user-card mode-{msg.agent}")
@@ -393,6 +418,12 @@ class UserMessageCard(Static):
                 att_line.append(f" @{att} ", style="bold #0a0a0a on #fab283")
                 att_line.append(" ")
             parts.append(att_line)
+            for att in self.msg.attachments:
+                if Path(att).suffix.lower() in self.IMAGE_EXTS:
+                    try:
+                        parts.append(_image_halfblocks(Path(att)))
+                    except Exception:
+                        continue
         return Group(*parts)
 
 

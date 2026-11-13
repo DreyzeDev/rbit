@@ -228,6 +228,8 @@ class AgentEngine:
         self.retry_base_delay = 0.6
         self.retry_max_delay = 8.0
         self._provider_models_synced_at = 0.0
+        self._bg_tasks: set = set()
+        self.on_background_done = None  # async callable(ChatMessage) for GUI hooks
         self.last_api_latency: float | None = None
         self._active_profile_tools: set[str] | None = None
         self._active_profile_readonly: bool = False
@@ -502,6 +504,7 @@ class AgentEngine:
                     model_id=remote_model_id if use_remote else "",
                     api_base=effective_base if use_remote else "",
                     api_key=api_key or "ollama",
+                    session=session,
                 )
             else:
                 res = await self.executor.execute(name, args, agent_mode=agent_mode)
@@ -1511,6 +1514,7 @@ class AgentEngine:
         model_id: str,
         api_base: str,
         api_key: str,
+        session: Session | None = None,
     ) -> ToolResult:
         t0 = time.perf_counter()
         goal = str(args.get("goal") or "").strip()
@@ -1521,6 +1525,9 @@ class AgentEngine:
             return ToolResult(
                 False, f"unsupported agent: {kind}", 'Only agent="explore" is supported for now.'
             )
+
+        if args.get("background"):
+            return self._start_background_subagent(goal, model_id, api_base, api_key, session)
 
         if model_id and api_base:
             text = await self._explore_with_llm(goal, model_id, api_base, api_key)
@@ -1533,6 +1540,61 @@ class AgentEngine:
             f"explore · {len(text)} chars",
             f"Subagent explore result for: {goal}\n\n{text}",
             duration_ms=duration,
+        )
+
+    def _start_background_subagent(
+        self,
+        goal: str,
+        model_id: str,
+        api_base: str,
+        api_key: str,
+        session: Session | None,
+    ) -> ToolResult:
+        """Launches an explore subagent that does NOT block the current turn;
+        the result lands in the chat (and the session file) when ready."""
+        started_at = time.strftime("%H:%M")
+
+        async def runner() -> None:
+            try:
+                if model_id and api_base:
+                    text = await self._explore_with_llm(goal, model_id, api_base, api_key)
+                else:
+                    text = await self._explore_deterministic(goal)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("background subagent failed", exc_info=True)
+                text = f"Subagent failed: {type(exc).__name__}: {exc}"
+            msg = ChatMessage(
+                id=short_id(),
+                role="assistant",
+                content=(
+                    f"**[Subagent · background]** `{goal}`\n\n{text}\n\n"
+                    f"*(запущен в {started_at}, готов — вывод выше)*"
+                ),
+                agent="build",
+                model="subagent",
+                tokens=max(12, count_tokens(text)),
+            )
+            if session is not None:
+                session.messages.append(msg)
+                self.storage.save_session(session)
+            if self.on_background_done is not None:
+                try:
+                    await self.on_background_done(msg)
+                except Exception:
+                    logger.debug("background done callback failed", exc_info=True)
+
+        task = asyncio.create_task(runner())
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return ToolResult(
+            True,
+            f"background subagent started ({time.strftime('%H:%M')})",
+            f"Explore subagent started in the BACKGROUND for: {goal}\n"
+            "The current turn continues without waiting. The result will be posted "
+            "to the chat (and saved to the session) when the subagent finishes.",
+            duration_ms=0,
         )
 
     @staticmethod
