@@ -222,6 +222,25 @@ class PromptSubHints(Static):
         return grid
 
 
+class ThinkingIndicator(Static):
+    """Inline chat line shown while the agent is reasoning or running a tool."""
+
+    def __init__(self) -> None:
+        super().__init__(classes="thinking-line")
+        self._frame = 0
+
+    def tick(self, frame: int) -> None:
+        self._frame = frame
+        self.refresh()
+
+    def render(self) -> Text:
+        spin = SPINNER_FRAMES[self._frame % len(SPINNER_FRAMES)]
+        t = Text()
+        t.append(f"{spin} ", style="bold #f5a742")
+        t.append("Thinking...", style="bold #f5a742")
+        return t
+
+
 class SessionHeaderBar(Static):
     """Top session bar: '# Session Title' on the left, 'tokens (%) $cost' on the right."""
 

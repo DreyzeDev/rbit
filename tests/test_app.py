@@ -2479,3 +2479,23 @@ async def test_previous_tool_results_are_replayed_in_history(tmp_path: Path) -> 
     assert call["function"]["name"] == "read"
     assert "a.py" in call["function"]["arguments"]
     assert [m["role"] for m in messages][-1] == "user"
+
+@pytest.mark.asyncio
+async def test_thinking_indicator_appears_and_clears(tmp_path: Path) -> None:
+    from rbit.widgets import ThinkingIndicator
+
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        app._show_thinking()
+        await pilot.pause()
+        assert app._thinking is not None
+        scroll = app.query_one("#chat-scroll")
+        assert scroll.children[-1] is app._thinking
+        app._thinking.tick(3)
+        await pilot.pause()
+        assert "Thinking..." in app._thinking.render().plain
+        app._hide_thinking()
+        await pilot.pause()
+        assert app._thinking is None
+        assert len(list(app.query(ThinkingIndicator))) == 0

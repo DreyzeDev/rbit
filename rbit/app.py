@@ -57,6 +57,7 @@ from .widgets import (
     PromptSubHints,
     SessionHeaderBar,
     SidebarPanel,
+    ThinkingIndicator,
     ToolCallCard,
     UserMessageCard,
     detect_git_branch,
@@ -194,6 +195,12 @@ Screen {
 
 .tool-card:hover {
     background: #101010;
+}
+
+.thinking-line {
+    height: 1;
+    padding: 0 0 0 2;
+    margin: 0 0 1 0;
 }
 
 .assistant-card {
@@ -489,6 +496,7 @@ class RbitApp(App[None]):
         self._tool_widgets: dict[str, ToolCallCard] = {}
         self._save_timer: Timer | None = None
         self._live_card: AssistantMessageCard | None = None
+        self._thinking: ThinkingIndicator | None = None
         self._interrupted_turn: bool = False
         self._history_window: int = 30
         self._last_error: str = ""
@@ -598,6 +606,8 @@ class RbitApp(App[None]):
                 mode=self.agent_mode,
                 frame=self._spin_frame,
             )
+            if self._thinking is not None:
+                self._thinking.tick(self._spin_frame)
 
     @property
     def _is_home_state(self) -> bool:
@@ -1112,6 +1122,23 @@ class RbitApp(App[None]):
         scroll.mount(Static(text, classes="system-notice"))
         self._smart_scroll_end()
 
+    def _show_thinking(self) -> None:
+        if self._thinking is not None:
+            return
+        self._thinking = ThinkingIndicator()
+        self.query_one("#chat-scroll", ChatScroll).mount(self._thinking)
+        self._smart_scroll_end()
+
+    def _hide_thinking(self) -> None:
+        widget = self._thinking
+        self._thinking = None
+        if widget is None:
+            return
+        try:
+            widget.remove()
+        except Exception:
+            pass
+
     def _smart_scroll_end(self) -> None:
         """Follows new output only while the user is already at the bottom."""
         self.query_one("#chat-scroll", ChatScroll).follow_end()
@@ -1603,11 +1630,15 @@ class RbitApp(App[None]):
         self._interrupted_turn = False
         self.session.finished = False
         self._schedule_save_session(delay=0.05)
+        self._show_thinking()
 
         async def on_tool_start(rec: ToolCallRecord) -> None:
             card = ToolCallCard(rec)
             self._tool_widgets[rec.id] = card
-            scroll.mount(card)
+            if self._thinking is not None:
+                scroll.mount(card, before=self._thinking)
+            else:
+                scroll.mount(card)
             self._smart_scroll_end()
 
         async def on_tool_end(rec: ToolCallRecord) -> None:
@@ -1634,7 +1665,10 @@ class RbitApp(App[None]):
                 self._live_card = AssistantMessageCard(
                     draft, self.engine.extra_models, live=True
                 )
-                scroll.mount(self._live_card)
+                if self._thinking is not None:
+                    scroll.mount(self._live_card, before=self._thinking)
+                else:
+                    scroll.mount(self._live_card)
             else:
                 await self._live_card.update_stream(partial_md)
             self._smart_scroll_end()
@@ -1672,6 +1706,7 @@ class RbitApp(App[None]):
                 hint = " Check the provider with `/connect`."
             self._post_notice(f"✗ Error: {exc}\n\nPress `Ctrl+R` to retry the last prompt.{hint}")
         finally:
+            self._hide_thinking()
             self.session.finished = True
             self._schedule_save_session(delay=0.05)
             self.is_busy = False
