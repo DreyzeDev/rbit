@@ -73,13 +73,13 @@ code, pre { font-family: ui-monospace, Consolas, monospace; }
   flex: 1; overflow-y: auto; padding: 20px 24px;
   display: flex; flex-direction: column; justify-content: flex-end;
 }
-body.home #feed { justify-content: center; }
+body.home #feed { justify-content: flex-start; padding-top: 13vh; }
 .wordmark {
   font-size: 110px; font-weight: 800; letter-spacing: 4px; color: #1f1f1f;
   text-align: center; user-select: none; line-height: 1;
 }
 body:not(.home) .wordmark { font-size: 40px; color: #202020; margin-bottom: 18px; }
-.tagline { color: var(--dim); text-align: center; margin: 10px 0 22px; }
+body.home .tagline { display: none; }
 .empty { color: var(--dim); margin: 20px 0; }
 
 .msg { margin: 12px 0; white-space: pre-wrap; word-break: break-word; }
