@@ -229,6 +229,9 @@ class SessionHeaderBar(Static):
         super().__init__(id="session-header")
         self._title = "New Session"
         self._stats = ""
+        self._used = 0
+        self._pct = 0
+        self._cost = 0.0
 
     def update_header(
         self,
@@ -242,6 +245,9 @@ class SessionHeaderBar(Static):
         cost = (used / 1000.0) * info.cost_per_1k
         self._title = session.title or "New Session"
         self._stats = f"{used:,}  {pct}% (${cost:.2f})"
+        self._used = used
+        self._pct = pct
+        self._cost = cost
         self.refresh()
 
     def render(self) -> Table:
@@ -251,7 +257,10 @@ class SessionHeaderBar(Static):
         left = Text()
         left.append("# ", style="bold #808080")
         left.append(self._title, style="bold #eeeeee")
-        right = Text(self._stats, style="#808080")
+        right = Text()
+        right.append(f"{self._used:,}", style="#c8c8c8")
+        right.append(f"  {self._pct}%", style="#808080")
+        right.append(f"  ${self._cost:.2f}", style="#808080")
         grid.add_row(left, right)
         return grid
 
@@ -423,22 +432,22 @@ class ToolCallCard(Static):
             line = Text()
             if name == "read":
                 fpath = args.get("filePath", ".")
-                line.append("→ ", style="#808080")
-                line.append(f"Read {fpath}", style="#808080")
+                line.append("→ ", style="#5c9cf5")
+                line.append(f"Read {fpath}", style="#a8a8a8")
             elif name == "glob":
                 pat = args.get("pattern", "*")
-                line.append("✱ ", style="#808080")
-                line.append(f'Glob "{pat}" ', style="#808080")
+                line.append("✱ ", style="#9d7cd8")
+                line.append(f'Glob "{pat}" ', style="#a8a8a8")
                 line.append(f"({rec.summary})", style="#585858")
             elif name == "grep":
                 pat = args.get("pattern", "")
-                line.append("✱ ", style="#808080")
-                line.append(f'Grep "{pat}" ', style="#808080")
+                line.append("✱ ", style="#9d7cd8")
+                line.append(f'Grep "{pat}" ', style="#a8a8a8")
                 line.append(f"({rec.summary})", style="#585858")
             elif name == "webfetch":
                 url = args.get("url", "")
                 line.append("↗ ", style="#5c9cf5")
-                line.append(f"WebFetch {url} ", style="#808080")
+                line.append(f"WebFetch {url} ", style="#a8a8a8")
                 line.append(f"({rec.summary})", style="#585858")
 
             if not self.expanded or not rec.output:
@@ -448,10 +457,17 @@ class ToolCallCard(Static):
 
         # 2. Symbols / diagnostics / lint / git / subagent
         if name in ("symbols", "diagnostics", "lint", "git", "subagent") and not is_err:
-            icons = {"symbols": "⌘", "diagnostics": "⚕", "lint": "⚑", "git": "⎇", "subagent": "⤷"}
+            icons = {
+                "symbols": ("⌘", "#5c9cf5"),
+                "diagnostics": ("⚕", "#fab283"),
+                "lint": ("⚑", "#e5c07b"),
+                "git": ("⎇", "#9d7cd8"),
+                "subagent": ("⤷", "#7fd88f"),
+            }
+            icon, icon_color = icons[name]
             line = Text()
-            line.append(f"{icons[name]} ", style="#808080")
-            line.append(f"{name.capitalize()} ", style="#808080")
+            line.append(f"{icon} ", style=icon_color)
+            line.append(f"{name.capitalize()} ", style="#a8a8a8")
             if rec.summary:
                 line.append(f"({rec.summary})", style="#585858")
             if not self.expanded or not rec.output:
@@ -464,8 +480,17 @@ class ToolCallCard(Static):
             fpath = args.get("filePath", "")
             verb = {"write": "Write", "edit": "Edit", "multi_edit": "MultiEdit", "apply_patch": "Patch"}[name]
             header = Text()
-            header.append("← " if not is_err else "✗ ", style="#808080" if not is_err else err_color)
-            header.append(f"{verb} {fpath} ", style="#eeeeee" if not is_err else err_color)
+            verb_color = {
+                "write": "#7fd88f",
+                "edit": "#fab283",
+                "multi_edit": "#fab283",
+                "apply_patch": "#9d7cd8",
+            }[name]
+            header.append(
+                "← " if not is_err else "✗ ",
+                style=verb_color if not is_err else err_color,
+            )
+            header.append(f"{verb} {fpath} ", style="#d8d8d8" if not is_err else err_color)
             _append_counts(
                 header,
                 rec.summary.replace(fpath, "").strip(),
@@ -553,10 +578,16 @@ class ToolCallCard(Static):
 class AssistantMessageCard(Vertical):
     """Assistant response: clean Markdown + '▣ Build · model · 1.2s' footer, with live streaming updates."""
 
-    def __init__(self, msg: ChatMessage, extra_models: list[ModelInfo] | None = None) -> None:
+    def __init__(
+        self,
+        msg: ChatMessage,
+        extra_models: list[ModelInfo] | None = None,
+        live: bool = False,
+    ) -> None:
         super().__init__(classes="assistant-card")
         self.msg = msg
         self.extra_models = extra_models
+        self._live = live
 
     def compose(self) -> ComposeResult:
         yield Markdown(self.msg.content, classes="assistant-md")
@@ -566,7 +597,12 @@ class AssistantMessageCard(Vertical):
         info = get_model_info(self.msg.model, self.extra_models)
         meta = Text()
         meta.append("▣ ", style=f"bold {agent_accent(self.msg.agent)}")
-        suffix = f" · {self.msg.duration_s:.1f}s" if self.msg.duration_s > 0 else " · streaming..."
+        if self.msg.duration_s > 0:
+            suffix = f" · {self.msg.duration_s:.1f}s"
+        elif self._live:
+            suffix = " · streaming..."
+        else:
+            suffix = ""
         meta.append(f"{self.msg.agent.capitalize()} · {info.name}{suffix}", style="#808080")
         if self.msg.interrupted:
             meta.append(" · interrupted", style="italic #e5c07b")
@@ -579,6 +615,7 @@ class AssistantMessageCard(Vertical):
 
     async def finalize(self, final_msg: ChatMessage) -> None:
         self.msg = final_msg
+        self._live = False
         await self.query_one(Markdown).update(final_msg.content)
         self.query_one(".assistant-meta", Static).update(self._build_meta_text())
 
@@ -628,8 +665,8 @@ class SidebarPanel(Vertical):
         pct = min(100, round((used / max(1, info.context_window)) * 100))
         cost = (used / 1000.0) * info.cost_per_1k
 
-        # 1. Session title
-        title_txt = Text(session.title or "New Session", style="bold #eeeeee")
+        # 1. Workspace
+        title_txt = Text(self.workspace.name or str(self.workspace), style="bold #eeeeee")
         self.query_one("#sb-title", Static).update(title_txt)
 
         # 2. Context
@@ -794,7 +831,11 @@ class BottomStatusBar(Static):
         grid.add_column(justify="right")
 
         left = Text()
-        left.append(self._cwd, style="#808080")
+        cwd = self._cwd
+        home = str(Path.home())
+        if cwd.startswith(home):
+            cwd = "~" + cwd[len(home):]
+        left.append(cwd, style="#808080")
         if self._branch:
             left.append(f":{self._branch}", style="#686868")
 

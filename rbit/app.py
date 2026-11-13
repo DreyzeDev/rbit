@@ -101,6 +101,13 @@ RBIT_TUI_CSS = """
 Screen {
     background: $background;
     color: $foreground;
+    scrollbar-background: transparent;
+    scrollbar-background-hover: transparent;
+    scrollbar-background-active: transparent;
+    scrollbar-color: #2e2e2e;
+    scrollbar-color-hover: #4a4a4a;
+    scrollbar-color-active: #fab283;
+    scrollbar-corner-color: transparent;
 }
 
 #workspace-row {
@@ -116,7 +123,7 @@ Screen {
 
 #center-stage.is-home {
     align: center middle;
-    padding: 0 2;
+    padding: 0 3;
 }
 
 #center-stage.is-session {
@@ -141,23 +148,31 @@ Screen {
 #session-header {
     width: 100%;
     height: auto;
-    background: $surface;
-    border-left: thick #323232;
-    padding: 1 2;
-    margin: 1 2 0 2;
+    background: transparent;
+    border-bottom: solid #1c1c1c;
+    padding: 0 3;
+    margin: 1 0 0 0;
 }
 
 /* --- Scrollable Session Feed --- */
 #chat-scroll {
     width: 1fr;
     height: 1fr;
-    padding: 1 2 0 2;
+    padding: 1 3 0 3;
     scrollbar-size-vertical: 1;
+    scrollbar-background: transparent;
+    scrollbar-background-hover: transparent;
+    scrollbar-background-active: transparent;
+    scrollbar-color: #2e2e2e;
+    scrollbar-color-hover: #4a4a4a;
+    scrollbar-color-active: #fab283;
+    scrollbar-corner-color: transparent;
 }
 
 .user-card {
-    background: $surface;
-    padding: 1 2;
+    background: transparent;
+    border-left: thick #3a3a3a;
+    padding: 0 2;
     margin: 1 0;
     height: auto;
 }
@@ -178,7 +193,7 @@ Screen {
 }
 
 .tool-card:hover {
-    background: $surface;
+    background: #101010;
 }
 
 .assistant-card {
@@ -234,14 +249,14 @@ Screen {
 
 #center-stage.is-session #prompt-outer {
     width: 100%;
-    padding: 0 2 1 2;
+    padding: 0 3 1 3;
 }
 
 #autocomplete-popup {
     display: none;
     max-height: 10;
     background: $surface;
-    border: tall #2a2a2a;
+    border: round #2a2a2a;
     margin-bottom: 1;
 }
 
@@ -249,15 +264,16 @@ Screen {
     width: 100%;
     height: auto;
     background: $surface;
-    padding: 1 2 0 2;
+    padding: 0 2;
+    border: round #2a2a2a;
 }
 
 #prompt-box.mode-build {
-    border-left: thick #fab283;
+    border: round #fab283;
 }
 
 #prompt-box.mode-plan {
-    border-left: thick #5c9cf5;
+    border: round #5c9cf5;
 }
 
 #prompt-input {
@@ -298,11 +314,11 @@ Screen {
 
 /* --- Flat Right Sidebar --- */
 #sidebar {
-    width: 40;
+    width: 36;
     height: 1fr;
     background: $surface;
-    border-left: vkey #1e1e1e;
-    padding: 1 2;
+    border-left: solid #1c1c1c;
+    padding: 1 1;
 }
 
 .sb-block {
@@ -332,7 +348,7 @@ ModalScreen {
     height: auto;
     max-height: 82%;
     background: $surface;
-    border: tall #282828;
+    border: round #2a2a2a;
     padding: 1 2;
 }
 
@@ -506,7 +522,7 @@ class RbitApp(App[None]):
                     yield AutocompletePopup()
                     with Vertical(id="prompt-box", classes="mode-build"):
                         yield Input(
-                            placeholder='Ask anything... "!git status", "@file", "/checkpoint"',
+                            placeholder="Ask anything...",
                             id="prompt-input",
                         )
                         with Horizontal(id="prompt-meta-row"):
@@ -1615,7 +1631,9 @@ class RbitApp(App[None]):
                     model=model_id,
                     duration_s=0.0,
                 )
-                self._live_card = AssistantMessageCard(draft, self.engine.extra_models)
+                self._live_card = AssistantMessageCard(
+                    draft, self.engine.extra_models, live=True
+                )
                 scroll.mount(self._live_card)
             else:
                 await self._live_card.update_stream(partial_md)
