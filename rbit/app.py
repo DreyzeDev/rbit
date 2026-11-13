@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import os
 import platform
 import re
 import shutil

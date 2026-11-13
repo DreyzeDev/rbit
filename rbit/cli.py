@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from rich.table import Table
 
 from . import __version__
 from .agent import AgentEngine, discover_ollama_models
+from .models import _migrate_session_dict
 from .app import RbitApp
 from .models import ChatMessage, Session, ToolCallRecord, get_model_info, short_id
 from .storage import StorageManager
@@ -934,7 +936,7 @@ def main(argv: list[str] | None = None) -> int:
             if fpath.suffix.lower() == ".json":
                 data = json.loads(text)
                 if isinstance(data, dict) and "messages" in data:
-                    data = _migrate_session_dict_public(data)
+                    data = _migrate_session_dict(data)
                     sess = Session.from_dict(data)
                     storage.save_session(sess)
                     Console().print(f"✓ Imported rbit session `{sess.id}` ({len(sess.messages)} messages)")
@@ -1167,7 +1169,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     from rbit.agent import AgentEngine
-    from rbit.models import ChatMessage, Session, short_id, _migrate_session_dict as _migrate_session_dict_public, Session, ToolCallRecord, short_id
+    from rbit.models import ChatMessage, Session, ToolCallRecord, short_id
     from rbit.tools import ToolExecutor
 
     workspace = _resolve_workspace(args.dir)
@@ -1176,7 +1178,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     model_id = str(cfg.get("model", "rbit/smart-local"))
     sessions: dict[str, Session] = {}
 
-    def run_turn_events(prompt_text: str, session: Session, sink: " _queue.Queue"):  # type: ignore[name-defined]
+    def run_turn_events(prompt_text: str, session: Session, sink: "_queue.Queue"):  # type: ignore[name-defined]
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
