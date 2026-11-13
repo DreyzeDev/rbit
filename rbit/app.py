@@ -123,7 +123,7 @@ Screen {
 
 #center-stage.is-home {
     align: center middle;
-    padding: 0 3;
+    padding: 0 2;
 }
 
 #center-stage.is-session {
@@ -148,37 +148,38 @@ Screen {
 #session-header {
     width: 100%;
     height: auto;
-    background: transparent;
-    border-bottom: solid #1c1c1c;
-    padding: 0 3;
-    margin: 1 0 0 0;
+    background: $surface;
+    border: solid #242424;
+    padding: 0 2;
+    margin: 1 2 0 2;
 }
 
 /* --- Scrollable Session Feed --- */
 #chat-scroll {
     width: 1fr;
     height: 1fr;
-    padding: 1 3 0 3;
+    padding: 1 2 0 2;
     scrollbar-size-vertical: 1;
     scrollbar-background: transparent;
     scrollbar-background-hover: transparent;
     scrollbar-background-active: transparent;
     scrollbar-color: #2e2e2e;
     scrollbar-color-hover: #4a4a4a;
-    scrollbar-color-active: #fab283;
+    scrollbar-color-active: #5c9cf5;
     scrollbar-corner-color: transparent;
 }
 
 .user-card {
-    background: transparent;
-    border-left: thick #3a3a3a;
+    background: $surface;
+    border: solid #242424;
+    border-left: thick #5c9cf5;
     padding: 0 2;
     margin: 1 0;
     height: auto;
 }
 
 .user-card.mode-build {
-    border-left: thick #fab283;
+    border-left: thick #5c9cf5;
 }
 
 .user-card.mode-plan {
@@ -249,14 +250,14 @@ Screen {
 
 #center-stage.is-session #prompt-outer {
     width: 100%;
-    padding: 0 3 1 3;
+    padding: 0 2 1 2;
 }
 
 #autocomplete-popup {
     display: none;
     max-height: 10;
     background: $surface;
-    border: round #2a2a2a;
+    border: solid #2a2a2a;
     margin-bottom: 1;
 }
 
@@ -265,15 +266,16 @@ Screen {
     height: auto;
     background: $surface;
     padding: 0 2;
-    border: round #2a2a2a;
+    border: solid #242424;
+    border-left: thick #5c9cf5;
 }
 
 #prompt-box.mode-build {
-    border: round #fab283;
+    border-left: thick #5c9cf5;
 }
 
 #prompt-box.mode-plan {
-    border: round #5c9cf5;
+    border-left: thick #5c9cf5;
 }
 
 #prompt-input {
@@ -316,16 +318,14 @@ Screen {
 #sidebar {
     width: 36;
     height: 1fr;
-    background: $surface;
-    border-left: solid #1c1c1c;
+    background: transparent;
+    border-left: solid #1a1a1a;
     padding: 1 1;
 }
 
 .sb-block {
     height: auto;
     margin-bottom: 1;
-    padding-bottom: 1;
-    border-bottom: solid #1f1f1f;
 }
 
 /* --- 1-Line Bottom Footer --- */
@@ -348,7 +348,7 @@ ModalScreen {
     height: auto;
     max-height: 82%;
     background: $surface;
-    border: round #2a2a2a;
+    border: solid #2a2a2a;
     padding: 1 2;
 }
 
@@ -662,6 +662,8 @@ class RbitApp(App[None]):
             frame=self._spin_frame,
         )
         self.query_one(SessionHeaderBar).update_header(self.session, model_id, self.engine.extra_models)
+        session_title = (self.session.title or "New Session").strip()
+        self.title = f"rbit · {session_title}" if session_title else "rbit"
         self.query_one(SidebarPanel).refresh_all(
             self.session,
             model_id,
@@ -1089,9 +1091,9 @@ class RbitApp(App[None]):
             if m.role == "user":
                 widgets.append(UserMessageCard(m))
             elif m.role == "assistant":
+                widgets.append(AssistantMessageCard(m, self.engine.extra_models))
                 for tc in m.tool_calls:
                     widgets.append(ToolCallCard(tc))
-                widgets.append(AssistantMessageCard(m, self.engine.extra_models))
         if widgets:
             scroll.mount_all(widgets)
         scroll.scroll_end(animate=False)
