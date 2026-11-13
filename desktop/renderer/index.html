@@ -7,9 +7,10 @@
 </head>
 <body>
   <div id="tabbar">
-    <button id="menu-btn" title="Sessions">☰</button>
+    <button id="menu-btn" title="Menu">☰</button>
     <div id="tabs"></div>
     <button id="tab-new" title="New session">＋</button>
+    <div id="tab-drag"></div>
   </div>
   <div id="layout">
     <aside id="sessions" class="hidden">
@@ -23,12 +24,18 @@
         <div id="composer-card">
           <textarea id="prompt" rows="1" placeholder="Спросите что угодно, / — команды, @ — контекст..."></textarea>
           <div id="composer-bar">
-            <span class="ghost" id="btn-mode">Build</span>
-            <span class="dot">·</span>
-            <span class="ghost" id="btn-model">GLM 5.3 Flash</span>
+            <button class="ghost" id="btn-add">＋</button>
+            <button class="ghost" id="btn-mode">Build ▾</button>
+            <button class="ghost" id="btn-model">GLM 5.3 Flash ▾</button>
             <span class="spacer"></span>
             <button id="send" title="Send">↑</button>
           </div>
+        </div>
+        <div id="crumbs">
+          <button class="crumb">project ▾</button>
+          <span class="sep">/</span>
+          <span class="crumb-static">⎇ Нет Git</span>
+          <span class="crumb-path" id="crumb-path"></span>
         </div>
       </div>
     </main>
