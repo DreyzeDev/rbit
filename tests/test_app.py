@@ -3674,3 +3674,33 @@ async def test_max_tokens_from_config(tmp_path: Path) -> None:
     await engine.http_client.aclose()
     engine.http_client = None
     assert captured[0]["max_tokens"] == 2048
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_compacts_and_retries(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    app.config_data["model"] = "rbit/smart-local"
+    calls = {"n": 0}
+
+    async def fake_run_turn(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("400 This model's maximum context length is exceeded")
+        return ChatMessage(id="a1", role="assistant", content="после компакции", agent="build", model="m", duration_s=0.1)
+
+    app.engine.run_turn = fake_run_turn
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        for i in range(10):
+            app.session.messages.append(ChatMessage(id=f"u{i}", role="user", content=f"сообщение {i} " * 20))
+        user = ChatMessage(id="u_last", role="user", content="продолжи")
+        app.session.messages.append(user)
+        app._execute_agent_turn(user)
+        for _ in range(200):
+            await pilot.pause()
+            if not app.is_busy:
+                break
+        await pilot.pause()
+    assert calls["n"] == 2  # retried once after compaction
+    assert any("[Compacted]" in m.content for m in app.session.messages)
+    assert app.session.messages[-1].content == "после компакции"

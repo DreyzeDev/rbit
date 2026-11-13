@@ -1409,6 +1409,21 @@ class RbitApp(App[None]):
         lines = [f"`{k}` → {', '.join(sorted(v)) or '(no local imports)'}" for k, v in list(graph.items())[:30]]
         self._post_notice("# Import graph\n\n" + "\n".join(lines))
 
+    @staticmethod
+    def _is_context_overflow_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        markers = (
+            "context length",
+            "context_length",
+            "maximum context",
+            "context window",
+            "prompt is too long",
+            "too many tokens",
+            "input length exceeds",
+            "reduce the length",
+        )
+        return any(m in text for m in markers)
+
     def _get_editor(self) -> list[str]:
         """Editor command: $VISUAL/$EDITOR → config `editor` → platform default."""
         import os as _os
@@ -2247,7 +2262,37 @@ class RbitApp(App[None]):
             )
 
         try:
-            reply = await run_engine_once(user_msg)
+            # Context-overflow resilience: when the provider rejects the request
+            # because the conversation no longer fits, compact once and retry.
+            compact_retried = False
+            while True:
+                try:
+                    reply = await run_engine_once(user_msg)
+                    break
+                except Exception as exc:
+                    if compact_retried or not self.config_data.get("auto_compact", True):
+                        raise
+                    if len(session.messages) <= 8 or not self._is_context_overflow_error(exc):
+                        raise
+                    compact_retried = True
+                    self._post_notice("⚠ Контекст переполнен — компакция и один повтор…")
+                    older = list(session.messages[:-2])
+                    if not older:
+                        raise
+                    summary_text = await self.engine.summarize_session(older, model_id)
+                    summary_msg = ChatMessage(
+                        id=short_id(),
+                        role="assistant",
+                        content=(
+                            f"**[Compacted]** {len(older)} message(s) → handoff summary\n\n{summary_text}"
+                        ),
+                        agent=self.agent_mode,
+                        model=model_id,
+                        tokens=max(24, count_tokens(summary_text)),
+                    )
+                    session.messages = [summary_msg] + session.messages[-2:]
+                    self.storage.save_session(session)
+                    self._rebuild_chat_view()
             if self._interrupted_turn:
                 self._live_card = None
                 return
