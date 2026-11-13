@@ -1005,6 +1005,8 @@ class ToolExecutor:
         if not rg:
             return None
         cmd = [rg, "--line-number", "--no-heading", "--color", "never", "-i"]
+        # Respect .gitignore even outside a git repo, like the fallback path does.
+        cmd.append("--no-require-git")
         if files_only:
             cmd.append("-l")
         if context:
@@ -1030,7 +1032,12 @@ class ToolExecutor:
             line = raw_line.strip()
             if not line:
                 continue
-            rel = line[2:] if line.startswith("./") else line
+            # Normalize the path prefix to match the fallback output ("a.py:1:...",
+            # never ".\a.py" or "./a.py"); leave the matched text untouched.
+            path_part, sep, rest = line.partition(":")
+            if path_part[:2] in ("./", ".\\"):
+                path_part = path_part[2:]
+            rel = path_part.replace("\\", "/") + sep + rest
             if files_only:
                 if is_secret_file(self.workspace / rel) and not self._secret_reads_allowed():
                     continue

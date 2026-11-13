@@ -71,6 +71,9 @@ All notable changes to rbit are documented here. The format follows
 
 ### Fixed
 
+- The ripgrep-backed `grep` now respects `.gitignore` even outside a git repository
+  (`--no-require-git`) and emits the same relative `path:line:` formatting as the
+  fallback, so results no longer depend on whether `rg` is installed.
 - Streaming text no longer aborts the turn with a bogus connection error when the chat
   card has not finished mounting yet (`No nodes match 'Markdown'`).
 - Provider failures are no longer reported as network errors; non-HTTP exceptions surface

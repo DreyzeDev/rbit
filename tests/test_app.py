@@ -2711,3 +2711,59 @@ async def test_failing_stream_hook_does_not_abort_the_turn(tmp_path: Path) -> No
     await engine.http_client.aclose()
     engine.http_client = None
     assert text == "Hello world"
+
+
+@pytest.mark.asyncio
+async def test_full_agent_turn_thinking_reasoning_stream_and_click(tmp_path: Path) -> None:
+    """Full _execute_agent_turn flow: two thinking rounds with reasoning, streaming,
+    settled 'Thought for Ns' lines kept in the feed, click expands them."""
+    from rbit.widgets import ThinkingIndicator
+
+    app = RbitApp(workspace=tmp_path)
+    app.config_data["model"] = "rbit/smart-local"
+
+    async def fake_run_turn(**kwargs):
+        on_thinking = kwargs["on_thinking"]
+        on_reasoning_chunk = kwargs["on_reasoning_chunk"]
+        on_stream_chunk = kwargs["on_stream_chunk"]
+
+        await on_thinking(True)
+        await on_reasoning_chunk("сначала думаю о структуре. ")
+        await on_reasoning_chunk("теперь о формулировке.")
+        await on_thinking(False)
+        await on_stream_chunk("# Ответ\n\nПервая часть.")
+        await on_thinking(True)
+        await on_reasoning_chunk("уточняю вторую часть.")
+        await on_thinking(False)
+        await on_stream_chunk("# Ответ\n\nПервая часть. Вторая часть.")
+        return ChatMessage(
+            id="a1", role="assistant", content="# Ответ\n\nПервая часть. Вторая часть.",
+            agent=kwargs["agent_mode"], model=kwargs["model_id"], duration_s=1.0,
+        )
+
+    app.engine.run_turn = fake_run_turn
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        user = ChatMessage(id="u1", role="user", content="тест")
+        app.session.messages.append(user)
+        app._execute_agent_turn(user)
+        for _ in range(200):
+            await pilot.pause()
+            if not app.is_busy:
+                break
+        await pilot.pause()
+        await pilot.pause()
+
+        assert app.is_busy is False
+        lines = list(app.query(ThinkingIndicator))
+        cards = list(app.query(AssistantMessageCard))
+        assert len(cards) == 1, f"expected final assistant card, got {len(cards)}"
+        assert len(lines) == 2, f"expected both settled thinking lines kept, got {len(lines)}"
+        assert "▸" in lines[0].render().plain
+        assert "▸" in lines[1].render().plain
+        lines[0].toggle()
+        await pilot.pause()
+        assert "▾" in lines[0].render().plain
+        assert "сначала думаю о структуре." in lines[0].render().plain
+        assert "Первая часть" in cards[0].msg.content
