@@ -1608,6 +1608,49 @@ class AgentEngine:
             logger.debug("title generation failed", exc_info=True)
             return None
 
+    async def generate_memory(self, exchange: str) -> list[str]:
+        """Extracts up to 3 durable project facts from an exchange (LLM, optional)."""
+        cfg = self.get_config()
+        api_key = self.storage.resolve_api_key(cfg).strip()
+        if not api_key:
+            return []
+        api_base = (cfg.get("api_base") or "https://openrouter.ai/api/v1").rstrip("/")
+        if api_base.endswith("/chat/completions"):
+            api_base = api_base[: -len("/chat/completions")]
+        model_id = str(cfg.get("model") or "openai/gpt-4.1-mini")
+        try:
+            own_client = self.http_client is None
+            client = self.http_client or httpx.AsyncClient(timeout=25.0, limits=HTTP_LIMITS)
+            try:
+                resp = await client.post(
+                    f"{api_base}/chat/completions",
+                    headers=self._build_headers(api_key),
+                    json={
+                        "model": model_id,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "Extract up to 3 durable facts about this project (stack, commands, paths, user preferences) from the exchange. Reply with '- fact' bullets only. If nothing durable, reply exactly NONE.",
+                            },
+                            {"role": "user", "content": exchange[:1200]},
+                        ],
+                        "max_tokens": 120,
+                        "temperature": 0.2,
+                    },
+                )
+            finally:
+                if own_client:
+                    await client.aclose()
+            if resp.status_code != 200:
+                return []
+            text = str((resp.json()["choices"][0]["message"] or {}).get("content") or "").strip()
+            if text.upper().strip() == "NONE":
+                return []
+            return [ln.lstrip("-* ").strip() for ln in text.splitlines() if ln.strip().startswith(("-", "*"))][:3]
+        except Exception:
+            logger.debug("memory generation failed", exc_info=True)
+            return []
+
     async def summarize_session(self, messages: list[ChatMessage], model_id: str) -> str:
         """Summarizes older messages via the active LLM, with a deterministic fallback."""
         cfg = self.get_config()

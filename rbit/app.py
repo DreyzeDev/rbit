@@ -1299,6 +1299,28 @@ class RbitApp(App[None]):
         self.storage.save_session(session)
         self._sync_ui()
 
+    async def _auto_memory(self, session: Session) -> None:
+        """Extracts durable facts from the last exchange into .rbit/memory.md."""
+        try:
+            last_user = next(
+                (m.content for m in reversed(session.messages)
+                 if m.role == "user" and not m.content.startswith(("/", "!"))),
+                "",
+            )
+            last_asst = next(
+                (m.content for m in reversed(session.messages) if m.role == "assistant" and m.content.strip()),
+                "",
+            )
+            if not last_user or not last_asst:
+                return
+            facts = await self.engine.generate_memory(f"User: {last_user[:600]}\n\nAssistant: {last_asst[:600]}")
+            if facts:
+                added = self.storage.append_project_memory(facts)
+                if added:
+                    self.notify(f"🧠 Память пополнена (+{added}).", timeout=2.0)
+        except Exception:
+            pass
+
     def _maybe_auto_compact(self, model_id: str) -> None:
         if not self.config_data.get("auto_compact", True) or self.is_busy:
             return
@@ -1542,8 +1564,9 @@ class RbitApp(App[None]):
     def _phrase_is_build(lowered: str) -> bool:
         return lowered.startswith(("начни делать", "реализуй", "исправь", "делай", "fix:", "implement:"))
 
-    def _build_self_check_message(self, reply: ChatMessage) -> ChatMessage | None:
-        """Runs diagnostics on files mutated this turn; returns a fix prompt when broken."""
+    async def _build_self_check_message(self, reply: ChatMessage) -> ChatMessage | None:
+        """Runs diagnostics + the project's tests over files mutated this turn;
+        returns a fix prompt when something is broken."""
         mutated: list[str] = []
         seen: set[str] = set()
         for tc in reply.tool_calls:
@@ -1565,9 +1588,19 @@ class RbitApp(App[None]):
         problems: list[str] = []
         for rel in mutated:
             res = self.executor._tool_diagnostics({"filePath": rel})
-            m = re.search(r"(\d+) issues", (res.summary or "").lower())
-            if m and int(m.group(1)) > 0:
-                problems.append(f"`{rel}` — {res.output[:400]}")
+        m = re.search(r"(\d+) issues", (res.summary or "").lower())
+        if m and int(m.group(1)) > 0:
+            problems.append(f"`{rel}` — {res.output[:400]}")
+        if not problems and self.config_data.get("test_gate", True):
+            code_exts = (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java")
+            if any(rel.endswith(code_exts) for rel in mutated):
+                test_cmd = detect_test_command(self.workspace)
+                if test_cmd:
+                    self.notify(f"🧪 Test gate: {test_cmd}", timeout=2.5)
+                    res = await self.executor.execute("bash", {"command": test_cmd, "timeout": 300})
+                    if not res.ok:
+                        tail = "\n".join(res.output.splitlines()[-25:])
+                        problems.append(f"Тесты упали (`{test_cmd}`):\n{tail}")
         if not problems:
             return None
         self._post_notice(
@@ -2315,7 +2348,7 @@ class RbitApp(App[None]):
                 and not self._auto_fix_round
                 and any(tc.name in MUTATING_TOOLS for tc in reply.tool_calls)
             ):
-                fix_msg = self._build_self_check_message(reply)
+                fix_msg = await self._build_self_check_message(reply)
                 if fix_msg is not None:
                     self._auto_fix_round = True
                     try:
@@ -2378,3 +2411,5 @@ class RbitApp(App[None]):
                     self._maybe_auto_compact(model_id)
             else:
                 self._maybe_auto_compact(model_id)
+            if self.config_data.get("auto_memory", True) and not getattr(self, "_auto_fix_round", False):
+                self._run_coro(self._auto_memory(session))

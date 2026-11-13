@@ -98,6 +98,28 @@ class StorageManager:
         except OSError:
             pass
 
+    def append_project_memory(self, bullets: list[str]) -> int:
+        """Appends deduplicated fact bullets to .rbit/memory.md."""
+        if not bullets:
+            return 0
+        self.ensure_dirs()
+        existing = ""
+        if self.memory_path.exists():
+            existing = self.memory_path.read_text(encoding="utf-8", errors="ignore").lower()
+        added = 0
+        new_lines = []
+        for b in bullets:
+            b = str(b).strip().lstrip("-• ").strip()
+            if not b or b.lower() in existing:
+                continue
+            new_lines.append(f"- {b}")
+            existing += b.lower() + "\n"
+            added += 1
+        if new_lines:
+            with self.memory_path.open("a", encoding="utf-8") as f:
+                f.write("\n".join(new_lines) + "\n")
+        return added
+
     def load_config(self) -> dict[str, Any]:
         raw_base = (
             os.environ.get("RBIT_API_BASE")

@@ -3704,3 +3704,57 @@ async def test_context_overflow_compacts_and_retries(tmp_path: Path) -> None:
     assert calls["n"] == 2  # retried once after compaction
     assert any("[Compacted]" in m.content for m in app.session.messages)
     assert app.session.messages[-1].content == "после компакции"
+
+
+def test_append_project_memory_dedups(tmp_path: Path) -> None:
+    from rbit.storage import StorageManager
+
+    storage = StorageManager(workspace=tmp_path)
+    first = storage.append_project_memory(["стек: FastAPI", "тесты: pytest -q"])
+    second = storage.append_project_memory(["стек: FastAPI", "порт 8000"])
+    assert first == 2
+    assert second == 1
+    text = storage.memory_path.read_text(encoding="utf-8")
+    assert text.count("стек: FastAPI") == 1
+    assert "порт 8000" in text
+
+
+@pytest.mark.asyncio
+async def test_test_gate_feeds_failures_to_fix_round(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (tmp_path / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    (tmp_path / "test_calc.py").write_text(
+        "from calc import add\n\ndef test_add():\n    assert add(1, 1) == 3\n", encoding="utf-8"
+    )
+    app = RbitApp(workspace=tmp_path)
+    app.config_data["model"] = "rbit/smart-local"
+    calls = {"n": 0}
+
+    async def fake_run_turn(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ChatMessage(
+                id="a1", role="assistant", content="правлю",
+                agent="build", model="m", duration_s=0.1,
+                tool_calls=[ToolCallRecord(
+                    id="t1", name="write", arguments={"filePath": "calc.py"},
+                    status="success", summary="(+0 -0)", output="ok", diff="",
+                    duration_ms=1,
+                )],
+            )
+        assert "Тесты упали" in kwargs["user_msg.content"] or "тест" in kwargs["user_msg.content"].lower()
+        return ChatMessage(id="a2", role="assistant", content="исправил тест", agent="build", model="m", duration_s=0.1)
+
+    app.engine.run_turn = fake_run_turn
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        user = ChatMessage(id="u1", role="user", content="обнови calc.py")
+        app.session.messages.append(user)
+        app._execute_agent_turn(user)
+        for _ in range(600):
+            await asyncio.sleep(0.05)
+            await pilot.pause()
+            if calls["n"] >= 2 and not app.is_busy:
+                break
+        await pilot.pause()
+    assert calls["n"] == 2  # test gate triggered the fix round
