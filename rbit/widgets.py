@@ -209,6 +209,7 @@ class PromptSubHints(Static):
             spin = SPINNER_FRAMES[self._frame % len(SPINNER_FRAMES)]
             accent = agent_accent(self._mode)
             left.append(f" {spin} ", style=f"bold {accent}")
+            left.append("Thinking...", style="#808080")
             right.append("esc", style="bold #eeeeee")
             right.append(" interrupt", style="#808080")
         else:
