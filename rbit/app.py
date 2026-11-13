@@ -562,6 +562,17 @@ class RbitApp(App[None]):
             )
         self._plugins_loaded = False
         self._maybe_show_doctor_hint()
+        # Config-driven keybindings: {"bindings": {"open_models": "ctrl+shift+m"}}
+        custom_bindings = self.config_data.get("bindings")
+        if isinstance(custom_bindings, dict) and custom_bindings:
+            merged = []
+            for b in self.BINDINGS:
+                new_key = custom_bindings.get(b.action)
+                merged.append(Binding(new_key, b.action, b.description, show=b.show) if new_key else b)
+            self.BINDINGS = merged
+        from .plugins import load_plugins
+
+        self._loaded_plugins = load_plugins(self)
         self.register_theme(RBIT_DARK)
         self.register_theme(RBIT_LIGHT)
         self.register_theme(RBIT_HIGH_CONTRAST)
@@ -1240,6 +1251,38 @@ class RbitApp(App[None]):
         scroll.mount(Static(text, classes="system-notice"))
         self._smart_scroll_end()
 
+    def _cmd_mcp(self, arg: str) -> None:
+        """Manages configured MCP server entries in config (launching is a future step)."""
+        servers = self.config_data.get("mcp_servers")
+        if not isinstance(servers, dict):
+            servers = {}
+        parts = arg.split(maxsplit=2)
+        if parts and parts[0] in ("add", "remove") :
+            name = parts[1].strip() if len(parts) > 1 else ""
+            if not name:
+                self.notify("Usage: /mcp add <name> <command…> | /mcp remove <name>", severity="warning")
+                return
+            if parts[0] == "remove":
+                servers.pop(name, None)
+                self.notify(f"MCP server removed: {name}", timeout=2.0)
+            else:
+                servers[name] = {"command": parts[2] if len(parts) > 2 else ""}
+                self.notify(f"MCP server added: {name} (config saved)", timeout=2.0)
+            self.config_data["mcp_servers"] = servers
+            self.storage.save_config(self.config_data)
+            self._cmd_mcp("")
+            return
+        lines = ["[bold #eeeeee]MCP servers[/]", ""]
+        if servers:
+            for name, entry in servers.items():
+                cmd_text = entry.get("command", "") if isinstance(entry, dict) else str(entry)
+                lines.append(f"  • [bold]{name}[/] — {cmd_text}")
+        else:
+            lines.append("  (none configured — /mcp add <name> <command>)")
+        lines.append("")
+        lines.append("[#808080]Запуск серверов пока не подключён — конфигурация сохраняется для будущих версий.[/]")
+        self._post_notice("\n".join(lines))
+
     def action_history_search(self) -> None:
         self.push_screen(PromptHistoryModal(self.prompt_history), self._on_history_picked)
 
@@ -1562,6 +1605,9 @@ class RbitApp(App[None]):
             return True
         if cmd == "/deps":
             self._cmd_deps()
+            return True
+        if cmd in ("/mcp", "/mcp-servers"):
+            self._cmd_mcp(arg)
             return True
         if cmd == "/macro":
             self._run_coro(self._cmd_macro(arg))

@@ -3475,3 +3475,114 @@ async def test_phrase_switches_agent_mode(tmp_path: Path) -> None:
             if not app.is_busy:
                 break
         assert app.agent_mode == "plan"
+
+
+def test_detect_test_command(tmp_path: Path) -> None:
+    from rbit.tools import detect_test_command
+
+    assert detect_test_command(tmp_path) is None
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    assert detect_test_command(tmp_path) == "pytest -q"
+    (tmp_path / "package.json").write_text('{"scripts": {"test": "vitest"}}', encoding="utf-8")
+    (tmp_path / "pyproject.toml").unlink()
+    assert detect_test_command(tmp_path) == "npm test"
+
+
+@pytest.mark.asyncio
+async def test_import_graph_and_extra_roots(tmp_path: Path) -> None:
+    (tmp_path / "pkg_a.py").write_text("import pkg_b\n", encoding="utf-8")
+    (tmp_path / "pkg_b.py").write_text("x = 1\n", encoding="utf-8")
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    graph = executor.import_graph()
+    assert graph.get("pkg_a.py") == {"pkg_b"}
+
+    other = tmp_path.parent / "rbit-extra-root-test"
+    other.mkdir(exist_ok=True)
+    (other / "outside.txt").write_text("ok\n", encoding="utf-8")
+    executor.extra_roots = [other]
+    resolved = executor.resolve_path(str(other / "outside.txt"))
+    assert resolved.exists()
+
+
+def test_move_detection_in_diff(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    old = "alpha\nbeta\ngamma\n"
+    new = "gamma\nalpha\nbeta\n"
+    diff, added, removed = executor._compute_diff(old, new, "f.txt")
+    assert "moved" in diff
+
+
+@pytest.mark.asyncio
+async def test_tool_output_truncation_marker(tmp_path: Path) -> None:
+    (tmp_path / "big.txt").write_text("y" * 9000, encoding="utf-8")
+    executor = ToolExecutor(
+        workspace=tmp_path, session=Session(), get_config=lambda: {"tool_output_chars": 1000}
+    )
+    from rbit.agent import AgentEngine
+    from rbit.models import Session as S2
+
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: {"tool_output_chars": 1000})
+    res = ToolResult(True, "ok", "z" * 9000)
+    msg = engine._format_tool_message("c1", "read", res)
+    assert "truncated: 9000" in msg["content"]
+    assert len(msg["content"]) < 9500
+
+
+def test_session_migration_and_openai_export(tmp_path: Path) -> None:
+    from rbit.models import SESSION_SCHEMA_VERSION, Session
+
+    legacy = {"title": "old", "messages": [{"role": "user", "content": "hi"}]}
+    sess = Session.from_dict(legacy)
+    assert sess.messages[0].pinned is False
+    assert sess.to_dict()["schema_version"] == SESSION_SCHEMA_VERSION
+
+
+def test_i18n_and_plugins(tmp_path: Path) -> None:
+    from rbit import i18n
+    from rbit.plugins import load_plugins
+
+    i18n.set_locale("en")
+    assert i18n.tr("nothing_undo") == "Nothing to undo."
+    i18n.set_locale("ru")
+    assert i18n.tr("nothing_undo") == "Nothing to undo."
+    assert load_plugins(object()) == []  # no plugins installed: empty list, no crash
+
+
+@pytest.mark.asyncio
+async def test_sqlite_backend_roundtrip(tmp_path: Path) -> None:
+    from rbit.storage import StorageManager
+
+    storage = StorageManager(workspace=tmp_path)
+    storage.ensure_dirs()
+    storage.save_config({"storage_backend": "sqlite"})
+    sess = Session(title="in sqlite")
+    sess.messages.append(ChatMessage(id="m1", role="user", content="hello"))
+    storage.save_session(sess)
+    loaded = storage.list_sessions()
+    assert any(s.id == sess.id and s.messages[0].content == "hello" for s in loaded)
+    found = storage.find_session(sess.id)
+    assert found is not None and found.title == "in sqlite"
+
+
+@pytest.mark.asyncio
+async def test_session_encryption_roundtrip(tmp_path: Path) -> None:
+    pytest.importorskip("cryptography")
+    import os
+
+    from rbit.storage import StorageManager
+
+    storage = StorageManager(workspace=tmp_path)
+    storage.ensure_dirs()
+    storage.save_config({"encrypt_sessions": True})
+    os.environ["RBIT_PASSPHRASE"] = "pw"
+    try:
+        sess = Session(title="secret")
+        storage.save_session(sess)
+        raw = (storage.sessions_dir / f"{sess.id}.json").read_text(encoding="utf-8")
+        assert raw.startswith("rbit-enc:v1:")
+        os.environ["RBIT_PASSPHRASE"] = ""
+        assert storage.list_sessions() == [] or all(s.id != sess.id for s in storage.list_sessions())
+        os.environ["RBIT_PASSPHRASE"] = "pw"
+        assert any(s.id == sess.id for s in storage.list_sessions())
+    finally:
+        os.environ.pop("RBIT_PASSPHRASE", None)

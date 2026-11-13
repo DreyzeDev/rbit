@@ -357,6 +357,7 @@ class ToolExecutor:
         self._webfetch_cache: dict[str, tuple[float, str]] = {}
         self._file_cache: tuple[float, list[str]] | None = None
         self.session_readonly: bool = False
+        self.extra_roots: list[Path] = []
 
     def _gitignore_matcher(self) -> GitIgnoreMatcher:
         if self._gitignore is None:
@@ -389,6 +390,15 @@ class ToolExecutor:
         p = Path(raw_path)
         if not p.is_absolute():
             p = self.workspace / p
+        else:
+            # Monorepo support: absolute paths inside a configured extra root are allowed.
+            resolved = p.resolve()
+            for root in self.extra_roots:
+                try:
+                    resolved.relative_to(root)
+                    return resolved
+                except ValueError:
+                    continue
         p = p.resolve()
         try:
             p.relative_to(self.workspace)
@@ -2119,3 +2129,15 @@ def detect_test_command(workspace: Path) -> str | None:
     if any(ws.glob("test_*.py")):
         return "pytest -q"
     return None
+
+
+def detect_language_servers() -> dict[str, bool]:
+    """Detects language servers on PATH for the sidebar/doctor LSP status."""
+    import shutil as _shutil
+
+    return {
+        "pylsp": _shutil.which("pylsp") is not None,
+        "pyright": _shutil.which("pyright") is not None or _shutil.which("pyright-langserver") is not None,
+        "typescript-language-server": _shutil.which("typescript-language-server") is not None,
+        "clangd": _shutil.which("clangd") is not None,
+    }

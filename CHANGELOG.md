@@ -8,6 +8,19 @@ All notable changes to rbit are documented here. The format follows
 
 ### Added
 
+- Second-echelon features: `rbit watch` (file watcher with optional agent reaction),
+  macro replay (`/macro`, `.rbit/macros/*.json`), `/mcp` server config manager,
+  LSP-server detection in the sidebar/doctor, plugin loading (`rbit.plugins` entry
+  points), config-driven keybindings (`bindings`), minimal ru/en localization
+  (`i18n`, `locale` config), monorepo extra roots (`extra_workspaces`), voice input
+  (`rbit voice`, optional sounddevice+whisper), pinned messages, prompt-history
+  search (ctrl+h), /test /review /explain /deps, turn latency in the header,
+  quiet mode, session lock, first-run doctor hint, OS notification on long turns,
+  tool-output auto-truncation marker, move detection in diffs, /undoturn,
+  HTML/OpenAI session export+import, SQLite storage backend, session schema
+  migrations, encrypted sessions (Fernet, optional), `rbit backup`/`describe`,
+  NO_COLOR support, `rbit stats` LOC/language/complexity metrics.
+
 - `rbit serve` — local HTTP endpoint: `POST /v1/turns` streams a full agent turn as
   NDJSON (status/thinking/delta/tool_call/message), `GET /health` for readiness.
 - `rbit backup` — zips the `.rbit` state directory; `rbit describe` — project

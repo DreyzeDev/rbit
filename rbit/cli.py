@@ -830,7 +830,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "export", "map", "lint", "init", "commit", "update", "backup", "describe", "serve", "import"}
+    subcommands = {"run", "doctor", "stats", "sessions", "export", "map", "lint", "init", "commit", "update", "backup", "describe", "serve", "import", "watch", "voice"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -877,6 +877,21 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("dir", nargs="?", help="Workspace directory")
             parsed = p.parse_args(rest)
             return asyncio.run(_run_doctor(_resolve_workspace(parsed.dir)))
+
+        if sub == "watch":
+            p = argparse.ArgumentParser(prog="rbit watch", description="Watch workspace files and react to changes")
+            p.add_argument("dir", nargs="?", help="Workspace directory")
+            p.add_argument("--run", metavar="PROMPT", help="Send a prompt to the agent when files change")
+            p.add_argument("--interval", type=float, default=2.0)
+            parsed = p.parse_args(rest)
+            return _run_watch(_resolve_workspace(parsed.dir), parsed.run, max(0.5, parsed.interval))
+
+        if sub == "voice":
+            p = argparse.ArgumentParser(prog="rbit voice", description="Speech-to-text prompt (optional deps)")
+            p.add_argument("--seconds", type=float, default=5.0)
+            p.add_argument("--model", default="base", help="whisper model size")
+            parsed = p.parse_args(rest)
+            return _run_voice(parsed.seconds, parsed.model)
 
         if sub == "serve":
             p = argparse.ArgumentParser(prog="rbit serve", description="Local HTTP endpoint exposing rbit turns as NDJSON")
@@ -1260,3 +1275,107 @@ def _run_serve(args: argparse.Namespace) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def _run_watch(workspace: Path, run_prompt: str | None, interval: float) -> int:
+    """Polls workspace mtimes; prints changes, optionally triggering an agent turn."""
+    import asyncio
+
+    snapshot: dict[str, float] = {}
+    console = Console()
+    console.print(f"[bold #7fd88f]Watching[/] {workspace} (Ctrl+C to stop)")
+    storage = StorageManager(workspace)
+    cfg = storage.load_config()
+    engine_holder: dict[str, object] = {}
+
+    async def react(changed: list[str]) -> None:
+        from rbit.agent import AgentEngine
+        from rbit.models import ChatMessage, Session, short_id
+        from rbit.tools import ToolExecutor
+
+        session = Session(title=f"watch {changed[0]}")
+        executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=lambda: cfg)
+        engine = AgentEngine(workspace=workspace, executor=executor, storage=storage, get_config=lambda: cfg)
+        user = ChatMessage(id=short_id(), role="user", content=run_prompt)
+        session.messages.append(user)
+
+        async def _noop(_rec) -> None:
+            return None
+
+        async def _noop_s(_s: str) -> None:
+            return None
+
+        reply = await engine.run_turn(
+            session=session, user_msg=user, agent_mode="build",
+            model_id=str(cfg.get("model", "rbit/smart-local")),
+            on_tool_start=_noop, on_tool_end=_noop, on_status=_noop_s,
+        )
+        console.print(f"[bold #7fd88f]rbit[/] {reply.content[:600]}")
+
+    def scan() -> list[str]:
+        changed: list[str] = []
+        for f in workspace.rglob("*"):
+            if not f.is_file() or any(part in (".rbit", ".git", ".venv", "node_modules", "__pycache__") for part in f.parts):
+                continue
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            rel = str(f.relative_to(workspace))
+            if snapshot.get(rel, mtime) != mtime:
+                changed.append(rel)
+            snapshot[rel] = mtime
+        return changed
+
+    scan()  # baseline
+    try:
+        while True:
+            time.sleep(interval)
+            changed = scan()
+            if changed:
+                console.print("[bold #fab283]changed:[/]", ", ".join(changed[:8]))
+                if run_prompt:
+                    asyncio.run(react(changed))
+    except KeyboardInterrupt:
+        console.print("\nStopped.")
+    return 0
+
+
+def _run_voice(seconds: float, model_size: str) -> int:
+    """Records microphone audio and transcribes it (optional dependencies)."""
+    console = Console()
+    missing = []
+    try:
+        import sounddevice  # noqa: F401
+    except ImportError:
+        missing.append("sounddevice")
+    try:
+        import whisper  # noqa: F401
+    except ImportError:
+        missing.append("openai-whisper")
+    if missing:
+        console.print("[bold #e06c75]Voice input needs optional packages:[/] pip install " + " ".join(missing))
+        console.print("Then run `rbit voice` again.")
+        return 1
+    import numpy as np
+
+    import sounddevice as sd
+    import whisper
+
+    console.print(f"Recording {seconds:.0f}s — speak now…")
+    sr = 16000
+    audio = sd.rec(int(seconds * sr), samplerate=sr, channels=1, dtype="float32")
+    sd.wait()
+    console.print("Transcribing…")
+    result = whisper.load_model(model_size).transcribe(np.squeeze(audio))
+    text = str(result.get("text") or "").strip()
+    console.print(f"[bold #7fd88f]Prompt:[/] {text}")
+    try:
+        import pyperclip
+
+        pyperclip.copy(text)
+        console.print("(copied to clipboard — paste into rbit)")
+    except Exception:
+        pass
+    return 0
+

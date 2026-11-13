@@ -813,16 +813,25 @@ class AgentEngine:
                 pass
         return {}
 
-    @staticmethod
-    def _format_tool_message(tc_id: str, fn_name: str, res: ToolResult) -> dict[str, Any]:
+    def _format_tool_message(self, tc_id: str, fn_name: str, res: ToolResult) -> dict[str, Any]:
         out_payload = res.output
         if res.diff:
             out_payload += f"\n\nDiff:\n{res.diff}"
+        limit = 6000
+        try:
+            limit = max(500, int((self.get_config() or {}).get("tool_output_chars", 6000)))
+        except (TypeError, ValueError):
+            limit = 6000
+        if len(out_payload) > limit:
+            out_payload = (
+                out_payload[:limit]
+                + f"\n\n[... truncated: {len(out_payload)} → {limit} chars; use grep or read with offset/limit]"
+            )
         return {
             "role": "tool",
             "tool_call_id": tc_id,
             "name": fn_name,
-            "content": out_payload[:6000],
+            "content": out_payload,
         }
 
     async def _dispatch_tool_calls(
