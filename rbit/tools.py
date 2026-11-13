@@ -84,12 +84,23 @@ def strip_ansi(text: str) -> str:
 
 
 def atomic_write_text(path: Path, content: str) -> None:
-    """Writes text via a temp file + os.replace so a crash never truncates the target."""
+    """Writes text via a temp file + os.replace so a crash never truncates the target.
+
+    Preserves the target's dominant line ending: without this, Windows text mode
+    turns every `\\n` into `\\r\\n`, so editing an LF file rewrote every line
+    (and vice versa), exploding git diffs and breaking follow-up edits."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    data = content.encode("utf-8")
+    try:
+        original = path.read_bytes()
+    except OSError:
+        original = b""
+    if b"\r\n" not in data and original.count(b"\r\n") * 2 > original.count(b"\n"):
+        data = data.replace(b"\n", b"\r\n")
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
     os.close(fd)
     try:
-        Path(tmp_name).write_text(content, encoding="utf-8")
+        Path(tmp_name).write_bytes(data)
         os.replace(tmp_name, path)
     finally:
         if os.path.exists(tmp_name):
@@ -512,18 +523,25 @@ class ToolExecutor:
         return f"Restored `{rel}` ({snap.step_label})"
 
     # --- Named Workspace Checkpoints (No Git required) ---
+    MANIFEST_KEY = "__manifest__"
+
     def create_checkpoint(self, label: str = "") -> CheckpointMeta:
         files_map: dict[str, str] = {}
+        manifest: list[str] = []
         self.invalidate_file_cache()
         for rel in self.list_workspace_files(limit=400):
             full = self.workspace / rel
             if not self._secret_reads_allowed() and is_secret_file(full):
                 continue
+            manifest.append(rel)
             try:
                 if full.stat().st_size <= MAX_CHECKPOINT_FILE_BYTES:
                     files_map[rel] = full.read_text(encoding="utf-8")
             except Exception:
+                # Binary or undecodable file: no text content to snapshot, but the
+                # manifest entry keeps restore_checkpoint from ever deleting it.
                 continue
+        files_map[self.MANIFEST_KEY] = json.dumps(manifest, ensure_ascii=False)
         return self.storage.save_checkpoint(label or "Manual checkpoint", files_map)
 
     def restore_checkpoint(self, cid: str) -> str:
@@ -534,6 +552,16 @@ class ToolExecutor:
         self.invalidate_file_cache()
         current_files = set(self.list_workspace_files(limit=400))
 
+        # Files that existed at checkpoint time (text or binary). Older checkpoints
+        # have no manifest; then the saved text files are the best approximation.
+        manifest = set(saved_files.keys())
+        raw_manifest = saved_files.pop(self.MANIFEST_KEY, None)
+        if raw_manifest:
+            try:
+                manifest = manifest | set(json.loads(raw_manifest))
+            except (TypeError, ValueError):
+                pass
+
         # Restore saved text files
         restored = 0
         for rel, content in saved_files.items():
@@ -541,18 +569,22 @@ class ToolExecutor:
             full.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_text(full, content)
             restored += 1
-        # Remove newly created text files that didn't exist at checkpoint time
+        # Remove newly created files that didn't exist at checkpoint time. Only
+        # files a snapshot could hold (decodable text, within the size limit) are
+        # deletable — restore could never recreate a binary file, so it must stay.
         removed = 0
-        for rel in current_files - set(saved_files.keys()):
+        for rel in current_files - manifest:
             full = self.workspace / rel
             if not self._secret_reads_allowed() and is_secret_file(full):
                 continue
             try:
-                if full.exists() and full.stat().st_size <= MAX_CHECKPOINT_FILE_BYTES:
-                    full.unlink()
-                    removed += 1
+                if not full.exists() or full.stat().st_size > MAX_CHECKPOINT_FILE_BYTES:
+                    continue
+                full.read_text(encoding="utf-8")
             except Exception:
                 continue
+            full.unlink()
+            removed += 1
 
         self.invalidate_file_cache()
         return f"Rewound workspace to `{meta.label}` ({restored} restored, {removed} removed)."
@@ -763,7 +795,7 @@ class ToolExecutor:
                     f"Found {len(spans)} whitespace-normalized matches; add context or set replaceAll=true.",
                 )
             span = spans[0]
-            notes.append("fuzzy match (whitespace normalized) â€” verify the diff")
+            notes.append("fuzzy match (whitespace normalized) — verify the diff")
         elif count > 1 and not replace_all:
             return ToolResult(
                 False,
@@ -772,7 +804,13 @@ class ToolExecutor:
             )
 
         if span is not None:
-            new_content = old_content[: span[0]] + new_str + old_content[span[1] :]
+            replaced = old_content[span[0] : span[1]]
+            addition = new_str
+            # The span covers the matched lines including their trailing newline;
+            # keep it, or the replacement glues the next line onto the last one.
+            if replaced.endswith("\n") and not addition.endswith("\n"):
+                addition += "\n"
+            new_content = old_content[: span[0]] + addition + old_content[span[1] :]
         else:
             new_content = (
                 old_content.replace(old_str, new_str)
@@ -1021,7 +1059,8 @@ class ToolExecutor:
                 cmd,
                 cwd=str(self.workspace),
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=20,
             )
         except (OSError, subprocess.SubprocessError):
@@ -1047,11 +1086,13 @@ class ToolExecutor:
             if is_secret_file(self.workspace / path_part) and not self._secret_reads_allowed():
                 continue
             lines.append(rel[:200])
+        if proc.returncode not in (0, 1):
+            # 2+ means rg itself failed (bad regex, IO error); fall back so the
+            # caller surfaces a real error instead of a bogus "no matches".
+            return None
         if files_only:
             out = "\n".join(matched) if matched else "No matches found."
             return ToolResult(True, f"{len(matched)} files (rg)", out)
-        if proc.returncode not in (0, 1):
-            return None
         out = "\n".join(lines) if lines else "No matches found."
         return ToolResult(True, f"{len(lines)} lines (rg)", out)
 
@@ -1073,7 +1114,10 @@ class ToolExecutor:
         rg_result = self._grep_with_ripgrep(pattern, include, files_only, context, max_per_file)
         if rg_result is not None:
             return rg_result
-        regex = re.compile(pattern, re.IGNORECASE)
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            return ToolResult(False, "invalid regex", f"Invalid regex pattern: {exc}")
         hits: list[str] = []
         matched_files: list[str] = []
         for rel in self.list_workspace_files(limit=300):

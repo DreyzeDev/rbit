@@ -2767,3 +2767,63 @@ async def test_full_agent_turn_thinking_reasoning_stream_and_click(tmp_path: Pat
         assert "▾" in lines[0].render().plain
         assert "сначала думаю о структуре." in lines[0].render().plain
         assert "Первая часть" in cards[0].msg.content
+
+
+def test_atomic_write_preserves_dominant_line_ending(tmp_path: Path) -> None:
+    from rbit.tools import atomic_write_text
+
+    crlf = tmp_path / "crlf.txt"
+    crlf.write_bytes(b"a\r\nb\r\nc\r\n")
+    atomic_write_text(crlf, "a\nB\nc\n")
+    assert crlf.read_bytes() == b"a\r\nB\r\nc\r\n"
+
+    lf = tmp_path / "lf.txt"
+    lf.write_bytes(b"a\nb\n")
+    atomic_write_text(lf, "a\nB\n")
+    assert lf.read_bytes() == b"a\nB\n"
+
+    fresh = tmp_path / "new.txt"
+    atomic_write_text(fresh, "x\n")
+    assert fresh.read_bytes() == b"x\n"
+
+
+@pytest.mark.asyncio
+async def test_fuzzy_edit_keeps_trailing_newline(tmp_path: Path) -> None:
+    (tmp_path / "m.py").write_text("def  foo():\n    return 1\n", encoding="utf-8")
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    res = await executor.execute(
+        "edit", {"filePath": "m.py", "oldString": "def foo():", "newString": "def bar():"}
+    )
+    assert res.ok is True, res
+    text = (tmp_path / "m.py").read_text(encoding="utf-8")
+    assert text == "def bar():\n    return 1\n"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_restore_keeps_binary_files(tmp_path: Path) -> None:
+    (tmp_path / "keep.txt").write_text("v1\n", encoding="utf-8")
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    meta = executor.create_checkpoint("before")
+
+    (tmp_path / "keep.txt").write_text("v2\n", encoding="utf-8")
+    (tmp_path / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\nbinary")
+    (tmp_path / "later.txt").write_text("new file\n", encoding="utf-8")
+
+    msg = executor.restore_checkpoint(meta.id)
+    assert (tmp_path / "keep.txt").read_text(encoding="utf-8") == "v1\n"
+    assert (tmp_path / "logo.png").read_bytes().startswith(b"\x89PNG")
+    assert not (tmp_path / "later.txt").exists()
+    assert "restored" in msg
+
+
+@pytest.mark.asyncio
+async def test_grep_utf8_output_and_invalid_regex(tmp_path: Path) -> None:
+    (tmp_path / "u.txt").write_text("\u0101\u0101\u0101 needle\n", encoding="utf-8")
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+
+    res = await executor.execute("grep", {"pattern": "needle"})
+    assert res.ok is True
+    assert "needle" in res.output
+
+    bad = await executor.execute("grep", {"pattern": "[", "filesOnly": True})
+    assert bad.ok is False

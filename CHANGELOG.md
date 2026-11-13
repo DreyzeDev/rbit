@@ -71,9 +71,17 @@ All notable changes to rbit are documented here. The format follows
 
 ### Fixed
 
-- The ripgrep-backed `grep` now respects `.gitignore` even outside a git repository
-  (`--no-require-git`) and emits the same relative `path:line:` formatting as the
-  fallback, so results no longer depend on whether `rg` is installed.
+- File writes preserve the target's dominant line ending: editing an LF file no longer
+  rewrites every line to CRLF (and vice versa), so diffs stay minimal and follow-up
+  edits stop failing with `oldString not found`.
+- Fuzzy edit no longer eats the newline after the replaced block, which glued the next
+  line onto the replacement and silently corrupted files.
+- `restore_checkpoint` no longer deletes binary or undecodable files created after the
+  checkpoint (only restorable text files are removed); a path manifest also protects
+  files that existed but could not be snapshotted.
+- The ripgrep-backed `grep` decodes output as UTF-8 (it crashed on non-ASCII content
+  under the cp1252 locale) and reports rg failures instead of pretending "no matches";
+  invalid regexes return a clear error from the fallback path.
 - Streaming text no longer aborts the turn with a bogus connection error when the chat
   card has not finished mounting yet (`No nodes match 'Markdown'`).
 - Provider failures are no longer reported as network errors; non-HTTP exceptions surface
