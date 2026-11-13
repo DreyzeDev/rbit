@@ -977,6 +977,9 @@ class AgentEngine:
         effort = self._reasoning_effort(model_id)
         if effort is not None:
             payload["reasoning_effort"] = effort
+        max_tokens = (self.get_config() or {}).get("max_tokens")
+        if max_tokens:
+            payload["max_tokens"] = int(max_tokens)
         full_text: list[str] = []
         reasoning_text: list[str] = []
         tc_acc: dict[int, dict[str, Any]] = {}
@@ -1159,6 +1162,9 @@ class AgentEngine:
         effort = self._reasoning_effort(model_id)
         if effort is not None:
             payload["reasoning_effort"] = effort
+        max_tokens = (self.get_config() or {}).get("max_tokens")
+        if max_tokens:
+            payload["max_tokens"] = int(max_tokens)
         for attempt in range(1, self.retry_attempts + 1):
             try:
                 _t_req = time.perf_counter()
