@@ -1169,7 +1169,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     from rbit.agent import AgentEngine
-    from rbit.models import ChatMessage, Session, ToolCallRecord, short_id
+    from rbit.models import AVAILABLE_MODELS, ChatMessage, Session, ToolCallRecord, short_id
     from rbit.tools import ToolExecutor
 
     workspace = _resolve_workspace(args.dir)
@@ -1178,7 +1178,13 @@ def _run_serve(args: argparse.Namespace) -> int:
     model_id = str(cfg.get("model", "rbit/smart-local"))
     sessions: dict[str, Session] = {}
 
-    def run_turn_events(prompt_text: str, session: Session, sink: "_queue.Queue"):  # type: ignore[name-defined]
+    def run_turn_events(
+        prompt_text: str,
+        session: Session,
+        sink: "_queue.Queue",  # type: ignore[name-defined]
+        model_override: str = "",
+        agent_override: str = "",
+    ):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -1209,11 +1215,12 @@ def _run_serve(args: argparse.Namespace) -> int:
             async def _turn() -> None:
                 user = ChatMessage(id=short_id(), role="user", content=prompt_text)
                 session.messages.append(user)
+                agent_mode = agent_override if agent_override in ("build", "plan") else "build"
                 reply = await engine.run_turn(
                     session=session,
                     user_msg=user,
-                    agent_mode="build",
-                    model_id=model_id,
+                    agent_mode=agent_mode,
+                    model_id=model_override or model_id,
                     on_tool_start=on_tool_start,
                     on_tool_end=on_tool_end,
                     on_status=on_status,
@@ -1283,6 +1290,24 @@ def _run_serve(args: argparse.Namespace) -> int:
                 else:
                     self.send_response(404)
                     self.end_headers()
+            elif self.path == "/v1/models":
+                listed = [
+                    {
+                        "id": m.id,
+                        "name": m.name,
+                        "provider": m.provider,
+                        "context_window": m.context_window,
+                        "cost_per_1k": m.cost_per_1k,
+                    }
+                    for m in AVAILABLE_MODELS
+                ]
+                body = _json.dumps({"models": listed}, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self._cors()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             elif self.path == "/v1/sessions":
                 listed = [
                     {
@@ -1350,6 +1375,8 @@ def _run_serve(args: argparse.Namespace) -> int:
             sid = str(req.get("session_id") or "")
             session = sessions.get(sid) or (storage.find_session(sid) if sid else None) or Session()
             sessions[session.id] = session
+            model_req = str(req.get("model") or "").strip()
+            agent_req = str(req.get("agent") or "").strip()
 
             self.send_response(200)
             self._cors()
@@ -1357,7 +1384,7 @@ def _run_serve(args: argparse.Namespace) -> int:
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             events: _queue.Queue = _queue.Queue()
-            worker = _threading.Thread(target=run_turn_events, args=(prompt_text, session, events), daemon=True)
+            worker = _threading.Thread(target=run_turn_events, args=(prompt_text, session, events, model_req, agent_req), daemon=True)
             worker.start()
             while True:
                 item = events.get()
@@ -1367,7 +1394,7 @@ def _run_serve(args: argparse.Namespace) -> int:
                 self.wfile.flush()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    Console().print(f"rbit serve on http://127.0.0.1:{args.port}  (POST /v1/turns, GET /health)")
+    Console().print(f"rbit serve on http://127.0.0.1:{args.port}  (POST /v1/turns, GET /health, GET /v1/models)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
