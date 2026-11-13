@@ -479,7 +479,7 @@ class AgentEngine:
         headers = self._build_headers(api_key)
 
         cfg_limits = self.get_config()
-        max_steps = max(1, int(cfg_limits.get("max_steps", 10) or 10))
+        max_steps = max(1, int(cfg_limits.get("max_steps", 50) or 50))
         raw_max_cost = cfg_limits.get("max_cost_usd")
         max_cost = float(raw_max_cost) if raw_max_cost not in (None, "", 0, "0") else None
         cost_per_1k = get_model_info(model_id, self.extra_models).cost_per_1k
@@ -487,8 +487,8 @@ class AgentEngine:
 
         async def _drive_steps(client: httpx.AsyncClient) -> str:
             nonlocal spent_usd
-            for step in range(max_steps):
-                await on_status(f"Запрос к {model_id} (шаг {step + 1}/{max_steps})...")
+            await on_status(f"Запрос к {model_id}...")
+            for _step in range(max_steps):
                 if on_stream_chunk is not None:
                     ok, content, tool_calls = await self._stream_chat_step(
                         client=client,

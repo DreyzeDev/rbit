@@ -52,6 +52,8 @@ All notable changes to rbit are documented here. The format follows
 ### Changed
 
 - Bash output is dimmed and gutter-prefixed so commands stand out from their results.
+- The `шаг N/M` counter was removed from the status bar; the agent loop now runs up to
+  50 tool rounds by default (`max_steps` still overrides it).
 
 - Session writes are debounced (1.2s) instead of rewriting the file on every stream
   chunk; pending writes flush on exit.
