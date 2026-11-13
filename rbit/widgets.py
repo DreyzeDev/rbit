@@ -870,22 +870,25 @@ class SidebarPanel(Vertical):
             todo.append("No active tasks (/todo)", style="#686868")
         self.query_one("#sb-todo", Static).update(todo)
 
-        # 6. Modified Files
+        # 6. Modified Files (click a file to open its session diff)
         files = session.modified_files
-        fblock = Text()
-        fblock.append("Modified Files\n", style="bold #eeeeee")
         if not files:
+            fblock = Text()
+            fblock.append("Modified Files\n", style="bold #eeeeee")
             fblock.append("No modified files", style="#686868")
+            self.query_one("#sb-files", Static).update(fblock)
         else:
+            lines = ["[bold #eeeeee]Modified Files[/]"]
             for rel, stat in list(files.items())[-10:]:
                 short_rel = rel if len(rel) <= 22 else "…" + rel[-21:]
-                fblock.append(f"{short_rel:<23} ", style="#eeeeee")
+                safe = rel.replace("\\", "/").replace("'", "")
+                line = f"[@click=app.open_file_diff('{safe}')]{short_rel}[/]"
                 if stat.added:
-                    fblock.append(f"+{stat.added}", style="#7fd88f")
+                    line += f" [#7fd88f]+{stat.added}[/]"
                 if stat.removed:
-                    fblock.append(f" -{stat.removed}", style="#e06c75")
-                fblock.append("\n")
-        self.query_one("#sb-files", Static).update(fblock)
+                    line += f" [#e06c75]-{stat.removed}[/]"
+                lines.append(line)
+            self.query_one("#sb-files", Static).update("\n".join(lines))
 
 
 class AutocompletePopup(OptionList):

@@ -8,6 +8,14 @@ All notable changes to rbit are documented here. The format follows
 
 ### Added
 
+- Prompt queue: a prompt submitted while the agent is working is queued (preview in
+  the status line) and runs automatically when the current turn finishes; Esc clears
+  the queue.
+- Tool-argument streaming feedback: while the model streams tool-call arguments, the
+  status line shows `стрим аргументов: write · 1.2 KB` (on name change or ~512 bytes).
+- Sidebar "Modified Files" entries are clickable and open a unified diff modal
+  (session start vs current file state).
+
 - Model fallback to `rbit/smart-local` on HTTP 401/404 responses.
 - `rbit run --stdin`, `--output-format jsonl`, and `rbit commit` (`--apply`).
 - Shell completion via `rbit --generate-completion bash|zsh|powershell`.

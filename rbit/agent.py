@@ -773,6 +773,7 @@ class AgentEngine:
             tc_acc = {}
             last_tc_key = 0
             finish_reason = None
+            args_progress: dict[int, tuple[str, int]] = {}
             try:
                 async with client.stream("POST", url, headers=headers, json=payload) as resp:
                     if (
@@ -861,6 +862,25 @@ class AgentEngine:
                                 entry["function"]["name"] += fn["name"]
                             if fn.get("arguments"):
                                 entry["function"]["arguments"] += fn["arguments"]
+                            # Live feedback while the model streams tool arguments
+                            # (name change or every ~512 chars).
+                            if on_status is not None:
+                                name_now = entry["function"]["name"]
+                                args_len = len(entry["function"]["arguments"])
+                                last_name, last_len = args_progress.get(last_tc_key, ("", -1))
+                                if name_now != last_name or args_len - last_len >= 512:
+                                    args_progress[last_tc_key] = (name_now, args_len)
+                                    label = f"{name_now} · {args_len} B" if name_now else "tool call…"
+                                    try:
+                                        await on_status(f"стрим аргументов: {label}")
+                                    except Exception:
+                                        logger.debug("status hook failed", exc_info=True)
+                if args_progress and on_status is not None:
+                    # Clear the "streaming arguments" hint once the response ends.
+                    try:
+                        await on_status("")
+                    except Exception:
+                        logger.debug("status hook failed", exc_info=True)
                 ordered_tcs = [tc_acc[k] for k in sorted(tc_acc.keys())]
                 if finish_reason == "length":
                     for entry in ordered_tcs:

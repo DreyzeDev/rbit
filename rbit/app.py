@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import platform
 import re
 import shutil
@@ -25,6 +26,7 @@ from .modals import (
     CheckpointModal,
     CommandPaletteModal,
     ConnectApiModal,
+    DiffViewerModal,
     EffortSelectorModal,
     HelpModal,
     ModelSelectorModal,
@@ -492,6 +494,7 @@ class RbitApp(App[None]):
         self.is_busy: bool = False
         self.busy_status: str = ""
         self._busy_worker: Any = None
+        self._queued_prompt: str | None = None
         self._spin_frame: int = 0
         self._has_inline_notices: bool = False
         self._sidebar_override_on_home: bool = False
@@ -605,12 +608,19 @@ class RbitApp(App[None]):
             self._spin_frame += 1
             self.query_one(PromptSubHints).update_state(
                 busy=True,
-                status=self.busy_status,
+                status=self._busy_status_display,
                 mode=self.agent_mode,
                 frame=self._spin_frame,
             )
             if self._thinking is not None:
                 self._thinking.tick(self._spin_frame)
+
+    @property
+    def _busy_status_display(self) -> str:
+        if self._queued_prompt and self.is_busy:
+            preview = self._queued_prompt.strip().replace("\n", " ")[:28]
+            return f"{self.busy_status}  ·  в очереди: {preview}…".strip()
+        return self.busy_status
 
     @property
     def _is_home_state(self) -> bool:
@@ -659,6 +669,37 @@ class RbitApp(App[None]):
         except NoMatches:
             pass
 
+    @work
+    async def action_open_file_diff(self, rel: str) -> None:
+        """Shows the session's cumulative diff for a modified file (sidebar click)."""
+        try:
+            target = self.executor.resolve_path(rel)
+        except Exception:
+            self.notify(f"Cannot resolve path: {rel}", severity="warning")
+            return
+        target_key = str(target)
+        snapshots = [s for s in self.executor.undo_stack if s.path == target_key]
+        original = ""
+        if snapshots:
+            first = snapshots[0]
+            if first.existed_before:
+                original = first.previous_content
+        try:
+            current = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            self.notify(f"Cannot read {rel}: {exc}", severity="warning")
+            return
+        diff = "\n".join(
+            difflib.unified_diff(
+                original.splitlines(),
+                current.splitlines(),
+                fromfile=f"a/{rel}",
+                tofile=f"b/{rel}",
+                lineterm="",
+            )
+        )
+        self.push_screen(DiffViewerModal(rel, diff))
+
     def _sync_ui(self) -> None:
         model_id = self.config_data.get("model", "rbit/smart-local")
         api_ok = bool((self.config_data.get("api_key") or "").strip())
@@ -678,7 +719,7 @@ class RbitApp(App[None]):
         )
         self.query_one(PromptSubHints).update_state(
             busy=self.is_busy,
-            status=self.busy_status,
+            status=self._busy_status_display,
             mode=self.agent_mode,
             frame=self._spin_frame,
         )
@@ -808,6 +849,7 @@ class RbitApp(App[None]):
             self._interrupted_turn = self._finalize_interrupted()
             self.is_busy = False
             self.busy_status = ""
+            self._queued_prompt = None  # interrupt means stop everything
             self._post_notice("Interrupted by user (esc).")
             self._sync_ui()
 
@@ -1029,6 +1071,7 @@ class RbitApp(App[None]):
         if self.is_busy:
             self.notify("Agent is busy — press Esc first.", severity="warning")
             return
+        self._queued_prompt = None
         self.session = Session()
         self.executor.session = self.session
         self._history_window = 30
@@ -1106,6 +1149,7 @@ class RbitApp(App[None]):
         if self.is_busy:
             self.notify("Agent is busy — press Esc first.", severity="warning")
             return
+        self._queued_prompt = None
         self.session = sess
         self.executor.session = sess
         self._history_window = 30
@@ -1656,7 +1700,12 @@ class RbitApp(App[None]):
 
     def _submit_prompt(self, raw_text: str) -> None:
         if self.is_busy:
-            self.notify("Agent is currently working — press Esc to interrupt.", severity="warning")
+            # Prompt queue: let the user type the next task while the agent works;
+            # it is dispatched automatically when the current turn finishes.
+            self._queued_prompt = raw_text
+            preview = raw_text.strip().replace("\n", " ")[:40]
+            self.notify(f"В очереди — выполнится после текущего хода: {preview}", timeout=3.0)
+            self._sync_ui()
             return
 
         attachments = re.findall(r"@([^\s]+)", raw_text)
@@ -1802,4 +1851,8 @@ class RbitApp(App[None]):
             self._schedule_save_session(delay=0.05)
             self.is_busy = False
             self.busy_status = ""
+            queued = self._queued_prompt
+            self._queued_prompt = None
             self._sync_ui()
+            if queued:
+                self.call_after_refresh(self._submit_prompt, queued)

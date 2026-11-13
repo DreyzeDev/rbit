@@ -3030,3 +3030,109 @@ async def test_prompt_paste_keeps_multiline_and_large_text(tmp_path: Path) -> No
         inp.post_message(events.Paste("a\nb\nc\nдлинный хвост"))
         await pilot.pause()
         assert inp.value == "начало a b c длинный хвост"
+
+
+@pytest.mark.asyncio
+async def test_prompt_queue_runs_after_current_turn(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    app.config_data["model"] = "rbit/smart-local"
+    turn = {"n": 0}
+
+    release = asyncio.Event()
+
+    async def fake_run_turn(**kwargs):
+        turn["n"] += 1
+        if turn["n"] == 1:
+            await release.wait()  # hold the first turn open until the queue is set
+        return ChatMessage(
+            id=f"a{turn['n']}", role="assistant", content=f"ответ {turn['n']}",
+            agent="build", model="m", duration_s=0.1,
+        )
+
+    app.engine.run_turn = fake_run_turn
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        app._submit_prompt("первый")
+        for _ in range(100):
+            await pilot.pause()
+            if app.is_busy:
+                break
+        assert app.is_busy, "first turn never started"
+        app._submit_prompt("второй")
+        assert app._queued_prompt == "второй"
+        assert "в очереди" in app._busy_status_display
+        release.set()
+        for _ in range(600):
+            await pilot.pause()
+            if len(app.session.messages) >= 4 and not app.is_busy:
+                break
+        await pilot.pause()
+        assert app._queued_prompt is None
+    roles = [m.role for m in app.session.messages]
+    assert roles == ["user", "assistant", "user", "assistant"]
+    assert app.session.messages[-1].content == "ответ 2"
+
+
+@pytest.mark.asyncio
+async def test_sidebar_file_opens_diff_modal(tmp_path: Path) -> None:
+    (tmp_path / "t.txt").write_text("v1\n", encoding="utf-8")
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        res = await app.executor.execute(
+            "edit", {"filePath": "t.txt", "oldString": "v1", "newString": "v2"}
+        )
+        assert res.ok is True
+        app._sync_ui()
+        await pilot.pause()
+        app.action_open_file_diff("t.txt")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert type(app.screen).__name__ == "DiffViewerModal"
+        await pilot.press("escape")
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_tool_args_streaming_status_hint(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "test"}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        chunks = [
+            {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "c1", "function": {"name": "write"}}
+            ]}}]},
+            {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "x" * 600}}
+            ]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+        body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    statuses: list[str] = []
+
+    async def on_status(s: str) -> None:
+        statuses.append(s)
+
+    async def on_stream_chunk(_p: str) -> None:
+        return None
+
+    ok, text, tool_calls = await engine._stream_chat_step(
+        client=engine.http_client,
+        url="https://mock.local/v1/chat/completions",
+        headers={},
+        model_id="openai/gpt-4.1",
+        messages=[{"role": "user", "content": "hi"}],
+        on_stream_chunk=on_stream_chunk,
+        on_status=on_status,
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert ok is True
+    assert any("стрим аргументов: write" in s for s in statuses)
+    assert statuses[-1] == ""
+    assert tool_calls and len(tool_calls[0]["function"]["arguments"]) == 600

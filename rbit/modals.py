@@ -118,6 +118,32 @@ HELP_MARKDOWN = """
 """
 
 
+class DiffViewerModal(ModalScreen[None]):
+    """Unified diff for one modified file (opened from the sidebar)."""
+
+    BINDINGS = [Binding("escape", "close", "Close")]
+
+    MAX_DIFF_CHARS = 60000
+
+    def __init__(self, rel: str, diff_text: str) -> None:
+        super().__init__()
+        self.rel = rel
+        self.diff_text = diff_text or "(no changes recorded for this file)"
+
+    def compose(self) -> ComposeResult:
+        body = self.diff_text
+        if len(body) > self.MAX_DIFF_CHARS:
+            body = body[: self.MAX_DIFF_CHARS] + "\n… (diff truncated)"
+        with Vertical(classes="oc-modal help-modal"):
+            yield Static(_modal_header(f"Diff — {self.rel}"), classes="oc-modal-header")
+            with VerticalScroll(id="diff-scroll"):
+                yield Markdown(f"```diff\n{body}\n```", id="diff-content")
+            yield Label("esc close", classes="oc-modal-foot")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class HelpModal(ModalScreen[None]):
     """Full-screen keybindings cheat sheet (F1 / /help)."""
 
