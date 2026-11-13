@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rbit"
-version = "1.2.0"
+version = "1.3.1"
 description = "rbit — Next-Gen Full-Screen Terminal AI Coding Agent & CLI"
 requires-python = ">=3.10"
 dependencies = [
