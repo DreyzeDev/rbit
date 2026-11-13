@@ -318,7 +318,7 @@ Screen {
 #sidebar {
     width: 36;
     height: 1fr;
-    background: transparent;
+    background: $surface;
     border-left: solid #1a1a1a;
     padding: 1 1;
 }
