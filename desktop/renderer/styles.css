@@ -73,9 +73,9 @@ code, pre { font-family: ui-monospace, Consolas, monospace; }
   flex: 1; overflow-y: auto; padding: 20px 24px;
   display: flex; flex-direction: column; justify-content: flex-end;
 }
-body.home #feed { justify-content: flex-start; padding-top: 13vh; }
+body.home #feed { justify-content: flex-start; padding-top: 21vh; }
 .wordmark {
-  font-size: 110px; font-weight: 800; letter-spacing: 4px; color: #1f1f1f;
+  font-size: 150px; font-weight: 800; letter-spacing: 6px; color: #1c1c1c;
   text-align: center; user-select: none; line-height: 1;
 }
 body:not(.home) .wordmark { font-size: 40px; color: #202020; margin-bottom: 18px; }
@@ -99,7 +99,7 @@ code { background: #101010; padding: 1px 5px; border-radius: 4px; }
 /* ---- composer card ---- */
 #composer-wrap { padding: 10px 20px 16px; display: flex; flex-direction: column; align-items: center; }
 body.home #composer-wrap {
-  position: absolute; left: 0; right: 0; top: 46%; transform: translateY(-50%);
+  position: absolute; left: 0; right: 0; top: 44%; transform: translateY(-50%);
   padding: 0 20px;
 }
 #composer-card {
