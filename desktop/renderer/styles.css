@@ -75,8 +75,10 @@ code, pre { font-family: ui-monospace, Consolas, monospace; }
 }
 body.home #feed { justify-content: flex-start; padding-top: 21vh; }
 .wordmark {
-  font-size: 150px; font-weight: 800; letter-spacing: 6px; color: #1c1c1c;
+  font-size: 160px; font-weight: 800; letter-spacing: 10px; color: #1c1c1c;
   text-align: center; user-select: none; line-height: 1;
+  background: linear-gradient(180deg, #242424 0%, #171717 100%);
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
 }
 body:not(.home) .wordmark { font-size: 40px; color: #202020; margin-bottom: 18px; }
 body.home .tagline { display: none; }
@@ -99,13 +101,13 @@ code { background: #101010; padding: 1px 5px; border-radius: 4px; }
 /* ---- composer card ---- */
 #composer-wrap { padding: 10px 20px 16px; display: flex; flex-direction: column; align-items: center; }
 body.home #composer-wrap {
-  position: absolute; left: 0; right: 0; top: 44%; transform: translateY(-50%);
+  position: absolute; left: 0; right: 0; top: 42%; transform: translateY(-50%);
   padding: 0 20px;
 }
 #composer-card {
-  display: flex; flex-direction: column; width: 100%; max-width: 720px;
-  background: var(--card); border: 1px solid var(--border); border-radius: 14px;
-  padding: 12px 14px 8px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  display: flex; flex-direction: column; width: 100%; max-width: 745px;
+  background: #1c1c1c; border: 1px solid #262626; border-radius: 12px;
+  padding: 14px 16px 10px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
 }
 #composer-card:focus-within { border-color: #6b5642; }
 #prompt {
@@ -122,22 +124,10 @@ button.ghost {
 }
 button.ghost:hover { background: #2a2a2a; color: var(--text); }
 #send {
-  background: var(--accent); color: #141414; border: 0; border-radius: 50%;
-  width: 34px; height: 34px; cursor: pointer; font-size: 15px; line-height: 1;
+  background: #2a2a2a; color: #e8e8e8; border: 0; border-radius: 9px;
+  width: 36px; height: 34px; cursor: pointer; font-size: 15px; line-height: 1;
 }
 #send:disabled { opacity: 0.35; cursor: default; }
 
 /* ---- breadcrumbs ---- */
-#crumbs {
-  display: flex; align-items: center; gap: 8px; margin-top: 12px;
-  justify-content: center; color: var(--dim); font-size: 13px;
-}
-body:not(.home) #crumbs { display: none; }
-.crumb {
-  background: transparent; border: 0; color: var(--text); cursor: pointer;
-  font-size: 13px; padding: 3px 6px; border-radius: 6px;
-}
-.crumb:hover { background: var(--card); color: var(--accent); }
-.crumb-static { color: var(--dim); }
-.crumb-path { color: #5a5a5a; margin-left: 8px; }
-.sep { color: #4a4a4a; }
+body:not(.home) 

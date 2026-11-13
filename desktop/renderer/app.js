@@ -206,7 +206,6 @@ promptEl.addEventListener("input", () => {
   promptEl.style.height = "auto";
   promptEl.style.height = Math.min(200, promptEl.scrollHeight) + "px";
 });
-document.getElementById("crumb-path").textContent = rbitCfg.workspace || "";
 
 setHome();
 refreshSessions();
