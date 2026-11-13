@@ -3004,3 +3004,29 @@ def test_load_corrupted_checkpoint_returns_none(tmp_path: Path) -> None:
     storage.ensure_dirs()
     (storage.checkpoints_dir / "badcp.json").write_text("{ truncated", encoding="utf-8")
     assert storage.load_checkpoint_files("badcp") is None
+
+
+@pytest.mark.asyncio
+async def test_prompt_paste_keeps_multiline_and_large_text(tmp_path: Path) -> None:
+    from textual import events
+
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        inp = app.query_one("#prompt-input", Input)
+
+        inp.post_message(events.Paste("строка один\nстрока два\nстрока три"))
+        await pilot.pause()
+        assert inp.value == "строка один строка два строка три"
+
+        inp.value = ""
+        big = "x" * 20000
+        inp.post_message(events.Paste(big))
+        await pilot.pause()
+        assert inp.value == big
+
+        inp.value = "начало "
+        inp.cursor_position = len(inp.value)
+        inp.post_message(events.Paste("a\nb\nc\nдлинный хвост"))
+        await pilot.pause()
+        assert inp.value == "начало a b c длинный хвост"

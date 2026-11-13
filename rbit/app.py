@@ -54,6 +54,7 @@ from .widgets import (
     ChatScroll,
     HomeLogo,
     HomeTipBanner,
+    PromptInput,
     PromptModelLabel,
     PromptSubHints,
     SessionHeaderBar,
@@ -531,7 +532,7 @@ class RbitApp(App[None]):
                 with Vertical(id="prompt-outer"):
                     yield AutocompletePopup()
                     with Vertical(id="prompt-box", classes="mode-build"):
-                        yield Input(
+                        yield PromptInput(
                             placeholder="Ask anything...",
                             id="prompt-input",
                         )

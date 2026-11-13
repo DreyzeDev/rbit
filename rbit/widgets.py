@@ -18,7 +18,7 @@ from textual.containers import Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.reactive import reactive
-from textual.widgets import Markdown, OptionList, Static
+from textual.widgets import Input, Markdown, OptionList, Static
 from textual.widgets.option_list import Option
 
 from . import __version__
@@ -298,6 +298,37 @@ class ThinkingIndicator(Static):
         text.append("\n")
         text.append(body, style="#8f8f8f")
         return text
+
+
+class PromptInput(Input):
+    """Prompt input that accepts whole multi-line pastes.
+
+    The stock Input keeps only the first line of a Paste event, silently
+    truncating long prompts (code, logs, big messages) pasted from the
+    clipboard. Lines are joined with spaces since the input is single-line."""
+
+    def _on_paste(self, event: events.Paste) -> None:
+        text = event.text
+        if text.strip():
+            line = " ".join(text.splitlines()) or text
+            selection = self.selection
+            if selection.is_empty:
+                self.insert_text_at_cursor(line)
+            else:
+                self.replace(line, *selection)
+            # Textual invokes _on_paste for every class in the MRO, so Input's
+            # first-line-only handler would run after this one — blank the text
+            # to make it a no-op.
+            event.text = ""
+        event.stop()
+
+    def action_paste(self) -> None:
+        clipboard = self.app.clipboard
+        if not clipboard:
+            return
+        line = " ".join(clipboard.splitlines()) or clipboard
+        start, end = self.selection
+        self.replace(line, start, end)
 
 
 class SessionHeaderBar(Static):

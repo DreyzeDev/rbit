@@ -71,6 +71,9 @@ All notable changes to rbit are documented here. The format follows
 
 ### Fixed
 
+- Pasting large/multi-line text into the prompt no longer truncates it to the first
+  line: the whole paste is inserted (lines joined with spaces), from both the terminal
+  bracketed-paste path and `ctrl+v`.
 - A stream that breaks mid-tool-call no longer glues its partial deltas onto the
   retried response (accumulators reset per attempt; `index: null` and missing
   `index`/`id` deltas no longer merge parallel tool calls into one).
