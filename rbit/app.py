@@ -1152,8 +1152,19 @@ class RbitApp(App[None]):
 
     @work
     async def action_search_session(self, initial_query: str = "") -> None:
-        target = await self.push_screen_wait(SearchResultsModal(self.session, initial_query))
+        target = await self.push_screen_wait(
+            SearchResultsModal(
+                self.session, initial_query, all_sessions=self.storage.list_sessions()
+            )
+        )
         if target:
+            if ":" in target:
+                # Cross-session hit: "<session_id>:<message_id>" — load it first.
+                sid, mid = target.split(":", 1)
+                other = self.storage.find_session(sid)
+                if other is not None and other.id != self.session.id:
+                    self._load_session_into_ui(other)
+                target = mid
             self._jump_to_message(target)
         self.query_one("#prompt-input", Input).focus()
 

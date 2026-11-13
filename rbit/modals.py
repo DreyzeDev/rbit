@@ -770,9 +770,11 @@ class SearchResultsModal(ModalScreen[str | None]):
 
     BINDINGS = [Binding("escape", "cancel", "Close")]
 
-    def __init__(self, session: Session, query: str = "") -> None:
+    def __init__(self, session: Session, query: str = "", all_sessions: list[Session] | None = None) -> None:
         super().__init__()
         self.session = session
+        # Current session first, then every other stored session (cross-session search).
+        self._sessions = [session] + [s for s in (all_sessions or []) if s.id != session.id]
         self._query = query
         self._hits: list[tuple[str, str, str]] = []
 
@@ -794,7 +796,14 @@ class SearchResultsModal(ModalScreen[str | None]):
 
     def _run_search(self, query: str) -> None:
         self._query = query
-        self._hits = search_session(self.session, query)
+        hits: list[tuple[str, str, str]] = []
+        for s in self._sessions:
+            for mid, label, snippet in search_session(s, query):
+                if s.id != self.session.id:
+                    label = f"⟨{s.title[:24]}⟩ {label}"
+                    mid = f"{s.id}:{mid}"
+                hits.append((mid, label, snippet))
+        self._hits = hits
         olist = self.query_one("#search-session-list", OptionList)
         olist.clear_options()
         if not query.strip():
