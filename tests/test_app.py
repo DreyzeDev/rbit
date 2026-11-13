@@ -3261,3 +3261,149 @@ async def test_self_check_runs_one_fix_round(tmp_path: Path) -> None:
         await pilot.pause()
     assert calls["n"] == 2
     assert any("[auto]" in m.content for m in app.session.messages if m.role == "user")
+
+
+@pytest.mark.asyncio
+async def test_notebook_read_and_edit_cells(tmp_path: Path) -> None:
+    nb = {
+        "cells": [
+            {"cell_type": "code", "metadata": {}, "source": ["print(1)\n"], "outputs": [{"x": 1}], "execution_count": 1},
+            {"cell_type": "markdown", "metadata": {}, "source": ["# Title"]},
+        ],
+        "metadata": {},
+        "nbformat": 4,
+    }
+    (tmp_path / "n.ipynb").write_text(json.dumps(nb), encoding="utf-8")
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+
+    read = await executor.execute("notebook", {"filePath": "n.ipynb", "action": "read"})
+    assert read.ok is True
+    assert "[0] code · 1 output(s)" in read.output
+    assert "[1] markdown" in read.output
+
+    edit = await executor.execute("notebook", {
+        "filePath": "n.ipynb", "action": "set_cell", "index": 0, "source": "print(2)\n",
+    })
+    assert edit.ok is True, edit
+    saved = json.loads((tmp_path / "n.ipynb").read_text(encoding="utf-8"))
+    assert "".join(saved["cells"][0]["source"]) == "print(2)\n"
+    assert saved["cells"][0]["outputs"] == []  # stale outputs dropped after edit
+
+    ins = await executor.execute("notebook", {
+        "filePath": "n.ipynb", "action": "insert_cell", "index": 1, "source": "# doc", "cellType": "markdown",
+    })
+    assert ins.ok is True
+    saved = json.loads((tmp_path / "n.ipynb").read_text(encoding="utf-8"))
+    assert saved["cells"][1]["cell_type"] == "markdown"
+
+    delete = await executor.execute("notebook", {"filePath": "n.ipynb", "action": "delete_cell", "index": 2})
+    assert delete.ok is True
+    saved = json.loads((tmp_path / "n.ipynb").read_text(encoding="utf-8"))
+    assert len(saved["cells"]) == 2
+
+
+def test_model_supports_tools_heuristic_and_override() -> None:
+    from rbit.agent import model_supports_tools
+
+    assert model_supports_tools("openai/gpt-4.1") is True
+    assert model_supports_tools("ollama/gemma3:8b") is False
+    cfg = {"model_capabilities": {"my-model": {"tools": False}}}
+    assert model_supports_tools("my-model", cfg) is False
+    assert model_supports_tools("openai/gpt-4.1", cfg) is True
+
+
+@pytest.mark.asyncio
+async def test_tools_omitted_for_unsupported_model(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "test"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert "tools" not in body
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ok, text, _ = await engine._non_stream_chat_step(
+        client=engine.http_client,
+        url="https://mock.local/v1/chat/completions",
+        headers={},
+        model_id="local/gemma3:8b",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_model_routing_picks_light_and_heavy(tmp_path: Path) -> None:
+    from rbit.agent import route_model_for_task
+
+    routing = {"enabled": True, "light": "m/light", "heavy": "m/heavy"}
+    short = ChatMessage(id="u1", role="user", content="привет")
+    long = ChatMessage(id="u2", role="user", content="рефактор " + "x" * 700)
+    assert route_model_for_task("m/base", short, routing) == "m/light"
+    assert route_model_for_task("m/base", long, routing) == "m/heavy"
+    with_att = ChatMessage(id="u3", role="user", content="hi", attachments=["a.py"])
+    assert route_model_for_task("m/base", with_att, routing) == "m/heavy"
+
+
+@pytest.mark.asyncio
+async def test_ollama_native_chat_with_tools(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": ""}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/api/chat")
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["messages"][0]["role"] == "system"
+        assert isinstance(body["messages"][0]["content"], str)  # no cache_control parts for ollama
+        assert "tools" in body
+        return httpx.Response(200, json={
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "read", "arguments": {"filePath": "a.py"}}}
+                ],
+            },
+            "done": True,
+        })
+
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ok, text, tool_calls = await engine._non_stream_chat_step(
+        client=engine.http_client,
+        url="http://localhost:11434/v1/chat/completions",
+        headers={},
+        model_id="llama3.1:8b",
+        messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}],
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert ok is True
+    assert tool_calls[0]["function"]["name"] == "read"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"filePath": "a.py"}
+
+
+@pytest.mark.asyncio
+async def test_provider_models_parse_pricing_and_context(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "k"}
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [
+            {"id": "m/cheap", "pricing": {"prompt": "0.000001", "completion": "0.000002"}, "context_length": 128000},
+            {"id": "m/free"},
+        ]})
+
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ok, message, models = await engine.fetch_provider_models("https://openrouter.ai/api/v1", "k")
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert ok is True
+    by_id = {m.id: m for m in models}
+    assert by_id["m/cheap"].cost_per_1k == 0.0015
+    assert by_id["m/cheap"].context_window == 128000
+    assert by_id["m/free"].cost_per_1k == 0.0

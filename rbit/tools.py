@@ -667,6 +667,8 @@ class ToolExecutor:
                 res = await asyncio.to_thread(self._tool_diagnostics, args)
             elif name == "lint":
                 res = await self._tool_lint(args)
+            elif name == "notebook":
+                res = self._tool_notebook(args)
             elif name == "todowrite":
                 res = self._tool_todowrite(args)
             elif name == "webfetch":
@@ -1423,6 +1425,101 @@ class ToolExecutor:
             "\n".join(f"- {item}" for item in all_issues),
         )
 
+    def _tool_notebook(self, args: dict[str, Any]) -> ToolResult:
+        """Cell-level access to .ipynb files: read / set_cell / insert_cell / delete_cell."""
+        raw = args.get("filePath") or args.get("path")
+        action = str(args.get("action", "read")).lower()
+        if not raw:
+            return ToolResult(False, "missing filePath", "filePath is required.")
+        target = self.resolve_path(str(raw))
+        rel = self.rel_display(target)
+        if not target.exists():
+            return ToolResult(False, f"{rel} not found", f"File does not exist: {rel}")
+        try:
+            nb = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return ToolResult(False, f"{rel} invalid", f"Cannot parse notebook: {exc}")
+        cells = nb.get("cells")
+        if not isinstance(cells, list):
+            return ToolResult(False, f"{rel} invalid", "Notebook has no `cells` list.")
+
+        def cell_source(cell: dict[str, Any]) -> str:
+            src = cell.get("source") or []
+            return src if isinstance(src, str) else "".join(src)
+
+        if action == "read":
+            lines: list[str] = []
+            for i, cell in enumerate(cells):
+                ctype = cell.get("cell_type", "?")
+                source = cell_source(cell)
+                outputs = cell.get("outputs") or []
+                out_note = f" · {len(outputs)} output(s)" if outputs else ""
+                lines.append(f"[{i}] {ctype}{out_note}")
+                src_lines = source.splitlines()
+                for src_line in src_lines[:40]:
+                    lines.append(f"    {src_line}")
+                if len(src_lines) > 40:
+                    lines.append(f"    … ({len(src_lines) - 40} more lines)")
+            return ToolResult(True, f"{len(cells)} cells", "\n".join(lines) or "(empty notebook)")
+
+        try:
+            index = int(args.get("index", -1))
+        except (TypeError, ValueError):
+            index = -1
+
+        def save_nb(new_content: str, label: str) -> None:
+            self.invalidate_file_cache()
+            self.undo_stack.append(
+                FileSnapshot(
+                    step_label=label,
+                    path=str(target),
+                    existed_before=True,
+                    previous_content=original,
+                    new_content=new_content,
+                )
+            )
+            self._record_file_change(rel, 0, 0)
+
+        if action in ("set_cell", "insert_cell"):
+            source = str(args.get("source", ""))
+            if not source:
+                return ToolResult(False, "missing source", "`source` is required for this action.")
+            if action == "set_cell" and not (0 <= index < len(cells)):
+                return ToolResult(False, "bad index", f"Cell index {index} out of range (0..{len(cells) - 1}).")
+            original = target.read_text(encoding="utf-8", errors="replace")
+            if action == "set_cell":
+                cells[index]["source"] = source.splitlines(keepends=True)
+                cells[index]["outputs"] = []
+                cells[index]["execution_count"] = None
+                updated = json.dumps(nb, ensure_ascii=False, indent=1)
+                atomic_write_text(target, updated)
+                save_nb(updated, f"notebook set_cell {rel}#{index}")
+                return ToolResult(True, f"cell #{index} replaced", f"Cell #{index} of {rel} updated.")
+            if index < 0 or index > len(cells):
+                index = len(cells)
+            new_cell = {
+                "cell_type": str(args.get("cellType") or "code"),
+                "metadata": {},
+                "source": source.splitlines(keepends=True),
+                "outputs": [],
+                "execution_count": None,
+            }
+            cells.insert(index, new_cell)
+            updated = json.dumps(nb, ensure_ascii=False, indent=1)
+            atomic_write_text(target, updated)
+            save_nb(updated, f"notebook insert {rel}#{index}")
+            return ToolResult(True, f"cell inserted at #{index}", f"Cell inserted into {rel} at #{index}.")
+        if action == "delete_cell":
+            if not (0 <= index < len(cells)):
+                return ToolResult(False, "bad index", f"Cell index {index} out of range (0..{len(cells) - 1}).")
+            original = target.read_text(encoding="utf-8", errors="replace")
+            cells.pop(index)
+            updated = json.dumps(nb, ensure_ascii=False, indent=1)
+            atomic_write_text(target, updated)
+            save_nb(updated, f"notebook delete {rel}#{index}")
+            return ToolResult(True, f"cell #{index} deleted", f"Cell #{index} removed from {rel}.")
+        return ToolResult(False, "unknown action", "action must be read | set_cell | insert_cell | delete_cell.")
+
     def _tool_todowrite(self, args: dict[str, Any]) -> ToolResult:
         raw_todos = args.get("todos", [])
         items: list[TodoItem] = []
@@ -1894,3 +1991,24 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         },
     },
 ]
+
+OPENAI_TOOLS_SCHEMA.append(
+    {
+        "type": "function",
+        "function": {
+            "name": "notebook",
+            "description": "Read or edit a Jupyter notebook (.ipynb) cell-by-cell without corrupting JSON.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string"},
+                    "action": {"type": "string", "enum": ["read", "set_cell", "insert_cell", "delete_cell"]},
+                    "index": {"type": "integer", "description": "Cell index (0-based)."},
+                    "source": {"type": "string", "description": "New cell source (set_cell/insert_cell)."},
+                    "cellType": {"type": "string", "enum": ["code", "markdown"]},
+                },
+                "required": ["filePath", "action"],
+            },
+        },
+    }
+)

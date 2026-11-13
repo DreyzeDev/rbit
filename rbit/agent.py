@@ -40,6 +40,47 @@ HTTP_LIMITS = httpx.Limits(max_keepalive_connections=10, max_connections=20)
 
 # Prompt profiles: accent + optionally restricted toolset. Selected via config
 # `prompt_profile` (or `--prompt-profile` on the CLI).
+TOOLLESS_MODEL_MARKERS = (
+    "gemma-2", "gemma2", "gemma3", "gemma-3",
+    "phi-2", "phi-3-small", "stablelm", "stable-lm",
+    "tinyllama", "smollm", "ministral-1", "ministral-3b",
+)
+
+
+def model_supports_tools(model_id: str, cfg: dict[str, Any] | None = None) -> bool:
+    """Heuristic + per-model override from config `model_capabilities`."""
+    if cfg:
+        caps = cfg.get("model_capabilities")
+        if isinstance(caps, dict):
+            override = caps.get(model_id)
+            if isinstance(override, dict) and "tools" in override:
+                return bool(override["tools"])
+            if isinstance(override, bool):
+                return override
+    mid = (model_id or "").lower()
+    return not any(marker in mid for marker in TOOLLESS_MODEL_MARKERS)
+
+
+HEAVY_TASK_MARKERS = (
+    "рефактор", "реализ", "мигр", "архитект", "оптимиз", "перепиш",
+    "refactor", "implement", "migrate", "architecture", "optimiz", "rewrite",
+)
+
+
+def route_model_for_task(model_id: str, user_msg: Any, routing: dict[str, Any]) -> str:
+    """Chooses light/heavy model by task size and keywords (config model_routing)."""
+    light = str(routing.get("light") or model_id)
+    heavy = str(routing.get("heavy") or model_id)
+    content = (getattr(user_msg, "content", "") or "")
+    lowered = content.lower()
+    is_heavy = (
+        len(content) > 600
+        or bool(getattr(user_msg, "attachments", None))
+        or any(w in lowered for w in HEAVY_TASK_MARKERS)
+    )
+    return heavy if is_heavy else light
+
+
 PROMPT_PROFILES: dict[str, dict[str, Any]] = {
     "default": {"prompt": ""},
     "fast": {
@@ -345,13 +386,29 @@ class AgentEngine:
             if not model_id or model_id in seen:
                 continue
             seen.add(model_id)
+            context_window = 200_000
+            cost_per_1k = 0.0
+            if isinstance(entry, dict):
+                try:
+                    context_window = int(entry.get("context_length") or 200_000)
+                except (TypeError, ValueError):
+                    context_window = 200_000
+                pricing = entry.get("pricing") or {}
+                try:
+                    prompt_p = float(pricing.get("prompt") or 0)
+                    completion_p = float(pricing.get("completion") or 0)
+                    if prompt_p or completion_p:
+                        # Per-token prices from OpenRouter-style listings → per-1k blended.
+                        cost_per_1k = round((prompt_p + completion_p) / 2 * 1000, 6)
+                except (TypeError, ValueError):
+                    cost_per_1k = 0.0
             models.append(
                 ModelInfo(
                     id=model_id,
                     name=_pretty_model_name(model_id),
                     provider=provider,
-                    context_window=200_000,
-                    cost_per_1k=0.0,
+                    context_window=context_window,
+                    cost_per_1k=cost_per_1k,
                 )
             )
         count = len(models)
@@ -395,6 +452,13 @@ class AgentEngine:
     ) -> ChatMessage:
         t0 = time.perf_counter()
         cfg = self.get_config()
+        routing = cfg.get("model_routing")
+        if isinstance(routing, dict) and routing.get("enabled"):
+            routed = route_model_for_task(model_id, user_msg, routing)
+            if routed and routed != model_id:
+                if on_status is not None:
+                    await on_status(f"роутинг: {routed}")
+                model_id = routed
         self.executor.begin_turn()
         model_info = get_model_info(model_id, self.extra_models)
         api_key = (cfg.get("api_key") or "").strip()
@@ -856,13 +920,20 @@ class AgentEngine:
         on_status: StatusHook | None = None,
         on_reasoning_chunk: StreamHook | None = None,
     ) -> tuple[bool, str, list[dict[str, Any]]]:
+        if self._is_ollama_base(url):
+            return await self._ollama_chat_step(
+                client, url, model_id, messages,
+                on_stream_chunk=on_stream_chunk, on_status=on_status,
+                on_reasoning_chunk=on_reasoning_chunk, stream=True,
+            )
         payload: dict[str, Any] = {
             "model": model_id,
             "messages": self._cached_messages(url, messages),
-            "tools": self._tools_for_payload(),
-            "tool_choice": "auto",
-            "stream": True,
         }
+        if model_supports_tools(model_id, self.get_config()):
+            payload["tools"] = self._tools_for_payload()
+            payload["tool_choice"] = "auto"
+        payload["stream"] = True
         effort = self._reasoning_effort(model_id)
         if effort is not None:
             payload["reasoning_effort"] = effort
@@ -1030,12 +1101,19 @@ class AgentEngine:
         on_status: StatusHook | None = None,
         on_reasoning_chunk: StreamHook | None = None,
     ) -> tuple[bool, str, list[dict[str, Any]]]:
+        if self._is_ollama_base(url):
+            return await self._ollama_chat_step(
+                client, url, model_id, messages,
+                on_stream_chunk=None, on_status=on_status,
+                on_reasoning_chunk=on_reasoning_chunk, stream=False,
+            )
         payload: dict[str, Any] = {
             "model": model_id,
             "messages": self._cached_messages(url, messages),
-            "tools": self._tools_for_payload(),
-            "tool_choice": "auto",
         }
+        if model_supports_tools(model_id, self.get_config()):
+            payload["tools"] = self._tools_for_payload()
+            payload["tool_choice"] = "auto"
         effort = self._reasoning_effort(model_id)
         if effort is not None:
             payload["reasoning_effort"] = effort
@@ -1103,6 +1181,136 @@ class AgentEngine:
                 content = reasoning
             return True, content, tool_calls
         return False, f"Не удалось получить ответ от `{url}` после повторных попыток.", []
+
+    @staticmethod
+    def _is_ollama_base(url: str) -> bool:
+        return ":11434" in (url or "")
+
+    @staticmethod
+    def _ollama_url(url: str) -> str:
+        return url.split("/chat/completions")[0].rstrip("/") + "/api/chat"
+
+    def _ollama_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for m in messages:
+            role = m.get("role")
+            if role == "tool":
+                out.append({"role": "tool", "content": str(m.get("content") or "")})
+            elif role == "assistant" and m.get("tool_calls"):
+                calls = []
+                for tc in m["tool_calls"]:
+                    fn = tc.get("function") or {}
+                    raw_args = fn.get("arguments") or "{}"
+                    if isinstance(raw_args, str):
+                        try:
+                            raw_args = json.loads(raw_args)
+                        except ValueError:
+                            raw_args = {}
+                    calls.append({"function": {"name": fn.get("name", ""), "arguments": raw_args}})
+                out.append({
+                    "role": "assistant",
+                    "content": m.get("content") or "",
+                    "tool_calls": calls,
+                })
+            else:
+                out.append({"role": role, "content": m.get("content") or ""})
+        return out
+
+    async def _ollama_chat_step(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        model_id: str,
+        messages: list[dict[str, Any]],
+        on_stream_chunk: StreamHook | None = None,
+        on_status: StatusHook | None = None,
+        on_reasoning_chunk: StreamHook | None = None,
+        stream: bool = False,
+    ) -> tuple[bool, str, list[dict[str, Any]]]:
+        """Native Ollama /api/chat path (NDJSON streaming, dict tool arguments)."""
+        endpoint = self._ollama_url(url)
+        payload: dict[str, Any] = {
+            "model": model_id,
+            "messages": self._ollama_messages(messages),
+            "stream": stream,
+        }
+        if model_supports_tools(model_id, self.get_config()) and self._tools_for_payload():
+            payload["tools"] = self._tools_for_payload()
+        full_text: list[str] = []
+        reasoning_text: list[str] = []
+        tcs: list[dict[str, Any]] = []
+        try:
+            if stream and on_stream_chunk is not None:
+                async with client.stream("POST", endpoint, json=payload) as resp:
+                    if resp.status_code >= 400:
+                        body = (await resp.aread()).decode("utf-8", errors="replace")
+                        return False, f"Ollama error ({resp.status_code}): `{body[:200]}`", []
+                    async for line in resp.aiter_lines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except ValueError:
+                            continue
+                        msg = chunk.get("message") or {}
+                        piece = msg.get("content")
+                        if piece:
+                            full_text.append(piece)
+                            try:
+                                await on_stream_chunk("".join(full_text))
+                            except Exception:
+                                logger.debug("stream hook failed", exc_info=True)
+                        think = msg.get("thinking")
+                        if isinstance(think, str) and think:
+                            reasoning_text.append(think)
+                            if on_reasoning_chunk is not None:
+                                try:
+                                    await on_reasoning_chunk(think)
+                                except Exception:
+                                    logger.debug("reasoning hook failed", exc_info=True)
+                        for tc in msg.get("tool_calls") or []:
+                            fn = tc.get("function") or {}
+                            raw_args = fn.get("arguments") or {}
+                            args_str = (
+                                raw_args if isinstance(raw_args, str)
+                                else json.dumps(raw_args, ensure_ascii=False)
+                            )
+                            tcs.append({
+                                "id": f"call_{short_id()}",
+                                "type": "function",
+                                "function": {"name": fn.get("name", ""), "arguments": args_str},
+                            })
+                        if chunk.get("done"):
+                            break
+            else:
+                resp = await client.post(endpoint, json=payload)
+                if resp.status_code >= 400:
+                    return False, f"Ollama error ({resp.status_code}): `{resp.text[:200]}`", []
+                data = resp.json()
+                msg = data.get("message") or {}
+                text = msg.get("content") or ""
+                for tc in msg.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    raw_args = fn.get("arguments") or {}
+                    args_str = (
+                        raw_args if isinstance(raw_args, str)
+                        else json.dumps(raw_args, ensure_ascii=False)
+                    )
+                    tcs.append({
+                        "id": f"call_{short_id()}",
+                        "type": "function",
+                        "function": {"name": fn.get("name", ""), "arguments": args_str},
+                    })
+                if not text and not tcs:
+                    text = msg.get("thinking") or ""
+                return True, text, tcs
+        except httpx.HTTPError as exc:
+            return False, f"Ollama недоступна: **{exc}**. Проверьте, что сервер запущен.", []
+        text = "".join(full_text)
+        if not text and not tcs:
+            text = "".join(reasoning_text)
+        return True, text, tcs
 
     async def _run_git_full(self, *args: str, timeout: float = 15.0) -> tuple[int, str]:
         try:
