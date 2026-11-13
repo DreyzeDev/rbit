@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
@@ -39,6 +40,7 @@ jobs:
         shell: bash
         run: |
           # The release is created by release.yml; wait for it, create if missing.
+          found=""
           for i in 1 2 3 4 5 6 7 8 9 10; do
             if gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               found=1
@@ -50,5 +52,11 @@ jobs:
             gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
               --title "$GITHUB_REF_NAME" --notes "rbit desktop installers" || true
           fi
-          gh release upload "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
-            rbit-dist/*.exe rbit-dist/*.dmg rbit-dist/*.AppImage --clobber
+          shopt -s nullglob
+          files=(rbit-dist/*.exe rbit-dist/*.dmg rbit-dist/*.AppImage)
+          if [ ${#files[@]} -gt 0 ]; then
+            gh release upload "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" "${files[@]}" --clobber
+          else
+            echo "No installer files found in rbit-dist/"
+            ls -la rbit-dist/ || true
+          fi
