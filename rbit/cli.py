@@ -225,6 +225,29 @@ def _run_stats(workspace: Path) -> int:
                 info = get_model_info(m.model)
                 cost_est += (m.tokens / 1000.0) * info.cost_per_1k
 
+    loc = 0
+    files_n = 0
+    lang_counts: dict[str, int] = {}
+    complexity = 0
+    complexity_n = 0
+    import ast as _ast
+
+    for f in workspace.rglob("*"):
+        if f.is_file() and ".rbit" not in f.parts and ".venv" not in f.parts and "node_modules" not in f.parts:
+            files_n += 1
+            ext = f.suffix.lower()
+            lang_counts[ext or "(none)"] = lang_counts.get(ext or "(none)", 0) + 1
+            if ext == ".py":
+                try:
+                    tree = _ast.parse(f.read_text(encoding="utf-8", errors="replace"))
+                    loc += sum(1 for _ in f.read_text(encoding="utf-8", errors="replace").splitlines())
+                    for node in _ast.walk(tree):
+                        if isinstance(node, (_ast.If, _ast.For, _ast.While, _ast.Try, _ast.BoolOp)):
+                            complexity += 1
+                    complexity_n += 1
+                except (OSError, SyntaxError):
+                    continue
+
     panel_body = (
         f"[bold #eeeeee]Sessions:[/]       {len(sessions)}\n"
         f"[bold #eeeeee]Messages:[/]       {total_msgs}\n"
@@ -232,7 +255,13 @@ def _run_stats(workspace: Path) -> int:
         f"[bold #eeeeee]Total Tokens:[/]   {total_tokens:,}\n"
         f"[bold #eeeeee]Est. API Cost:[/]  ${cost_est:.4f}\n"
         f"[bold #eeeeee]Files Touched:[/]  {len(modified_set)}\n"
-        f"[bold #eeeeee]Checkpoints:[/]    {len(checkpoints)}"
+        f"[bold #eeeeee]Checkpoints:[/]    {len(checkpoints)}\n"
+        + (
+            f"[bold #eeeeee]Workspace:[/]      {files_n} files, {loc:,} LOC, top langs: "
+            + ", ".join(f"{k}×{v}" for k, v in sorted(lang_counts.items(), key=lambda kv: -kv[1])[:5])
+            + "\n"
+            + f"[bold #eeeeee]Py complexity:[/]  {complexity} branches over {complexity_n} files"
+        )
     )
     console.print(Panel(panel_body, title=f"[bold #fab283]rbit Workspace Stats[/] ({workspace.name})", border_style="#282828"))
     return 0
@@ -257,7 +286,7 @@ def _run_sessions_list(workspace: Path) -> int:
     return 0
 
 
-def _run_export(workspace: Path, session_id: str | None, out_file: str | None) -> int:
+def _run_export(workspace: Path, session_id: str | None, out_file: str | None, fmt: str | None = None) -> int:
     console = Console()
     storage = StorageManager(workspace)
     sessions = storage.list_sessions()
@@ -268,6 +297,46 @@ def _run_export(workspace: Path, session_id: str | None, out_file: str | None) -
     if not target:
         console.print(f"[bold #e06c75]Session '{session_id}' not found.[/]")
         return 1
+    fmt = str(fmt or "markdown")
+    if fmt == "openai":
+        out = Path(out_file) if out_file else workspace / f"rbit-{target.id}-openai.json"
+        messages = []
+        for m in target.messages:
+            messages.append({"role": m.role, "content": m.content})
+        out.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
+        console.print(f"[bold #7fd88f]✓ OpenAI-format export →[/] {out}")
+        return 0
+    if fmt == "html":
+        out = Path(out_file) if out_file else workspace / f"rbit-{target.id}.html"
+        import html as _html
+
+        parts = [
+            "<!doctype html><meta charset='utf-8'><title>rbit ",
+            _html.escape(target.title),
+            "</title><style>body{background:#141414;color:#eee;font-family:ui-monospace,monospace;max-width:960px;margin:2rem auto}",
+            ".msg{border-left:3px solid #444;padding:.4rem 1rem;margin:.6rem 0;white-space:pre-wrap}",
+            ".user{border-color:#fab283}.assistant{border-color:#7fd88f}.system{color:#808080}",
+            ".diff-add{color:#7fd88f}.diff-del{color:#e06c75}</style>",
+        ]
+        for m in target.messages:
+            cls = m.role
+            parts.append(f"<div class='msg {cls}'><b>{_html.escape(m.role)}</b>")
+            body = _html.escape(m.content)
+            if m.role == "assistant" and m.tool_calls:
+                for tc in m.tool_calls:
+                    d = _html.escape(tc.diff or "")
+                    if d:
+                        lines = [
+                            f"<span class='diff-add'>{ln}</span>" if ln.startswith("+") and not ln.startswith("+++") else
+                            f"<span class='diff-del'>{ln}</span>" if ln.startswith("-") and not ln.startswith("---") else ln
+                            for ln in d.splitlines()
+                        ]
+                        body += "<pre>" + "\n".join(lines) + "</pre>"
+            parts.append(body + "</div>")
+        parts.append("</div>")
+        out.write_text("".join(parts), encoding="utf-8")
+        console.print(f"[bold #7fd88f]✓ HTML export →[/] {out}")
+        return 0
     out_path = Path(out_file).resolve() if out_file else None
     saved = storage.export_session_markdown(target, out_path)
     console.print(f"[bold #7fd88f]✓ Exported session `{target.id}` to:[/] {saved}")
@@ -761,7 +830,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "export", "map", "lint", "init", "commit", "update", "backup", "describe", "serve"}
+    subcommands = {"run", "doctor", "stats", "sessions", "export", "map", "lint", "init", "commit", "update", "backup", "describe", "serve", "import"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -816,6 +885,58 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--allow-outside", action="store_true")
             parsed = p.parse_args(rest)
             return _run_serve(parsed)
+
+        if sub == "import":
+            p = argparse.ArgumentParser(prog="rbit import", description="Import a session from JSON (rbit or OpenAI messages) or Markdown")
+            p.add_argument("file", help="Path to .json or .md file")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            workspace = _resolve_workspace(parsed.dir)
+            storage = StorageManager(workspace)
+            fpath = Path(parsed.file)
+            if not fpath.exists():
+                Console().print(f"[red]File not found:[/] {fpath}")
+                return 1
+            text = fpath.read_text(encoding="utf-8", errors="replace")
+            messages = []
+            if fpath.suffix.lower() == ".json":
+                data = json.loads(text)
+                if isinstance(data, dict) and "messages" in data:
+                    data = _migrate_session_dict_public(data)
+                    sess = Session.from_dict(data)
+                    storage.save_session(sess)
+                    Console().print(f"✓ Imported rbit session `{sess.id}` ({len(sess.messages)} messages)")
+                    return 0
+                for m in data if isinstance(data, list) else []:
+                    role = str(m.get("role") or "user")
+                    if role in ("system", "user", "assistant"):
+                        messages.append(ChatMessage(id=short_id(), role=role, content=str(m.get("content") or "")))
+            else:
+                role = "user"
+                buf: list[str] = []
+                for line in text.splitlines():
+                    low = line.strip().lower()
+                    if low.startswith("## user"):
+                        if buf:
+                            messages.append(ChatMessage(id=short_id(), role=role, content="\n".join(buf).strip()))
+                            buf = []
+                        role = "user"
+                    elif low.startswith("## assistant"):
+                        if buf:
+                            messages.append(ChatMessage(id=short_id(), role=role, content="\n".join(buf).strip()))
+                            buf = []
+                        role = "assistant"
+                    else:
+                        buf.append(line)
+                if buf and any(b.strip() for b in buf):
+                    messages.append(ChatMessage(id=short_id(), role=role, content="\n".join(buf).strip()))
+            if not messages:
+                Console().print("[red]No messages recognized in the file.[/]")
+                return 1
+            sess = Session(title=f"Imported {fpath.name[:32]}", messages=messages)
+            storage.save_session(sess)
+            Console().print(f"✓ Imported {len(messages)} messages as session `{sess.id}`")
+            return 0
 
         if sub == "backup":
             p = argparse.ArgumentParser(prog="rbit backup", description="Archive the .rbit state directory")
@@ -887,10 +1008,11 @@ def main(argv: list[str] | None = None) -> int:
         if sub == "export":
             p = argparse.ArgumentParser(prog="rbit export")
             p.add_argument("session_id", nargs="?", help="Session ID (defaults to latest)")
-            p.add_argument("-o", "--output", help="Output Markdown path")
+            p.add_argument("-o", "--output", help="Output path (markdown/html/openai)")
+            p.add_argument("--format", choices=["markdown", "html", "openai"], default=None)
             p.add_argument("-d", "--dir", help="Workspace directory")
             parsed = p.parse_args(rest)
-            return _run_export(_resolve_workspace(parsed.dir), parsed.session_id, parsed.output)
+            return _run_export(_resolve_workspace(parsed.dir), parsed.session_id, parsed.output, fmt=parsed.format)
 
         if sub == "map":
             p = argparse.ArgumentParser(prog="rbit map", description="Show a token-budgeted repository map")
@@ -1013,7 +1135,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     from rbit.agent import AgentEngine
-    from rbit.models import ChatMessage, Session, ToolCallRecord, short_id
+    from rbit.models import ChatMessage, Session, short_id, _migrate_session_dict as _migrate_session_dict_public, Session, ToolCallRecord, short_id
     from rbit.tools import ToolExecutor
 
     workspace = _resolve_workspace(args.dir)

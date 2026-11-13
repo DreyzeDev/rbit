@@ -170,11 +170,75 @@ class StorageManager:
                 pass
 
     # --- Sessions ---
+    def _use_sqlite(self) -> bool:
+        return str(self.load_config().get("storage_backend") or "json").lower() == "sqlite"
+
+    def _sqlite_path(self) -> Path:
+        return self.state_dir / "sessions.db"
+
+    def _sqlite_conn(self):
+        import sqlite3
+
+        conn = sqlite3.connect(self._sqlite_path())
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, updated REAL, data TEXT)"
+        )
+        return conn
+
+    def _encrypt(self, text: str) -> str:
+        """Fernet-encrypts a session payload when configured and a passphrase is set."""
+        if not self.load_config().get("encrypt_sessions"):
+            return text
+        import base64
+        import hashlib
+        import os as _os
+
+        passphrase = _os.environ.get("RBIT_PASSPHRASE")
+        if not passphrase:
+            return text
+        try:
+            from cryptography.fernet import Fernet
+        except ImportError:
+            return text
+        key = base64.urlsafe_b64encode(hashlib.sha256(passphrase.encode()).digest())
+        token = Fernet(key).encrypt(text.encode("utf-8")).decode("ascii")
+        return "rbit-enc:v1:" + token
+
+    def _decrypt(self, stored: str) -> str:
+        if not stored.startswith("rbit-enc:v1:"):
+            return stored
+        import base64
+        import hashlib
+        import os as _os
+
+        passphrase = _os.environ.get("RBIT_PASSPHRASE")
+        if not passphrase:
+            raise ValueError("Session is encrypted; set RBIT_PASSPHRASE.")
+        from cryptography.fernet import Fernet
+
+        key = base64.urlsafe_b64encode(hashlib.sha256(passphrase.encode()).digest())
+        return Fernet(key).decrypt(stored.split(":", 2)[2].encode("ascii")).decode("utf-8")
+
     def save_session(self, session: Session) -> None:
+        payload = json.dumps(session.to_dict(), ensure_ascii=False, indent=2)
+        if self._use_sqlite():
+            import time as _time
+
+            conn = self._sqlite_conn()
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO sessions (id, updated, data) VALUES (?, ?, ?)",
+                    (session.id, _time.time(), self._encrypt(payload)),
+                )
+            conn.close()
+            return
         self._atomic_write_json(
             self.sessions_dir / f"{session.id}.json",
-            json.dumps(session.to_dict(), ensure_ascii=False, indent=2),
+            self._encrypt(payload),
         )
+
+    def _decode_session_file(self, raw: str) -> dict[str, Any]:
+        return json.loads(self._decrypt(raw))
 
     def list_sessions(self) -> list[Session]:
         if not self.sessions_dir.exists():
@@ -186,10 +250,24 @@ class StorageManager:
             reverse=True,
         ):
             try:
-                data = json.loads(p.read_text(encoding="utf-8"))
+                if self._use_sqlite():
+                    break
+                data = self._decode_session_file(p.read_text(encoding="utf-8"))
                 sessions.append(Session.from_dict(data))
             except Exception:
                 continue
+        if self._use_sqlite():
+            conn = self._sqlite_conn()
+            try:
+                for (raw,) in conn.execute(
+                    "SELECT data FROM sessions ORDER BY updated DESC"
+                ):
+                    try:
+                        sessions.append(Session.from_dict(self._decode_session_file(raw)))
+                    except Exception:
+                        continue
+            finally:
+                conn.close()
         return sessions
 
     def find_session(self, id_or_prefix: str) -> Session | None:

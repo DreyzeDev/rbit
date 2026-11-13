@@ -151,6 +151,22 @@ class CheckpointMeta:
     file_count: int
 
 
+SESSION_SCHEMA_VERSION = 1
+
+
+def _migrate_session_dict(data: dict[str, Any]) -> dict[str, Any]:
+    """Brings older session payloads up to SESSION_SCHEMA_VERSION."""
+    version = int(data.get("schema_version") or 0)
+    if version < 1:
+        # v0 -> v1: pinned flag, per-message ids, sanitized timestamps.
+        for m in data.get("messages", []):
+            if isinstance(m, dict):
+                m.setdefault("pinned", False)
+                m.setdefault("id", short_id())
+    data["schema_version"] = SESSION_SCHEMA_VERSION
+    return data
+
+
 @dataclass
 class Session:
     id: str = field(default_factory=short_id)
@@ -173,6 +189,7 @@ class Session:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": SESSION_SCHEMA_VERSION,
             "id": self.id,
             "title": self.title,
             "created_at": self.created_at,
@@ -184,6 +201,7 @@ class Session:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Session":
+        data = _migrate_session_dict(data)
         return cls(
             id=data.get("id") or short_id(),
             title=data.get("title", "Session"),
