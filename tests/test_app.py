@@ -3586,3 +3586,48 @@ async def test_session_encryption_roundtrip(tmp_path: Path) -> None:
         assert any(s.id == sess.id for s in storage.list_sessions())
     finally:
         os.environ.pop("RBIT_PASSPHRASE", None)
+
+
+@pytest.mark.asyncio
+async def test_image_attachment_becomes_vision_part(tmp_path: Path) -> None:
+    import base64 as b64mod
+
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "test"}
+    (tmp_path / "shot.png").write_bytes(b"\x89PNG fake")
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "вижу картинку"}}]})
+
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    session = Session()
+    user = ChatMessage(id="u1", role="user", content="что на скриншоте?", attachments=["shot.png"])
+    session.messages.append(user)
+    async def _noop(_rec: ToolCallRecord) -> None:
+        return None
+
+    async def _noop_s(_s: str) -> None:
+        return None
+
+    reply = await engine.run_turn(
+        session=session, user_msg=user, agent_mode="build", model_id="openai/gpt-4.1",
+        on_tool_start=_noop, on_tool_end=_noop, on_status=_noop_s,
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert "вижу картинку" in reply.content
+    body = captured[0]["messages"][1]
+    assert isinstance(body["content"], list)
+    assert body["content"][0]["type"] == "text"
+    img = body["content"][1]
+    assert img["type"] == "image_url"
+    assert img["image_url"]["url"].startswith("data:image/png;base64,")
+    assert base64_present(img["image_url"]["url"]) if False else True
+    assert b64mod.b64decode(img["image_url"]["url"].split(",", 1)[1]) == b"\x89PNG fake"
+
+
+def base64_present(url: str) -> bool:
+    return "," in url

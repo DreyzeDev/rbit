@@ -646,19 +646,49 @@ class AgentEngine:
         for m in session.messages:
             if m.role == "user":
                 text = m.content
+                image_parts: list[dict[str, Any]] = []
                 if m is user_msg and m.attachments:
                     att_sem = asyncio.Semaphore(MAX_PARALLEL_TOOLS)
 
                     async def _read_attachment(rel: str) -> str:
                         if rel in VIRTUAL_ATTACHMENTS:
                             return await self._virtual_attachment(rel)
+                        # Image attachments become vision content parts, not text.
+                        suffix = Path(rel).suffix.lower()
+                        if suffix in (".png", ".jpg", ".jpeg", ".webp", ".gif") and self.get_config().get("send_images", True):
+                            try:
+                                img_path = self.executor.resolve_path(rel)
+                                if img_path.exists() and img_path.stat().st_size <= 5 * 1024 * 1024:
+                                    import base64 as _b64
+
+                                    b64 = _b64.b64encode(img_path.read_bytes()).decode("ascii")
+                                    mime = {
+                                        ".png": "image/png",
+                                        ".jpg": "image/jpeg",
+                                        ".jpeg": "image/jpeg",
+                                        ".webp": "image/webp",
+                                        ".gif": "image/gif",
+                                    }[suffix]
+                                    image_parts.append(
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {"url": f"data:{mime};base64,{b64}"},
+                                        }
+                                    )
+                                    return f"(image attached: {rel})"
+                            except Exception:
+                                logger.debug("image attachment failed: %s", rel, exc_info=True)
                         async with att_sem:
                             res = await self.executor.execute("read", {"filePath": rel, "limit": 160}, agent_mode)
                         return f'<file path="{rel}">\n{res.output}\n</file>'
 
                     attached_blocks = await asyncio.gather(*(_read_attachment(rel) for rel in m.attachments))
                     text = "\n\n".join(attached_blocks) + "\n\n" + text
-                units.append([{"role": "user", "content": text}])
+                if image_parts:
+                    content: Any = [{"type": "text", "text": text}, *image_parts]
+                    units.append([{"role": "user", "content": content}])
+                else:
+                    units.append([{"role": "user", "content": text}])
             elif m.role == "assistant":
                 assistant_msg: dict[str, Any] = {
                     "role": "assistant",
