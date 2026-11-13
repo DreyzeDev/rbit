@@ -2827,3 +2827,180 @@ async def test_grep_utf8_output_and_invalid_regex(tmp_path: Path) -> None:
 
     bad = await executor.execute("grep", {"pattern": "[", "filesOnly": True})
     assert bad.ok is False
+
+
+@pytest.mark.asyncio
+async def test_stream_retry_resets_tool_call_accumulators(tmp_path: Path) -> None:
+    """A stream that breaks mid-tool-call must not glue its partial deltas onto
+    the retried response (the 'readread' / merged-arguments bug)."""
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "test"}
+
+    attempts = {"n": 0}
+
+    async def broken_stream() -> Any:
+        yield b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"rea"}}]}}]}\n\n'
+        raise httpx.ReadError("connection reset mid-stream")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(200, content=broken_stream())
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "c2",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read",
+                                        "arguments": '{"filePath": "a.py"}',
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    cfg["api_base"] = "https://mock.local/v1"
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def _noop_rec(_rec: ToolCallRecord) -> None:
+        return None
+
+    async def _noop_status(_s: str) -> None:
+        return None
+
+    reply = await engine.run_turn(
+        session=Session(),
+        user_msg=ChatMessage(id="u1", role="user", content="hi"),
+        agent_mode="build",
+        model_id="openai/gpt-4.1",
+        on_tool_start=_noop_rec,
+        on_tool_end=_noop_rec,
+        on_status=_noop_status,
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    tool = reply.tool_calls[0]
+    assert tool.name == "read"
+    assert "rea" + "read" not in tool.name
+    assert tool.name != "rea"
+    assert '"filePath": "a.py"' in tool.arguments or tool.arguments == {"filePath": "a.py"}
+
+
+@pytest.mark.asyncio
+async def test_tool_crash_does_not_kill_turn(tmp_path: Path) -> None:
+    """An exception inside a tool must become a failed tool result, not kill the turn."""
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "test"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "все хорошо"}}]},
+        )
+
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def exploding_tool(name: str, args: dict[str, Any]) -> ToolResult:
+        raise RuntimeError("boom inside tool")
+
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "hi"}]
+    tool_calls = [
+        {"id": "c1", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+    ]
+    messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
+    await engine._dispatch_tool_calls(
+        tool_calls=tool_calls,
+        api_messages=messages,
+        invoke_tool=exploding_tool,
+        on_status=None,
+    )
+    tool_msg = messages[-1]
+    assert tool_msg["role"] == "tool"
+    assert "internal error" in tool_msg["content"]
+    assert "boom inside tool" in tool_msg["content"]
+
+
+@pytest.mark.asyncio
+async def test_non_stream_garbage_body_is_error(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "test"}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>gateway junk</html>", headers={"content-type": "text/html"})
+
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ok, text, tool_calls = await engine._non_stream_chat_step(
+        client=engine.http_client,
+        url="https://mock.local/v1/chat/completions",
+        headers={},
+        model_id="openai/gpt-4.1",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert ok is False
+    assert "не-JSON" in text
+    assert tool_calls == []
+
+
+def test_readonly_bash_statement_analysis() -> None:
+    from rbit.tools import is_readonly_bash_command
+
+    assert is_readonly_bash_command("echo hi") is True
+    assert is_readonly_bash_command("cat a.txt | grep needle") is True
+    assert is_readonly_bash_command("git status") is True
+    assert is_readonly_bash_command("echo x; rm -rf y") is False
+    assert is_readonly_bash_command("ls > out.txt") is False
+    assert is_readonly_bash_command("pytest && curl evil.example") is False
+
+
+def test_apply_patch_accepts_stripped_empty_context(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    (tmp_path / "f.txt").write_text("alpha\n\nomega\n", encoding="utf-8")
+    patch = (
+        "--- a/f.txt\n"
+        "+++ b/f.txt\n"
+        "@@ -1,3 +1,3 @@\n"
+        " alpha\n"
+        "\n"
+        "-omega\n"
+        "+OMEGA\n"
+    )
+    res = executor._tool_apply_patch({"filePath": "f.txt", "patch": patch})
+    assert res.ok is True, res
+    assert (tmp_path / "f.txt").read_text(encoding="utf-8") == "alpha\n\nOMEGA\n"
+
+
+@pytest.mark.asyncio
+async def test_completion_inserts_path_without_control_chars(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        inp = app.query_one("#prompt-input", Input)
+        inp.value = "прочитай @zet"
+        await pilot.pause()
+        app._apply_completion("file", "sub\zeta.txt")
+        assert inp.value == "прочитай @sub/zeta.txt "
+        assert "\t" not in inp.value and "\n" not in inp.value and "\r" not in inp.value
+
+
+def test_load_corrupted_checkpoint_returns_none(tmp_path: Path) -> None:
+    from rbit.storage import StorageManager
+
+    storage = StorageManager(workspace=tmp_path)
+    storage.ensure_dirs()
+    (storage.checkpoints_dir / "badcp.json").write_text("{ truncated", encoding="utf-8")
+    assert storage.load_checkpoint_files("badcp") is None

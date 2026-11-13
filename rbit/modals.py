@@ -81,7 +81,7 @@ HELP_MARKDOWN = """
 
 ## Navigation
 - `tab` — switch Build ↔ Plan agent
-- `ctrl+p` / `ctrl+k` — command palette
+- `ctrl+p` — command palette
 - `ctrl+b` — toggle right sidebar (Context / MCP / LSP / Ollama / Todo / Files)
 - `ctrl+m` — switch model
 - `ctrl+t` — switch theme
@@ -89,8 +89,8 @@ HELP_MARKDOWN = """
 - `ctrl+n` — new session
 - `ctrl+y` — copy last answer
 - `ctrl+f` — search session messages and tool output
-- `ctrl+x` — stop background shell processes
-- `ctrl+e` — collapse all tool cards
+- `ctrl+shift+x` — stop background shell processes
+- `ctrl+shift+e` — collapse all tool cards
 - `enter` (on a tool card) — expand / collapse it
 - `ctrl+q` — quit
 

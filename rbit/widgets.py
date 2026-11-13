@@ -7,6 +7,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 from rich.console import Group
 from rich.table import Table
@@ -665,6 +666,7 @@ class AssistantMessageCard(Vertical):
         self.msg = msg
         self.extra_models = extra_models
         self._live = live
+        self._stream_timer: Any = None
 
     def compose(self) -> ComposeResult:
         yield Markdown(self.msg.content, classes="assistant-md")
@@ -688,14 +690,29 @@ class AssistantMessageCard(Vertical):
     async def update_stream(self, new_markdown: str) -> None:
         self.msg.content = new_markdown
         try:
+            self.query_one(Markdown)
+        except NoMatches:
+            return
+        if self._stream_timer is not None:
+            return  # a flush is already scheduled; it renders the latest content
+        # Markdown.update reparses the whole document on every call — coalesce
+        # SSE deltas to ~10 Hz instead of re-rendering on each token.
+        self._stream_timer = self.set_timer(0.1, self._flush_stream_update)
+
+    async def _flush_stream_update(self) -> None:
+        self._stream_timer = None
+        try:
             md = self.query_one(Markdown)
         except NoMatches:
             return
-        await md.update(new_markdown)
+        await md.update(self.msg.content)
 
     async def finalize(self, final_msg: ChatMessage) -> None:
         self.msg = final_msg
         self._live = False
+        if self._stream_timer is not None:
+            self._stream_timer.stop()
+            self._stream_timer = None
         try:
             md = self.query_one(Markdown)
             meta = self.query_one(".assistant-meta", Static)

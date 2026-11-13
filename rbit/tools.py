@@ -1,4 +1,4 @@
-﻿"""Agent tools for rbit: read, write, edit, multi_edit, glob, grep, bash, todowrite, webfetch + Checkpoints."""
+"""Agent tools for rbit: read, write, edit, multi_edit, glob, grep, bash, todowrite, webfetch + Checkpoints."""
 
 from __future__ import annotations
 
@@ -54,6 +54,11 @@ READONLY_BASH_PREFIXES = (
     "git diff",
     "git log",
     "git branch",
+    "grep",
+    "findstr",
+    "head",
+    "tail",
+    "wc",
     "python --version",
     "node -v",
     "npm -v",
@@ -68,6 +73,24 @@ READONLY_TOOLS: frozenset[str] = frozenset(
 )
 
 MUTATING_TOOLS: frozenset[str] = frozenset({"write", "edit", "multi_edit", "apply_patch"})
+
+_STATEMENT_SPLIT = re.compile(r"(?:;|\|\||&&|\||\r?\n)")
+
+
+def is_readonly_bash_command(command: str) -> bool:
+    """A command is read-only only if EVERY statement starts with a whitelisted
+    prefix and there are no output redirects. `echo x; rm y` and `ls > f` are
+    mutations, even though the first token looks harmless."""
+    if ">" in command:
+        return False
+    statements = [s.strip() for s in _STATEMENT_SPLIT.split(command) if s.strip()]
+    if not statements:
+        return False
+    for statement in statements:
+        lowered = statement.lower()
+        if not any(lowered.startswith(pref.lower()) for pref in READONLY_BASH_PREFIXES):
+            return False
+    return True
 
 VIRTUAL_ATTACHMENTS: frozenset[str] = frozenset({"diff", "git", "staged", "tree"})
 
@@ -187,6 +210,10 @@ SECRET_EXACT_NAMES = frozenset(
         ".npmrc",
         ".pypirc",
         ".netrc",
+        "prod.env",
+        ".envrc",
+        "secrets.yaml",
+        "secrets.yml",
     }
 )
 SECRET_EXTENSIONS = frozenset({".pem", ".key", ".p12", ".pfx", ".keystore", ".jks"})
@@ -860,6 +887,12 @@ class ToolExecutor:
             rep_all = bool(ed.get("replaceAll", False))
             if old_s not in updated:
                 return ToolResult(False, f"edit #{idx} failed", f"oldString in edit #{idx} not found.")
+            if not rep_all and updated.count(old_s) > 1:
+                return ToolResult(
+                    False,
+                    f"edit #{idx} ambiguous",
+                    f"Found {updated.count(old_s)} matches for edit #{idx} oldString; add context or set replaceAll=true.",
+                )
             updated = updated.replace(old_s, new_s) if rep_all else updated.replace(old_s, new_s, 1)
 
         atomic_write_text(target, updated)
@@ -918,6 +951,11 @@ class ToolExecutor:
             if raw.startswith("\\"):
                 continue
             if raw == "":
+                # LLM patches strip the space from empty context lines; treat a
+                # blank line inside an unfinished hunk as an empty context line.
+                old_so_far = sum(1 for ln in cur if ln[0] in (" ", "-"))
+                if old_so_far < old_len:
+                    cur.append(" ")
                 continue
             if raw[0] not in (" ", "+", "-"):
                 continue
@@ -1045,6 +1083,11 @@ class ToolExecutor:
         cmd = [rg, "--line-number", "--no-heading", "--color", "never", "-i"]
         # Respect .gitignore even outside a git repo, like the fallback path does.
         cmd.append("--no-require-git")
+        # Keep parity with the fallback listing: search hidden dirs, but never
+        # descend into VCS/tooling directories from IGNORED_DIRS.
+        cmd.append("--hidden")
+        for ignored in sorted(IGNORED_DIRS):
+            cmd.extend(["--glob", f"!{ignored}/**"])
         if files_only:
             cmd.append("-l")
         if context:
@@ -1447,7 +1490,7 @@ class ToolExecutor:
                 "force-push, fork bomb, ...). Refusing to execute it even in build mode.",
             )
 
-        is_readonly = any(command.lower().startswith(pref.lower()) for pref in READONLY_BASH_PREFIXES)
+        is_readonly = is_readonly_bash_command(command)
         if agent_mode == "plan" and not is_readonly:
             return ToolResult(
                 False,

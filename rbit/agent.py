@@ -408,18 +408,34 @@ class AgentEngine:
             )
 
         if use_remote and self._is_model_unavailable(content):
+            mutated = {
+                "write",
+                "edit",
+                "multi_edit",
+                "apply_patch",
+            }
+            already_wrote = any(rec.name in mutated for rec in tool_records)
             await on_status("Модель недоступна (401/404) — fallback на rbit/smart-local...")
-            fallback_text = await self._run_smart_local_agent(
-                session=session,
-                user_msg=user_msg,
-                agent_mode=agent_mode,
-                invoke_tool=invoke_tool,
-                on_status=on_status,
-            )
-            content = (
-                f"**[Fallback]** `{model_id}` недоступна — выполнен встроенный Smart-агент "
-                "без обращения к API.\n\n" + fallback_text
-            )
+            if already_wrote:
+                # The turn already modified files; letting the built-in agent run
+                # would overwrite the model's real work with synthesized stubs.
+                content = (
+                    f"**[Fallback]** `{model_id}` стал недоступен (401/404) после того, как часть "
+                    "инструментов уже изменила файлы. Встроенный Smart-агент не запускался, чтобы не "
+                    "перезаписать эти правки. Нажмите `Ctrl+R` для повтора хода или продолжите другим промптом."
+                )
+            else:
+                fallback_text = await self._run_smart_local_agent(
+                    session=session,
+                    user_msg=user_msg,
+                    agent_mode=agent_mode,
+                    invoke_tool=invoke_tool,
+                    on_status=on_status,
+                )
+                content = (
+                    f"**[Fallback]** `{model_id}` недоступна — выполнен встроенный Smart-агент "
+                    "без обращения к API.\n\n" + fallback_text
+                )
 
         elapsed = round(time.perf_counter() - t0, 2)
         tokens_est = max(
@@ -544,6 +560,14 @@ class AgentEngine:
         async def _drive_steps(client: httpx.AsyncClient) -> str:
             nonlocal spent_usd
             await on_status(f"Запрос к {model_id}...")
+            step_texts: list[str] = []
+
+            async def cumulative_chunk(partial: str) -> None:
+                # The app renders ONE live card per turn: feed it the text of
+                # every step so far, not just the current one.
+                parts = [*step_texts, partial] if partial else list(step_texts)
+                await on_stream_chunk("\n\n".join(p for p in parts if p))
+
             for _step in range(max_steps):
                 if on_thinking is not None:
                     await on_thinking(True)
@@ -555,7 +579,7 @@ class AgentEngine:
                             headers=headers,
                             model_id=model_id,
                             messages=api_messages,
-                            on_stream_chunk=on_stream_chunk,
+                            on_stream_chunk=cumulative_chunk,
                             on_status=on_status,
                             on_reasoning_chunk=on_reasoning_chunk,
                         )
@@ -578,7 +602,14 @@ class AgentEngine:
                         await on_thinking(False)
 
                 if not tool_calls:
-                    return content or "(пустой ответ модели)"
+                    # The reply must carry the text of every step of the turn,
+                    # not just the last one (search/export/next-context depend on it).
+                    parts = [*step_texts, content] if content and content.strip() else list(step_texts)
+                    full = "\n\n".join(p for p in parts if p and p.strip())
+                    return full or content or "(пустой ответ модели)"
+
+                if content and content.strip():
+                    step_texts.append(content)
 
                 api_messages.append(
                     {
@@ -642,11 +673,40 @@ class AgentEngine:
         on_status: StatusHook,
     ) -> None:
         """Runs contiguous read-only tool calls in parallel (Semaphore=4), keeping mutating tools as barriers."""
+
+        async def _safe_invoke(name: str, args: dict[str, Any]) -> ToolResult:
+            # One crashed tool must not kill the whole turn: report it to the
+            # model as a failed tool result and keep going.
+            try:
+                return await invoke_tool(name, args)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("tool %s crashed", name, exc_info=True)
+                return ToolResult(
+                    False,
+                    f"{name} crashed: {type(exc).__name__}",
+                    f"Tool `{name}` failed with an internal error: {type(exc).__name__}: {exc}",
+                )
+
         batches: list[list[tuple[dict[str, Any], str, dict[str, Any]]]] = []
         for tc in tool_calls:
             fn = tc.get("function") or {}
             fn_name = fn.get("name", "")
             parsed_args = self._parse_tool_args(fn.get("arguments"))
+            if tc.get("length_truncated") and not parsed_args and fn.get("arguments"):
+                api_messages.append(
+                    self._format_tool_message(
+                        tc.get("id") or f"call_{short_id()}",
+                        fn_name,
+                        ToolResult(
+                            False,
+                            "response truncated",
+                            "The model's tool-call arguments were cut off by max_tokens; the tool was not run.",
+                        ),
+                    )
+                )
+                continue
             item = (tc, fn_name, parsed_args)
             if fn_name in READONLY_TOOLS and batches and batches[-1][0][1] in READONLY_TOOLS:
                 batches[-1].append(item)
@@ -656,21 +716,27 @@ class AgentEngine:
         for batch in batches:
             if len(batch) == 1:
                 tc, fn_name, parsed_args = batch[0]
-                res = await invoke_tool(fn_name, parsed_args)
-                api_messages.append(self._format_tool_message(tc["id"], fn_name, res))
+                res = await _safe_invoke(fn_name, parsed_args)
+                api_messages.append(
+                    self._format_tool_message(tc.get("id") or f"call_{short_id()}", fn_name, res)
+                )
             else:
                 await on_status(f"Параллельный вызов ({len(batch)} read-only инструментов)...")
                 sem = asyncio.Semaphore(MAX_PARALLEL_TOOLS)
 
                 async def _bounded_call(name: str, args: dict[str, Any]) -> ToolResult:
                     async with sem:
-                        return await invoke_tool(name, args)
+                        return await _safe_invoke(name, args)
 
                 results = await asyncio.gather(
                     *(_bounded_call(fn_name, parsed_args) for _, fn_name, parsed_args in batch)
                 )
                 for (tc, fn_name, _), res in zip(batch, results):
-                    api_messages.append(self._format_tool_message(tc["id"], fn_name, res))
+                    api_messages.append(
+                        self._format_tool_message(
+                            tc.get("id") or f"call_{short_id()}", fn_name, res
+                        )
+                    )
 
     async def _stream_chat_step(
         self,
@@ -696,11 +762,25 @@ class AgentEngine:
         full_text: list[str] = []
         reasoning_text: list[str] = []
         tc_acc: dict[int, dict[str, Any]] = {}
+        last_tc_key = 0
+        finish_reason: str | None = None
 
         for attempt in range(1, self.retry_attempts + 1):
+            # Reset accumulators on every attempt: retrying with state from a
+            # broken stream glues stale tool-call deltas onto the new response.
+            full_text = []
+            reasoning_text = []
+            tc_acc = {}
+            last_tc_key = 0
+            finish_reason = None
             try:
                 async with client.stream("POST", url, headers=headers, json=payload) as resp:
-                    if resp.status_code in RETRYABLE_STATUS and attempt < self.retry_attempts and not full_text:
+                    if (
+                        resp.status_code in RETRYABLE_STATUS
+                        and attempt < self.retry_attempts
+                        and not full_text
+                        and not tc_acc
+                    ):
                         await resp.aread()
                         delay = self._retry_delay(attempt, resp)
                         if on_status is not None:
@@ -730,6 +810,8 @@ class AgentEngine:
                         choices = chunk.get("choices") or []
                         if not choices:
                             continue
+                        if choices[0].get("finish_reason"):
+                            finish_reason = choices[0]["finish_reason"]
                         delta = choices[0].get("delta") or {}
                         reasoning_piece = delta.get("reasoning_content") or delta.get("reasoning")
                         if isinstance(reasoning_piece, str) and reasoning_piece:
@@ -748,9 +830,24 @@ class AgentEngine:
                                 logger.debug("stream hook failed", exc_info=True)
 
                         for tc_delta in delta.get("tool_calls") or []:
-                            idx = int(tc_delta.get("index", 0))
+                            raw_idx = tc_delta.get("index")
+                            if raw_idx is not None:
+                                try:
+                                    last_tc_key = int(raw_idx)
+                                except (TypeError, ValueError):
+                                    last_tc_key = 0
+                            elif tc_delta.get("id"):
+                                # Providers that omit `index`: segment by tool-call id
+                                # instead of merging parallel calls into one.
+                                tc_id = tc_delta["id"]
+                                last_tc_key = next(
+                                    (k for k, v in tc_acc.items() if v["id"] == tc_id),
+                                    max(tc_acc.keys(), default=-1) + 1,
+                                )
+                            # No index and no id: keep appending to the call we are
+                            # already reading rather than collapsing into key 0.
                             entry = tc_acc.setdefault(
-                                idx,
+                                last_tc_key,
                                 {
                                     "id": tc_delta.get("id") or f"call_{short_id()}",
                                     "type": "function",
@@ -765,12 +862,15 @@ class AgentEngine:
                             if fn.get("arguments"):
                                 entry["function"]["arguments"] += fn["arguments"]
                 ordered_tcs = [tc_acc[k] for k in sorted(tc_acc.keys())]
+                if finish_reason == "length":
+                    for entry in ordered_tcs:
+                        entry["length_truncated"] = True
                 text = "".join(full_text)
                 if not text and not ordered_tcs:
                     text = "".join(reasoning_text)
                 return True, text, ordered_tcs
             except httpx.HTTPError as exc:
-                if attempt < self.retry_attempts and not full_text:
+                if attempt < self.retry_attempts and not full_text and not tc_acc:
                     delay = self._retry_delay(attempt)
                     if on_status is not None:
                         await on_status(
@@ -845,10 +945,27 @@ class AgentEngine:
                     "Откройте `/connect` для настройки ключа или выберите `rbit/smart-local` в `/models`.",
                     [],
                 )
-            data = resp.json()
-            choice = data["choices"][0]["message"]
+            try:
+                data = resp.json()
+            except ValueError:
+                return (
+                    False,
+                    f"Ошибка обработки ответа модели: провайдер вернул не-JSON (`{resp.text[:200]}`).",
+                    [],
+                )
+            choices = data.get("choices") or []
+            if not choices:
+                return (
+                    False,
+                    "Ошибка обработки ответа модели: провайдер вернул пустой `choices`.",
+                    [],
+                )
+            choice = choices[0].get("message") or {}
             content = choice.get("content") or ""
             tool_calls = choice.get("tool_calls") or []
+            for tc in tool_calls:
+                if isinstance(tc, dict) and not tc.get("id"):
+                    tc["id"] = f"call_{short_id()}"
             reasoning = choice.get("reasoning")
             if isinstance(reasoning, str) and reasoning and on_reasoning_chunk is not None:
                 try:
@@ -959,7 +1076,10 @@ class AgentEngine:
                     return f"Subagent network error: {exc}"
                 if resp.status_code >= 400:
                     return f"Subagent API error ({resp.status_code}): {resp.text[:200]}"
-                choice = resp.json()["choices"][0]["message"]
+                try:
+                    choice = resp.json()["choices"][0]["message"]
+                except (ValueError, KeyError, IndexError, TypeError):
+                    return f"Subagent error: provider returned a malformed response (`{resp.text[:150]}`)"
                 last_content = choice.get("content") or ""
                 tool_calls = choice.get("tool_calls") or []
                 if not tool_calls:
@@ -968,12 +1088,14 @@ class AgentEngine:
                     {"role": "assistant", "content": last_content, "tool_calls": tool_calls}
                 )
                 for tc in tool_calls:
-                    fn_name = tc["function"]["name"]
+                    fn = tc.get("function") or {}
+                    fn_name = fn.get("name", "")
+                    tc_id = tc.get("id") or f"call_{short_id()}"
                     if fn_name not in READONLY_TOOLS:
                         messages.append(
                             {
                                 "role": "tool",
-                                "tool_call_id": tc["id"],
+                                "tool_call_id": tc_id,
                                 "name": fn_name,
                                 "content": "Rejected: subagent is read-only.",
                             }
@@ -981,12 +1103,12 @@ class AgentEngine:
                         continue
                     used.append(fn_name)
                     res = await self.executor.execute(
-                        fn_name, self._parse_tool_args(tc["function"].get("arguments")), agent_mode="plan"
+                        fn_name, self._parse_tool_args(fn.get("arguments")), agent_mode="plan"
                     )
                     messages.append(
                         {
                             "role": "tool",
-                            "tool_call_id": tc["id"],
+                            "tool_call_id": tc_id,
                             "name": fn_name,
                             "content": res.output[:4000],
                         }

@@ -71,6 +71,40 @@ All notable changes to rbit are documented here. The format follows
 
 ### Fixed
 
+- A stream that breaks mid-tool-call no longer glues its partial deltas onto the
+  retried response (accumulators reset per attempt; `index: null` and missing
+  `index`/`id` deltas no longer merge parallel tool calls into one).
+- An exception inside a tool now becomes a failed tool result for the model instead of
+  killing the whole turn and leaving the tool card stuck on "running".
+- The non-stream step (CLI path) and the explore subagent no longer crash on malformed
+  provider responses (HTML garbage, empty `choices`); tool calls without an `id` get
+  one generated. `finish_reason: length` marks truncated tool-call arguments instead of
+  running the tool with silently empty arguments.
+- Multi-step turns keep the text of every step: the live card and the final message no
+  longer lose intermediate narration, and `/search` + `/export` see the full reply.
+- `!command`, `/compact`, `/commit`, new/clear/switch/fork session and `/todo` during an
+  active turn are rejected with a notice instead of silently killing the turn or
+  corrupting sessions; the turn also binds to its session, Esc cancels only the busy
+  worker (not model discovery), and the rebuild path drops stale live-widget references.
+- `@`-completion of files no longer crashes on Windows paths (bad escape `\z`) and no
+  longer injects TAB/CR into the prompt; Enter now accepts the highlighted file
+  suggestion too.
+- Session/config writes are atomic (temp + `os.replace`), save failures surface a
+  notification, and corrupted checkpoints return "not found" instead of crashing
+  `/rewind`.
+- Plan mode no longer treats `echo x; <mutation>` as read-only: every statement of a
+  bash command must be whitelisted and output redirects force a permission prompt;
+  `grep`/`findstr`/`head`/`tail`/`wc` join the read-only whitelist.
+- `apply_patch` accepts patches whose empty context lines lost their leading space
+  (the usual LLM form); `multi_edit` reports ambiguous matches instead of silently
+  editing the first one.
+- ripgrep `grep` searches hidden files/dirs for parity with the fallback (excepting
+  VCS/tooling dirs), and `prod.env`, `.envrc`, `secrets.yaml`/`secrets.yml` are treated
+  as secret files.
+- Streaming no longer re-renders the whole Markdown document on every SSE token
+  (updates coalesced to ~10 Hz); app bindings moved off keys captured by the focused
+  input (`ctrl+k` removed — palette stays on `ctrl+p`, stop-background is
+  `ctrl+shift+x`, collapse-cards is `ctrl+shift+e`).
 - File writes preserve the target's dominant line ending: editing an LF file no longer
   rewrites every line to CRLF (and vice versa), so diffs stay minimal and follow-up
   edits stop failing with `oldString not found`.

@@ -15,6 +15,7 @@ from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.timer import Timer
 from textual.widgets import Input, OptionList, Static
 
@@ -446,7 +447,6 @@ class RbitApp(App[None]):
 
     BINDINGS = [
         Binding("ctrl+p", "open_palette", "Commands", show=False),
-        Binding("ctrl+k", "open_palette", "Commands", show=False),
         Binding("ctrl+b", "toggle_sidebar", "Sidebar", show=False),
         Binding("ctrl+m", "open_models", "Models", show=False),
         Binding("ctrl+t", "open_themes", "Themes", show=False),
@@ -455,8 +455,8 @@ class RbitApp(App[None]):
         Binding("ctrl+l", "clear_chat", "Clear", show=False),
         Binding("ctrl+y", "copy_last", "Copy", show=False),
         Binding("ctrl+f", "search_session", "Search", show=False),
-        Binding("ctrl+x", "stop_background", "Stop background", show=False),
-        Binding("ctrl+e", "collapse_all_cards", "Collapse cards", show=False),
+        Binding("ctrl+shift+x", "stop_background", "Stop background", show=False),
+        Binding("ctrl+shift+e", "collapse_all_cards", "Collapse cards", show=False),
         Binding("ctrl+r", "retry_last", "Retry", show=False),
         Binding("f1", "show_help", "Help", show=False),
         Binding("escape", "interrupt_or_close", "Interrupt", show=False),
@@ -490,6 +490,7 @@ class RbitApp(App[None]):
         self.history_cursor: int = -1
         self.is_busy: bool = False
         self.busy_status: str = ""
+        self._busy_worker: Any = None
         self._spin_frame: int = 0
         self._has_inline_notices: bool = False
         self._sidebar_override_on_home: bool = False
@@ -649,6 +650,14 @@ class RbitApp(App[None]):
     def on_resize(self, event: events.Resize) -> None:
         self._update_layout_mode()
 
+    def on_screen_suspend(self, event: events.ScreenSuspend) -> None:
+        # A modal is coming up: the autocomplete popup would otherwise linger
+        # behind the overlay with a stale file list.
+        try:
+            self.query_one(AutocompletePopup).display = False
+        except NoMatches:
+            pass
+
     def _sync_ui(self) -> None:
         model_id = self.config_data.get("model", "rbit/smart-local")
         api_ok = bool((self.config_data.get("api_key") or "").strip())
@@ -789,7 +798,12 @@ class RbitApp(App[None]):
             popup.display = False
             return
         if self.is_busy:
-            self.workers.cancel_all()
+            # Cancel only the tracked busy worker (agent turn, compact, bang) —
+            # cancel_all() would also kill model discovery and other side tasks.
+            if self._busy_worker is not None:
+                self._busy_worker.cancel()
+            else:
+                self.workers.cancel_all()
             self._interrupted_turn = self._finalize_interrupted()
             self.is_busy = False
             self.busy_status = ""
@@ -831,7 +845,10 @@ class RbitApp(App[None]):
         if kind == "slash":
             inp.value = value + " "
         elif kind == "file":
-            inp.value = re.sub(r"@([^\s]*)$", f"@{value} ", inp.value)
+            value = value.replace("\\", "/")
+            # lambda replacement: a plain template string would interpret
+            # control sequences like \t or \n inside Windows paths.
+            inp.value = re.sub(r"@([^\s]*)$", lambda _m: f"@{value} ", inp.value, count=1)
         inp.cursor_position = len(inp.value)
         inp.focus()
 
@@ -933,6 +950,9 @@ class RbitApp(App[None]):
 
     @work
     async def action_open_todos(self) -> None:
+        if self.is_busy:
+            self.notify("Agent is busy — press Esc first.", severity="warning")
+            return
         updated = await self.push_screen_wait(TodoManagerModal(self.session.todos))
         if updated is not None:
             self.session.todos = updated
@@ -1005,6 +1025,9 @@ class RbitApp(App[None]):
         self.query_one("#prompt-input", Input).focus()
 
     def action_new_session(self) -> None:
+        if self.is_busy:
+            self.notify("Agent is busy — press Esc first.", severity="warning")
+            return
         self.session = Session()
         self.executor.session = self.session
         self._history_window = 30
@@ -1016,6 +1039,9 @@ class RbitApp(App[None]):
         self.query_one("#prompt-input", Input).focus()
 
     def action_clear_chat(self) -> None:
+        if self.is_busy:
+            self.notify("Agent is busy — press Esc first.", severity="warning")
+            return
         self.session.messages.clear()
         self._history_window = 30
         self._has_inline_notices = False
@@ -1076,6 +1102,9 @@ class RbitApp(App[None]):
         self.notify(f"Stopped {len(pids)} background process{'es' if len(pids) != 1 else ''}.", timeout=2.0)
 
     def _load_session_into_ui(self, sess: Session) -> None:
+        if self.is_busy:
+            self.notify("Agent is busy — press Esc first.", severity="warning")
+            return
         self.session = sess
         self.executor.session = sess
         self._history_window = 30
@@ -1087,6 +1116,10 @@ class RbitApp(App[None]):
         scroll = self.query_one("#chat-scroll", ChatScroll)
         scroll.remove_children()
         self._tool_widgets.clear()
+        # Live widgets were just detached; drop the stale references so an
+        # in-flight turn re-creates its card instead of updating a ghost.
+        self._live_card = None
+        self._thinking = None
         window = self._history_window if limit is None else limit
         messages = self.session.messages
         truncated = len(messages) > window
@@ -1187,8 +1220,8 @@ class RbitApp(App[None]):
         self._save_timer = None
         try:
             self.storage.save_session(self.session)
-        except Exception:
-            pass
+        except Exception as exc:
+            self.notify(f"Не удалось сохранить сессию: {exc}", severity="error", timeout=4.0)
 
     def _toggle_last_card(self) -> None:
         scroll = self.query_one("#chat-scroll", ChatScroll)
@@ -1388,12 +1421,15 @@ class RbitApp(App[None]):
         self._post_notice("\n".join(lines))
 
     def _cmd_compact(self) -> None:
+        if self.is_busy:
+            self.notify("Agent is busy — press Esc first.", severity="warning")
+            return
         if len(self.session.messages) <= 2:
             self.notify("Context is already compact.", timeout=2.0)
             return
-        self._compact_context()
+        self._busy_worker = self._compact_context()
 
-    @work(exclusive=True)
+    @work(exclusive=True, group="rbit-compact")
     async def _compact_context(self) -> None:
         count = len(self.session.messages)
         older = list(self.session.messages[:-2])
@@ -1443,9 +1479,12 @@ class RbitApp(App[None]):
         self.is_busy = True
         self.busy_status = "Retrying last prompt..."
         self._sync_ui()
-        self._execute_agent_turn(user_msg)
+        self._busy_worker = self._execute_agent_turn(user_msg)
 
     def _cmd_fork(self, arg: str) -> None:
+        if self.is_busy:
+            self.notify("Agent is busy — press Esc first.", severity="warning")
+            return
         msgs = self.session.messages
         if not msgs:
             self.notify("Nothing to fork — session is empty.", severity="warning")
@@ -1470,6 +1509,9 @@ class RbitApp(App[None]):
 
     def _cmd_commit(self, arg: str) -> None:
         token = arg.strip().lower()
+        if self.is_busy and token not in ("cancel", "no", "abort"):
+            self.notify("Agent is busy — press Esc first.", severity="warning")
+            return
         if token in ("yes", "y", "confirm", "apply"):
             if not self._pending_commit:
                 self.notify("No pending commit — run /commit first.", timeout=2.5)
@@ -1542,10 +1584,18 @@ class RbitApp(App[None]):
         popup = self.query_one(AutocompletePopup)
         if popup.display:
             accepted = popup.accept_highlighted()
-            if accepted and event.value.startswith("/") and event.value.strip() != accepted[1]:
+            if accepted and accepted[0] == "file":
+                at_match = re.search(r"@([^\s]*)$", event.value)
+                if at_match and at_match.group(1) == accepted[1].replace("\\", "/"):
+                    popup.display = False  # token already typed in full — submit as is
+                else:
+                    self._apply_completion(*accepted)
+                    return
+            elif accepted and event.value.startswith("/") and event.value.strip() != accepted[1]:
                 self._apply_completion(*accepted)
                 return
-            popup.display = False
+            else:
+                popup.display = False
 
         raw = event.value.strip()
         if not raw:
@@ -1557,9 +1607,12 @@ class RbitApp(App[None]):
         self.history_cursor = -1
 
         if raw.startswith("!"):
+            if self.is_busy:
+                self.notify("Agent is busy — press Esc first.", severity="warning")
+                return
             cmd_str = raw[1:].strip()
             if cmd_str:
-                self._execute_bang_command(cmd_str)
+                self._busy_worker = self._execute_bang_command(cmd_str)
             return
 
         if raw.startswith("/") and self._handle_slash_command(raw):
@@ -1567,7 +1620,7 @@ class RbitApp(App[None]):
 
         self._submit_prompt(raw)
 
-    @work(exclusive=True)
+    @work(exclusive=True, group="rbit-bang")
     async def _execute_bang_command(self, cmd_str: str) -> None:
         """Executes !<command> directly in the session feed without calling an LLM."""
         self._has_inline_notices = True
@@ -1640,13 +1693,16 @@ class RbitApp(App[None]):
 
         self._execute_agent_turn(user_msg)
 
-    @work(exclusive=True)
+    @work(exclusive=True, group="rbit-turn")
     async def _execute_agent_turn(self, user_msg: ChatMessage) -> None:
         scroll = self.query_one("#chat-scroll", ChatScroll)
+        # Bind the turn to the session it started with, so a mid-turn session
+        # switch can never route the reply into the wrong session.
+        session = self.session
         model_id = self.config_data.get("model", "rbit/smart-local")
         self._live_card = None
         self._interrupted_turn = False
-        self.session.finished = False
+        session.finished = False
         self._schedule_save_session(delay=0.05)
 
         async def on_tool_start(rec: ToolCallRecord) -> None:
@@ -1707,7 +1763,7 @@ class RbitApp(App[None]):
 
         try:
             reply = await self.engine.run_turn(
-                session=self.session,
+                session=session,
                 user_msg=user_msg,
                 agent_mode=self.agent_mode,
                 model_id=model_id,
@@ -1721,7 +1777,7 @@ class RbitApp(App[None]):
             if self._interrupted_turn:
                 self._live_card = None
                 return
-            self.session.messages.append(reply)
+            session.messages.append(reply)
             self._schedule_save_session(delay=0.05)
             live_card = self._live_card
             self._live_card = None
@@ -1741,7 +1797,7 @@ class RbitApp(App[None]):
             self._post_notice(f"✗ Error: {exc}\n\nPress `Ctrl+R` to retry the last prompt.{hint}")
         finally:
             self._settle_thinking()
-            self.session.finished = True
+            session.finished = True
             self._schedule_save_session(delay=0.05)
             self.is_busy = False
             self.busy_status = ""

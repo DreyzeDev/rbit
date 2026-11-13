@@ -79,11 +79,18 @@ class StorageManager:
             return "anthropic/claude-sonnet-4.5"
         return "rbit/smart-local"
 
-    def save_config(self, cfg: dict[str, Any]) -> None:
+    def _atomic_write_json(self, path: Path, payload: str) -> None:
+        """Writes via a temp file + os.replace: a crash mid-save never truncates
+        the target into unreadable JSON (which list_sessions silently skips)."""
         self.ensure_dirs()
-        self.config_path.write_text(
+        tmp = path.with_name(f".{path.name}.tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, path)
+
+    def save_config(self, cfg: dict[str, Any]) -> None:
+        self._atomic_write_json(
+            self.config_path,
             json.dumps(cfg, ensure_ascii=False, indent=2),
-            encoding="utf-8",
         )
         if os.name != "nt":
             try:
@@ -93,11 +100,9 @@ class StorageManager:
 
     # --- Sessions ---
     def save_session(self, session: Session) -> None:
-        self.ensure_dirs()
-        path = self.sessions_dir / f"{session.id}.json"
-        path.write_text(
+        self._atomic_write_json(
+            self.sessions_dir / f"{session.id}.json",
             json.dumps(session.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
         )
 
     def list_sessions(self) -> list[Session]:
@@ -254,14 +259,19 @@ class StorageManager:
         path = self.checkpoints_dir / f"{cid}.json"
         if not path.exists():
             return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-        meta = CheckpointMeta(
-            id=data["id"],
-            label=data.get("label", cid),
-            created_at=data.get("created_at", ""),
-            file_count=len(data.get("files", {})),
-        )
-        return meta, data.get("files", {})
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            meta = CheckpointMeta(
+                id=data["id"],
+                label=data.get("label", cid),
+                created_at=data.get("created_at", ""),
+                file_count=len(data.get("files", {})),
+            )
+            return meta, data.get("files", {})
+        except Exception:
+            # A corrupted checkpoint (truncated by a crash) must not crash the
+            # /rewind worker — surface it as "checkpoint not found" instead.
+            return None
 
     # --- Session Markdown Export ---
     def export_session_markdown(self, session: Session, out_path: Path | None = None) -> Path:
