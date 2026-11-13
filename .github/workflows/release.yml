@@ -45,6 +45,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
+    continue-on-error: true  # publishing needs the PYPI_API_KEY secret; skip failures
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
