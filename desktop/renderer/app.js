@@ -8,21 +8,21 @@ const PORT = rbitCfg.port;
 const BASE = `http://127.0.0.1:${PORT}`;
 
 let sessionId = null;
+let sessions = [];
 let busy = false;
 
 const feed = document.getElementById("feed");
 const promptEl = document.getElementById("prompt");
 const sendBtn = document.getElementById("send");
-const sessList = document.getElementById("session-list");
-const statusEl = document.getElementById("backend-status");
-document.getElementById("ws").textContent = rbitCfg.workspace || "local";
+const tabsEl = document.getElementById("tabs");
+const sessionsEl = document.getElementById("sessions");
+const sessionsList = document.getElementById("sessions-list");
 
 function esc(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function md(text) {
-  // Minimal markdown: fenced code, inline code, bold. Never trusts raw HTML.
   let out = esc(text);
   out = out.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang, code) => `<pre>${code}</pre>`);
   out = out.replace(/`([^`\n]+)`/g, "<code>$1</code>");
@@ -35,7 +35,8 @@ function addMsg(role, text) {
   feed.querySelector(".tagline")?.remove();
   const div = document.createElement("div");
   div.className = `msg ${role}`;
-  div.innerHTML = `<span class="role">${esc(role)}</span>${md(text)}`;
+  if (role === "assistant") div.innerHTML = md(text);
+  else div.textContent = text;
   feed.appendChild(div);
   feed.scrollTop = feed.scrollHeight;
   return div;
@@ -52,34 +53,75 @@ function addNote(text, cls = "notice") {
   return div;
 }
 
+function setHome() {
+  document.body.classList.add("home");
+  feed.innerHTML = '<div class="wordmark">rbit</div>';
+}
+
+function renderTabs() {
+  tabsEl.innerHTML = "";
+  for (const s of sessions) {
+    const el = document.createElement("button");
+    el.className = "tab" + (s.id === sessionId ? " active" : "");
+    el.innerHTML = `<span class="badge">${esc((s.title || "S")[0].toUpperCase())}</span>` +
+      `<span>${esc(s.title.slice(0, 26))}</span>`;
+    el.onclick = () => loadSession(s.id);
+    tabsEl.appendChild(el);
+  }
+  if (sessionId === null) {
+    const el = document.createElement("button");
+    el.className = "tab active";
+    el.innerHTML = `<span class="badge">＋</span><span>Новая сессия</span>`;
+    tabsEl.appendChild(el);
+  }
+}
+
+function renderSessionsPanel() {
+  sessionsList.innerHTML = "";
+  for (const s of sessions) {
+    const el = document.createElement("div");
+    el.className = "sess" + (s.id === sessionId ? " active" : "");
+    el.innerHTML = `<span class="badge">${esc((s.title || "S")[0].toUpperCase())}</span>` +
+      `<span class="name">${esc(s.title)}</span>`;
+    el.onclick = () => loadSession(s.id);
+    sessionsList.appendChild(el);
+  }
+}
+
 async function refreshSessions() {
   try {
     const res = await fetch(`${BASE}/v1/sessions`);
     const data = await res.json();
-    sessList.innerHTML = "";
-    let active = data.sessions?.find((s) => s.id === sessionId);
-    for (const s of data.sessions || []) {
-      const el = document.createElement("div");
-      el.className = "sess" + (s.id === sessionId ? " active" : "");
-      el.textContent = `${s.title} (${s.messages})`;
-      el.onclick = () => {
-        sessionId = s.id;
-        feed.innerHTML = `<div class="empty">Сессия «${s.title}» — история подгружается агентом автоматически.</div>`;
-        refreshSessions();
-      };
-      sessList.appendChild(el);
-    }
-    document.getElementById("hdr-title").textContent = active ? active.title : "rbit — new session";
-    document.getElementById("hdr-stats").textContent = active
-      ? `${active.messages} messages`
-      : `${data.sessions?.length || 0} stored sessions`;
-    statusEl.textContent = `backend ok · ${data.sessions?.length || 0} sessions`;
-    statusEl.className = "ok";
+    sessions = data.sessions || [];
+    renderTabs();
+    renderSessionsPanel();
+  } catch {}
+}
+
+async function loadSession(id) {
+  try {
+    const res = await fetch(`${BASE}/v1/sessions/${id}`);
+    if (!res.ok) throw new Error(String(res.status));
+    const data = await res.json();
+    sessionId = data.id;
+    document.body.classList.remove("home");
+    feed.innerHTML = "";
+    for (const m of data.messages || []) addMsg(m.role, m.content);
+    renderTabs();
+    renderSessionsPanel();
+    document.getElementById("hdr-title")?.remove();
   } catch {
-    statusEl.textContent = "backend недоступен";
-    statusEl.className = "bad";
+    addNote("Не удалось загрузить сессию.", "notice error");
   }
 }
+
+document.getElementById("menu-btn").onclick = () => sessionsEl.classList.toggle("hidden");
+document.getElementById("tab-new").onclick = () => {
+  sessionId = null;
+  setHome();
+  renderTabs();
+  renderSessionsPanel();
+};
 
 async function send() {
   const text = promptEl.value.trim();
@@ -87,6 +129,10 @@ async function send() {
   busy = true;
   sendBtn.disabled = true;
   promptEl.value = "";
+  if (document.body.classList.contains("home")) {
+    document.body.classList.remove("home");
+    feed.innerHTML = "";
+  }
   addMsg("user", text);
 
   let thinkEl = null;
@@ -128,7 +174,7 @@ async function send() {
           streamEl = null;
         } else if (ev.type === "delta") {
           if (!streamEl) streamEl = addMsg("assistant", "");
-          streamEl.innerHTML = `<span class="role">assistant</span>${md(ev.text)}`;
+          streamEl.innerHTML = md(ev.text);
           feed.scrollTop = feed.scrollHeight;
         } else if (ev.type === "message") {
           streamEl?.remove();
@@ -136,12 +182,12 @@ async function send() {
           addMsg("assistant", ev.content);
           sessionId = ev.session_id;
         } else if (ev.type === "error") {
-          addNote(`✗ ${ev.text}`, "toolcall");
+          addNote(`✗ ${ev.text}`, "notice error");
         }
       }
     }
   } catch (err) {
-    addNote(`✗ Backend error: ${err}`, "toolcall");
+    addNote(`✗ Backend error: ${err}`, "notice error");
   } finally {
     busy = false;
     sendBtn.disabled = false;
@@ -156,10 +202,12 @@ promptEl.addEventListener("keydown", (e) => {
     send();
   }
 });
-document.getElementById("new-session").onclick = () => {
-  sessionId = null;
-  feed.innerHTML = '<div class="wordmark">rbit</div><div class="tagline">Новая сессия.</div>';
-  refreshSessions();
-};
+promptEl.addEventListener("input", () => {
+  promptEl.style.height = "auto";
+  promptEl.style.height = Math.min(200, promptEl.scrollHeight) + "px";
+});
+document.getElementById("crumb-path").textContent = rbitCfg.workspace || "";
+
+setHome();
 refreshSessions();
 setInterval(refreshSessions, 15000);

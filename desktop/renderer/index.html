@@ -6,28 +6,40 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <aside id="sidebar">
-    <div id="brand">rbit <span id="ws"></span></div>
-    <button id="new-session">＋ New session</button>
-    <div id="session-list"></div>
-    <div id="backend-status"></div>
-  </aside>
-  <main id="main">
-    <header id="topbar">
-      <span id="hdr-title">rbit</span>
-      <span id="hdr-stats"></span>
-    </header>
-    <div id="feed">
-      <div class="wordmark">rbit</div>
-      <div class="tagline">Спроси что-нибудь — агент читает, правит файлы и запускает команды в воркспейсе.</div>
-    </div>
-    <div id="composer">
-      <div class="composer-card">
-        <textarea id="prompt" rows="2" placeholder="Спросите что угодно, / — команды, @ — контекст…  (Enter — отправить)"></textarea>
-        <button id="send">↑</button>
+  <div id="tabbar">
+    <button id="menu-btn" title="Menu">☰</button>
+    <div id="tabs"></div>
+    <button id="tab-new" title="New session">＋</button>
+    <div id="tab-drag"></div>
+  </div>
+  <div id="layout">
+    <aside id="sessions" class="hidden">
+      <div id="sessions-list"></div>
+    </aside>
+    <main id="main">
+      <div id="feed">
+        <div class="wordmark">rbit</div>
       </div>
-    </div>
-  </main>
+      <div id="composer-wrap">
+        <div id="composer-card">
+          <textarea id="prompt" rows="1" placeholder="Спросите что угодно, / — команды, @ — контекст..."></textarea>
+          <div id="composer-bar">
+            <button class="ghost" id="btn-add">＋</button>
+            <button class="ghost" id="btn-mode">Build ▾</button>
+            <button class="ghost" id="btn-model">GLM 5.3 Flash ▾</button>
+            <span class="spacer"></span>
+            <button id="send" title="Send">↑</button>
+          </div>
+        </div>
+        <div id="crumbs">
+          <button class="crumb">project ▾</button>
+          <span class="sep">/</span>
+          <span class="crumb-static">⎇ Нет Git</span>
+          <span class="crumb-path" id="crumb-path"></span>
+        </div>
+      </div>
+    </main>
+  </div>
   <script src="app.js"></script>
 </body>
 </html>

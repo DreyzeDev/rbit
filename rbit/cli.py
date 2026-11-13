@@ -1300,6 +1300,30 @@ def _run_serve(args: argparse.Namespace) -> int:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif self.path.startswith("/v1/sessions/"):
+                sid = self.path.rsplit("/", 1)[-1]
+                sess = storage.find_session(sid)
+                if not sess:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                body = _json.dumps(
+                    {
+                        "id": sess.id,
+                        "title": sess.title,
+                        "messages": [
+                            {"role": m.role, "content": m.content}
+                            for m in sess.messages
+                        ],
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.send_response(200)
+                self._cors()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             else:
                 self.send_response(404)
                 self.end_headers()
