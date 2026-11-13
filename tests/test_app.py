@@ -3652,3 +3652,25 @@ async def test_bash_prefix_permission_memory(tmp_path: Path) -> None:
 
     await executor.execute("bash", {"command": "rm other.txt"})
     assert len(asked) == 2  # different command still prompts
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_from_config(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    cfg: dict[str, Any] = {"api_key": "test", "max_tokens": 2048}
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    await engine._non_stream_chat_step(
+        client=engine.http_client, url="https://mock.local/v1/chat/completions",
+        headers={}, model_id="openai/gpt-4.1",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert captured[0]["max_tokens"] == 2048
