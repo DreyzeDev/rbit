@@ -42,8 +42,16 @@ All notable changes to rbit are documented here. The format follows
 - History renders in windows of 30 cards with a "load older" link for long sessions.
 - Right-click a tool card copies its path, command, or pattern; `Ctrl+R` retries
   the last prompt and error notices hint at `/connect` for auth failures.
+- Colored diff cards: `+` lines are green and `-` lines red with a dimmed line-number
+  gutter, and `(+N -M)` counters in card headers are tinted to match.
+- Fenced code blocks in assistant replies render with a dark panel and syntax
+  highlighting; inline commands and tool output have distinct styling.
+- Consistent tool-card labels for Read/Write/Edit/Patch/Bash/Glob/Grep/WebFetch and
+  Symbols/Diagnostics/Lint/Git/Subagent, and command output is prefixed by a `│` gutter.
 
 ### Changed
+
+- Bash output is dimmed and gutter-prefixed so commands stand out from their results.
 
 - Session writes are debounced (1.2s) instead of rewriting the file on every stream
   chunk; pending writes flush on exit.

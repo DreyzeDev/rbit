@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import re
 import subprocess
 from pathlib import Path
 
@@ -275,12 +276,14 @@ class UserMessageCard(Static):
 
 
 def _render_unified_diff(diff_text: str) -> Text:
-    """Renders unified diff with red/green line-tinted backgrounds and line numbers."""
+    """Renders unified diff with a colored gutter: additions green, deletions red."""
     out = Text()
     old_ln = 0
     new_ln = 0
     lines = diff_text.splitlines()
     shown = 0
+    add_style = "#d4f7dc on #13261a"
+    del_style = "#f7ccd0 on #2b1418"
     for raw in lines:
         if raw.startswith("---") or raw.startswith("+++"):
             continue
@@ -296,23 +299,43 @@ def _render_unified_diff(diff_text: str) -> Text:
             out.append("   ... diff truncated ...\n", style="dim #808080")
             break
         if raw.startswith("+"):
-            out.append(f" {new_ln:>4} + ", style="#7fd88f on #13261a")
-            out.append(f"{raw[1:]}\n", style="#d4f7dc on #13261a")
+            out.append(f" {new_ln:>4} ", style="#4f6a52")
+            out.append("+ ", style="bold #7fd88f")
+            out.append(f"{raw[1:]}\n", style=add_style)
             new_ln += 1
             shown += 1
         elif raw.startswith("-"):
-            out.append(f" {old_ln:>4} - ", style="#e06c75 on #2b1418")
-            out.append(f"{raw[1:]}\n", style="#f7ccd0 on #2b1418")
+            out.append(f" {old_ln:>4} ", style="#6a4f56")
+            out.append("- ", style="bold #e06c75")
+            out.append(f"{raw[1:]}\n", style=del_style)
             old_ln += 1
             shown += 1
         else:
             content = raw[1:] if raw.startswith(" ") else raw
-            out.append(f" {new_ln:>4}   ", style="#585858")
-            out.append(f"{content}\n", style="#9a9a9a")
+            out.append(f" {new_ln:>4} ", style="#3a3a3a")
+            out.append("  ", style="#3a3a3a")
+            out.append(f"{content}\n", style="#8a8a8a")
             old_ln += 1
             new_ln += 1
             shown += 1
     return out
+
+
+def _append_counts(target: Text, summary: str, base_style: str = "#808080") -> None:
+    """Appends a tool summary, tinting the `(+N -M)` counters green/red."""
+    match = re.search(r"\(\+(\d+) -(\d+)\)", summary)
+    if not match:
+        target.append(summary, style=base_style)
+        return
+    prefix = summary[: match.start()].strip()
+    if prefix:
+        target.append(f"{prefix} ", style=base_style)
+    target.append(f"+{match.group(1)}", style="bold #7fd88f")
+    target.append(" ", style=base_style)
+    target.append(f"-{match.group(2)}", style="bold #e06c75")
+    suffix = summary[match.end():].strip()
+    if suffix:
+        target.append(f" {suffix}", style=base_style)
 
 
 class ToolCallCard(Static):
@@ -423,14 +446,31 @@ class ToolCallCard(Static):
             preview = "\n".join(rec.output.splitlines()[:20])
             return Group(line, Text(preview, style="#686868"))
 
-        # 2. Write / Edit / MultiEdit with inline diff block
+        # 2. Symbols / diagnostics / lint / git / subagent
+        if name in ("symbols", "diagnostics", "lint", "git", "subagent") and not is_err:
+            icons = {"symbols": "⌘", "diagnostics": "⚕", "lint": "⚑", "git": "⎇", "subagent": "⤷"}
+            line = Text()
+            line.append(f"{icons[name]} ", style="#808080")
+            line.append(f"{name.capitalize()} ", style="#808080")
+            if rec.summary:
+                line.append(f"({rec.summary})", style="#585858")
+            if not self.expanded or not rec.output:
+                return Group(line)
+            preview = "\n".join(rec.output.splitlines()[:20])
+            return Group(line, Text(preview, style="#686868"))
+
+        # 3. Write / Edit / MultiEdit with inline diff block
         if name in ("write", "edit", "multi_edit", "apply_patch"):
             fpath = args.get("filePath", "")
             verb = {"write": "Write", "edit": "Edit", "multi_edit": "MultiEdit", "apply_patch": "Patch"}[name]
             header = Text()
             header.append("← " if not is_err else "✗ ", style="#808080" if not is_err else err_color)
             header.append(f"{verb} {fpath} ", style="#eeeeee" if not is_err else err_color)
-            header.append(rec.summary.replace(fpath, "").strip(), style="#808080" if not is_err else err_color)
+            _append_counts(
+                header,
+                rec.summary.replace(fpath, "").strip(),
+                base_style="#808080" if not is_err else err_color,
+            )
             if not self.expanded:
                 return Group(header)
             if rec.diff:
@@ -478,8 +518,14 @@ class ToolCallCard(Static):
                     header.append(f"  ⏹ stop (pid {rec.pid})", style="bold #e06c75")
             if not self.expanded or not rec.output:
                 return Group(header)
-            preview = "\n".join(rec.output.splitlines()[:24])
-            return Group(header, Text(preview, style=err_color if is_err else "#808080"))
+            body = Text()
+            out_lines = rec.output.splitlines()[:24]
+            for idx, raw_line in enumerate(out_lines):
+                body.append("  │ ", style="#3a3a3a")
+                body.append(raw_line, style=err_color if is_err else "#9a9a9a")
+                if idx < len(out_lines) - 1:
+                    body.append("\n")
+            return Group(header, body)
 
         fallback = Text(f"{'✗' if is_err else '•'} {name}: {rec.summary}", style=err_color if is_err else "#808080")
         return Group(fallback)
@@ -499,6 +545,8 @@ class ToolCallCard(Static):
             return f"Running {args.get('command', '')[:40]}"
         if name == "todowrite":
             return "Updating todos"
+        if name in ("symbols", "diagnostics", "lint", "git", "subagent"):
+            return f"Running {name}"
         return name
 
 

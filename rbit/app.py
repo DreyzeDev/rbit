@@ -197,6 +197,23 @@ Screen {
     margin-top: 1;
 }
 
+.assistant-md MarkdownFence {
+    background: #101216;
+    color: #d6d6d6;
+    margin: 0 0 1 0;
+    padding: 0;
+}
+
+.assistant-md MarkdownFence > Label {
+    padding: 0 1;
+}
+
+.assistant-md MarkdownH1,
+.assistant-md MarkdownH2,
+.assistant-md MarkdownH3 {
+    margin: 1 0 0 0;
+}
+
 .system-notice {
     background: $surface;
     border-left: thick #5c9cf5;

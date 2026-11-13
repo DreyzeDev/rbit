@@ -2356,3 +2356,59 @@ async def test_retry_binding_and_last_error_hint(tmp_path: Path) -> None:
         assert app._last_error == ""
         app._last_error = "boom"
         assert app._last_error == "boom"
+
+
+def test_diff_and_tool_card_styling() -> None:
+    from rich.text import Text
+
+    from rbit.widgets import _render_unified_diff
+
+    diff = (
+        "--- a/calc.py\n"
+        "+++ b/calc.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        " a = 1\n"
+        "-b = 2\n"
+        "+b = 3\n"
+        "+c = 4\n"
+    )
+    rendered = _render_unified_diff(diff)
+    assert isinstance(rendered, Text)
+    styles = " ".join(str(span.style) for span in rendered.spans)
+    assert "#7fd88f" in styles
+    assert "#e06c75" in styles
+    assert "+ b = 3" in rendered.plain
+    assert "- b = 2" in rendered.plain
+
+    write_card = ToolCardWidget(
+        ToolCallRecord(
+            id="w1",
+            name="write",
+            arguments={"filePath": "calc.py"},
+            summary="(+2 -1)",
+            status="success",
+        )
+    )
+    write_plain = _flatten_render(write_card)
+    assert "Write calc.py" in write_plain
+    assert "+2" in write_plain and "-1" in write_plain
+
+    bash_card = ToolCardWidget(
+        ToolCallRecord(
+            id="b1",
+            name="bash",
+            arguments={"command": "pytest -q"},
+            summary="1 passed",
+            output="ok\n",
+            status="success",
+        )
+    )
+    bash_card.expanded = True
+    bash_plain = _flatten_render(bash_card)
+    assert "$ pytest -q" in bash_plain
+    assert "\u2502 ok" in bash_plain
+
+    git_card = ToolCardWidget(
+        ToolCallRecord(id="g1", name="git", arguments={}, summary="2 files", status="success")
+    )
+    assert "Git" in _flatten_render(git_card)
