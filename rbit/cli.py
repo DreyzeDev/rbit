@@ -1255,6 +1255,34 @@ def _run_serve(args: argparse.Namespace) -> int:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif self.path in ("/", "/index.html"):
+                renderer = Path(__file__).resolve().parent.parent / "desktop" / "renderer" / "index.html"
+                if renderer.exists():
+                    body = renderer.read_bytes()
+                    self.send_response(200)
+                    self._cors()
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            elif self.path in ("/app.js", "/styles.css"):
+                fname = "app.js" if self.path.endswith("app.js") else "styles.css"
+                fpath = Path(__file__).resolve().parent.parent / "desktop" / "renderer" / fname
+                if fpath.exists():
+                    body = fpath.read_bytes()
+                    ctype = "application/javascript; charset=utf-8" if fname == "app.js" else "text/css; charset=utf-8"
+                    self.send_response(200)
+                    self._cors()
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
             elif self.path == "/v1/sessions":
                 listed = [
                     {

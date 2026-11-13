@@ -1,5 +1,10 @@
 // rbit desktop renderer: talks to the local `rbit serve` NDJSON backend.
-const PORT = window.rbit.port;
+// Works inside Electron (window.rbit from preload) and in a plain browser
+// when the renderer is served by `rbit serve` itself (same origin).
+const rbitCfg = window.rbit || {
+  port: Number(new URLSearchParams(window.location.search).get("port") || window.location.port) || 8337,
+};
+const PORT = rbitCfg.port;
 const BASE = `http://127.0.0.1:${PORT}`;
 
 let sessionId = null;
@@ -10,7 +15,7 @@ const promptEl = document.getElementById("prompt");
 const sendBtn = document.getElementById("send");
 const sessList = document.getElementById("session-list");
 const statusEl = document.getElementById("backend-status");
-document.getElementById("ws").textContent = window.rbit.workspace;
+document.getElementById("ws").textContent = rbitCfg.workspace || "local";
 
 function esc(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -26,7 +31,8 @@ function md(text) {
 }
 
 function addMsg(role, text) {
-  document.getElementById("empty")?.remove();
+  feed.querySelector(".wordmark")?.remove();
+  feed.querySelector(".tagline")?.remove();
   const div = document.createElement("div");
   div.className = `msg ${role}`;
   div.innerHTML = `<span class="role">${esc(role)}</span>${md(text)}`;
@@ -36,6 +42,8 @@ function addMsg(role, text) {
 }
 
 function addNote(text, cls = "notice") {
+  feed.querySelector(".wordmark")?.remove();
+  feed.querySelector(".tagline")?.remove();
   const div = document.createElement("div");
   div.className = cls;
   div.textContent = text;
@@ -150,7 +158,7 @@ promptEl.addEventListener("keydown", (e) => {
 });
 document.getElementById("new-session").onclick = () => {
   sessionId = null;
-  feed.innerHTML = '<div class="empty" id="empty">Новая сессия.</div>';
+  feed.innerHTML = '<div class="wordmark">rbit</div><div class="tagline">Новая сессия.</div>';
   refreshSessions();
 };
 refreshSessions();
