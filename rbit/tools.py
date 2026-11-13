@@ -349,6 +349,7 @@ class ToolExecutor:
         self.undo_stack: list[FileSnapshot] = []
         self.redo_stack: list[FileSnapshot] = []
         self.always_allow_bash: bool = False
+        self.allowed_bash_prefixes: list[str] = []
         self.allow_secret_reads: bool = False
         self.allow_outside_paths: bool = False
         self._auto_checkpoint_done: bool = False
@@ -1659,6 +1660,14 @@ class ToolExecutor:
             return ".."
         return None
 
+    def _prefix_allowed(self, command: str) -> bool:
+        """True when the command starts with a user-approved prefix."""
+        lowered = command.lower()
+        return any(lowered.startswith(p.lower()) for p in self.allowed_bash_prefixes)
+
+    def _bash_prefix(self, command: str) -> str:
+        return " ".join(command.split()[:2])
+
     async def _tool_bash(self, args: dict[str, Any], agent_mode: str = "build") -> ToolResult:
         command = str(args.get("command", "")).strip()
         if not command:
@@ -1690,7 +1699,12 @@ class ToolExecutor:
                 "Only read-only commands are allowed in Plan mode.",
             )
 
-        if not is_readonly and not self.always_allow_bash and self.permission_cb is not None:
+        if (
+            not is_readonly
+            and not self.always_allow_bash
+            and not self._prefix_allowed(command)
+            and self.permission_cb is not None
+        ):
             allowed = await self.permission_cb("bash", command)
             if not allowed:
                 return ToolResult(

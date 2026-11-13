@@ -523,6 +523,7 @@ class RbitApp(App[None]):
             self.executor.allow_outside_paths = True
         if self.config_data.get("readonly"):
             self.executor.session_readonly = True
+        self.executor.allowed_bash_prefixes = list(self.config_data.get("allowed_bash_prefixes") or [])
         self.engine = AgentEngine(
             workspace=self.workspace,
             executor=self.executor,
@@ -791,9 +792,19 @@ class RbitApp(App[None]):
         self._sync_ui()
 
     async def _ask_permission(self, tool_name: str, detail: str) -> bool:
-        choice = await self.push_screen_wait(PermissionModal(tool_name, detail))
+        choice = await self.push_screen_wait(
+            PermissionModal(tool_name, detail, command=detail if tool_name == "bash" else "")
+        )
         if choice == "always":
             self.executor.always_allow_bash = True
+            return True
+        if choice == "prefix":
+            prefix = " ".join(detail.split()[:2])
+            if prefix and prefix not in self.executor.allowed_bash_prefixes:
+                self.executor.allowed_bash_prefixes.append(prefix)
+                self.config_data["allowed_bash_prefixes"] = list(self.executor.allowed_bash_prefixes)
+                self.storage.save_config(self.config_data)
+            self.notify(f"Префикс «{prefix}» больше не спрашивается.", timeout=2.5)
             return True
         return choice == "once"
 

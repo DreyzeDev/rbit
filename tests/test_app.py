@@ -3631,3 +3631,24 @@ async def test_image_attachment_becomes_vision_part(tmp_path: Path) -> None:
 
 def base64_present(url: str) -> bool:
     return "," in url
+
+
+@pytest.mark.asyncio
+async def test_bash_prefix_permission_memory(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    asked: list[str] = []
+
+    async def permission_cb(tool: str, detail: str) -> bool:
+        asked.append(detail)
+        return True
+
+    executor.permission_cb = permission_cb
+    await executor.execute("bash", {"command": "npm test"})
+    assert asked  # prompted once
+
+    executor.allowed_bash_prefixes = ["npm test"]
+    await executor.execute("bash", {"command": "npm test --silent"})
+    assert len(asked) == 1  # prefix remembered: no second prompt
+
+    await executor.execute("bash", {"command": "rm other.txt"})
+    assert len(asked) == 2  # different command still prompts

@@ -829,21 +829,24 @@ class SearchResultsModal(ModalScreen[str | None]):
 
 
 class PermissionModal(ModalScreen[str]):
-    """Permission prompt: Allow once / Allow always / Reject."""
+    """Permission prompt: Allow once / Allow always / Allow prefix / Reject."""
 
     BINDINGS = [
         Binding("y", "allow_once", "Allow once"),
         Binding("a", "allow_always", "Always allow"),
+        Binding("p", "allow_prefix", "Allow prefix"),
         Binding("n", "deny", "Reject"),
         Binding("escape", "deny", "Reject"),
     ]
 
-    def __init__(self, tool_name: str, detail: str) -> None:
+    def __init__(self, tool_name: str, detail: str, command: str = "") -> None:
         super().__init__()
         self.tool_name = tool_name
         self.detail = detail
+        self.command = command
 
     def compose(self) -> ComposeResult:
+        prefix = " ".join(self.command.split()[:2])
         with Vertical(classes="oc-modal"):
             yield Static(_modal_header("Permission required"), classes="oc-modal-header")
             yield Static(
@@ -851,13 +854,19 @@ class PermissionModal(ModalScreen[str]):
                 f"[bold #eeeeee]{self.detail}[/]",
                 classes="oc-perm-body",
             )
-            yield Label("y allow once   a always allow   esc reject", classes="oc-modal-foot")
+            foot = "y allow once   a always allow   esc reject"
+            if prefix:
+                foot = f"y once   a always   p always '{prefix}…'   esc reject"
+            yield Label(foot, classes="oc-modal-foot")
 
     def action_allow_once(self) -> None:
         self.dismiss("once")
 
     def action_allow_always(self) -> None:
         self.dismiss("always")
+
+    def action_allow_prefix(self) -> None:
+        self.dismiss("prefix")
 
     def action_deny(self) -> None:
         self.dismiss("deny")
