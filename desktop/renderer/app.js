@@ -49,6 +49,7 @@ async function refreshSessions() {
     const res = await fetch(`${BASE}/v1/sessions`);
     const data = await res.json();
     sessList.innerHTML = "";
+    let active = data.sessions?.find((s) => s.id === sessionId);
     for (const s of data.sessions || []) {
       const el = document.createElement("div");
       el.className = "sess" + (s.id === sessionId ? " active" : "");
@@ -60,6 +61,10 @@ async function refreshSessions() {
       };
       sessList.appendChild(el);
     }
+    document.getElementById("hdr-title").textContent = active ? active.title : "rbit — new session";
+    document.getElementById("hdr-stats").textContent = active
+      ? `${active.messages} messages`
+      : `${data.sessions?.length || 0} stored sessions`;
     statusEl.textContent = `backend ok · ${data.sessions?.length || 0} sessions`;
     statusEl.className = "ok";
   } catch {
