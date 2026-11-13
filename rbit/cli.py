@@ -1219,6 +1219,7 @@ def _run_serve(args: argparse.Namespace) -> int:
                     on_thinking=on_thinking,
                     on_reasoning_chunk=on_reasoning_chunk,
                 )
+                storage.save_session(session)
                 sink.put({"type": "message", "content": reply.content, "session_id": session.id})
 
             loop.run_until_complete(_turn())
@@ -1232,10 +1233,39 @@ def _run_serve(args: argparse.Namespace) -> int:
         def log_message(self, *a) -> None:  # quiet
             return
 
+        def _cors(self) -> None:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+        def do_OPTIONS(self) -> None:  # noqa: N802
+            self.send_response(204)
+            self._cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_GET(self) -> None:  # noqa: N802
             if self.path == "/health":
                 body = _json.dumps({"status": "ok", "workspace": str(workspace)}).encode()
                 self.send_response(200)
+                self._cors()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/v1/sessions":
+                listed = [
+                    {
+                        "id": s.id,
+                        "title": s.title,
+                        "messages": len(s.messages),
+                        "finished": s.finished,
+                    }
+                    for s in storage.list_sessions()
+                ]
+                body = _json.dumps({"sessions": listed}, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self._cors()
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -1264,10 +1294,11 @@ def _run_serve(args: argparse.Namespace) -> int:
                 self.wfile.write(b'{"error": "prompt is required"}')
                 return
             sid = str(req.get("session_id") or "")
-            session = sessions.get(sid) or Session()
+            session = sessions.get(sid) or (storage.find_session(sid) if sid else None) or Session()
             sessions[session.id] = session
 
             self.send_response(200)
+            self._cors()
             self.send_header("Content-Type", "application/x-ndjson")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()

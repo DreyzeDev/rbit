@@ -1,0 +1,49 @@
+{
+  "name": "rbit-desktop",
+  "version": "1.2.0",
+  "description": "rbit desktop — Electron GUI for the rbit terminal AI coding agent",
+  "main": "main.js",
+  "author": "DreyzeDev",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "dev.dreyze.rbit",
+    "productName": "rbit",
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**"
+    ],
+    "directories": {
+      "output": "../rbit-dist"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Development"
+    }
+  },
+  "allowScripts": {
+    "electron@33.4.11": true
+  }
+}
