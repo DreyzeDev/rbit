@@ -2540,3 +2540,102 @@ async def test_thinking_indicator_appears_and_clears(tmp_path: Path) -> None:
         await pilot.pause()
         assert app._thinking is None
         assert len(list(app.query(ThinkingIndicator))) == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_updates_before_card_is_mounted_are_safe(tmp_path: Path) -> None:
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        draft = ChatMessage(id="a1", role="assistant", content="")
+        card = AssistantMessageCard(draft, live=True)
+        await card.update_stream("partial")
+        assert draft.content == "partial"
+        await card.finalize(ChatMessage(id="a2", role="assistant", content="final"))
+        assert card.msg.content == "final"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_only_reply_is_used_as_content(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "test"}
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": "", "reasoning": "internal chain of thought"}}
+                ]
+            },
+        )
+
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def invoke_tool(name: str, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(True, "ok", "ok")
+
+    async def on_status(_s: str) -> None:
+        pass
+
+    text = await engine._run_openai_compatible(
+        session=Session(),
+        user_msg=ChatMessage(id="u1", role="user", content="hi"),
+        agent_mode="build",
+        model_id="openai/gpt-4o-mini",
+        api_base="https://mock.local/v1",
+        api_key="test",
+        invoke_tool=invoke_tool,
+        on_status=on_status,
+        on_stream_chunk=None,
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert text == "internal chain of thought"
+
+
+@pytest.mark.asyncio
+async def test_failing_stream_hook_does_not_abort_the_turn(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "test"}
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        body = "\n".join(
+            [
+                'data: {"choices":[{"delta":{"content":"Hello"}}]}',
+                'data: {"choices":[{"delta":{"content":" world"}}]}',
+                "data: [DONE]",
+                "",
+            ]
+        )
+        return httpx.Response(
+            200, text=body, headers={"content-type": "text/event-stream"}
+        )
+
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def invoke_tool(name: str, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(True, "ok", "ok")
+
+    async def on_status(_s: str) -> None:
+        pass
+
+    async def on_stream_chunk(_partial: str) -> None:
+        raise RuntimeError("No nodes match 'Markdown'")
+
+    text = await engine._run_openai_compatible(
+        session=Session(),
+        user_msg=ChatMessage(id="u1", role="user", content="hi"),
+        agent_mode="build",
+        model_id="openai/gpt-4o-mini",
+        api_base="https://mock.local/v1",
+        api_key="test",
+        invoke_tool=invoke_tool,
+        on_status=on_status,
+        on_stream_chunk=on_stream_chunk,
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+    assert text == "Hello world"

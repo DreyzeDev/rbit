@@ -13,6 +13,7 @@ from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Markdown, OptionList, Static
@@ -629,14 +630,22 @@ class AssistantMessageCard(Vertical):
 
     async def update_stream(self, new_markdown: str) -> None:
         self.msg.content = new_markdown
-        md = self.query_one(Markdown)
+        try:
+            md = self.query_one(Markdown)
+        except NoMatches:
+            return
         await md.update(new_markdown)
 
     async def finalize(self, final_msg: ChatMessage) -> None:
         self.msg = final_msg
         self._live = False
-        await self.query_one(Markdown).update(final_msg.content)
-        self.query_one(".assistant-meta", Static).update(self._build_meta_text())
+        try:
+            md = self.query_one(Markdown)
+            meta = self.query_one(".assistant-meta", Static)
+        except NoMatches:
+            return
+        await md.update(final_msg.content)
+        meta.update(self._build_meta_text())
 
 
 class ChatScroll(VerticalScroll):

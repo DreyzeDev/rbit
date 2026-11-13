@@ -69,6 +69,14 @@ All notable changes to rbit are documented here. The format follows
 
 ### Fixed
 
+- Streaming text no longer aborts the turn with a bogus connection error when the chat
+  card has not finished mounting yet (`No nodes match 'Markdown'`).
+- Provider failures are no longer reported as network errors; non-HTTP exceptions surface
+  as "Ошибка обработки ответа модели" instead of "Не удалось подключиться".
+- Reasoning-only replies (thinking models) are used as the assistant message instead of
+  showing "(пустой ответ модели)".
+- The system prompt now states the real shell (`PowerShell` on Windows) so models stop
+  emitting Unix-only commands such as `ls -la`.
 - Continuing a session now replays previous tool calls and their results to the model.
   Previously only plain user/assistant text was sent, so the model forgot files it had
   read, diffs it produced, and commands it had run in earlier turns.

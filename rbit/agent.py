@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -96,6 +97,7 @@ ThinkingHook = Callable[[bool], Awaitable[None]]
 SYSTEM_PROMPT_TEMPLATE = """You are rbit, an autonomous interactive CLI coding agent.
 Workspace: {workspace}
 Active Agent Mode: {agent_mode}
+{shell_note}
 {mode_note}
 {memory_section}
 Respond concisely in the user's language (Russian if the user writes in Russian) using GitHub-flavored Markdown.
@@ -452,6 +454,13 @@ class AgentEngine:
         )
         project_mem = self.storage.load_project_memory()
         memory_section = f"\nProject Rules & Memory:\n{project_mem}\n" if project_mem else ""
+        shell_note = (
+            "Shell: Windows PowerShell 5.1 — write PowerShell commands "
+            "(`Get-ChildItem`, `New-Item -ItemType Directory`, `$env:VAR`); "
+            "Unix flags like `ls -la` fail."
+            if os.name == "nt"
+            else "Shell: POSIX sh/bash."
+        )
 
         api_messages: list[dict[str, Any]] = [
             {
@@ -459,6 +468,7 @@ class AgentEngine:
                 "content": SYSTEM_PROMPT_TEMPLATE.format(
                     workspace=self.workspace,
                     agent_mode=agent_mode.upper(),
+                    shell_note=shell_note,
                     mode_note=mode_note,
                     memory_section=memory_section,
                 ),
@@ -678,6 +688,7 @@ class AgentEngine:
         if effort is not None:
             payload["reasoning_effort"] = effort
         full_text: list[str] = []
+        reasoning_text: list[str] = []
         tc_acc: dict[int, dict[str, Any]] = {}
 
         for attempt in range(1, self.retry_attempts + 1):
@@ -714,10 +725,16 @@ class AgentEngine:
                         if not choices:
                             continue
                         delta = choices[0].get("delta") or {}
+                        reasoning_piece = delta.get("reasoning_content") or delta.get("reasoning")
+                        if isinstance(reasoning_piece, str) and reasoning_piece:
+                            reasoning_text.append(reasoning_piece)
                         txt_piece = delta.get("content")
                         if txt_piece:
                             full_text.append(txt_piece)
-                            await on_stream_chunk("".join(full_text))
+                            try:
+                                await on_stream_chunk("".join(full_text))
+                            except Exception:
+                                logger.debug("stream hook failed", exc_info=True)
 
                         for tc_delta in delta.get("tool_calls") or []:
                             idx = int(tc_delta.get("index", 0))
@@ -737,8 +754,11 @@ class AgentEngine:
                             if fn.get("arguments"):
                                 entry["function"]["arguments"] += fn["arguments"]
                 ordered_tcs = [tc_acc[k] for k in sorted(tc_acc.keys())]
-                return True, "".join(full_text), ordered_tcs
-            except Exception as exc:
+                text = "".join(full_text)
+                if not text and not ordered_tcs:
+                    text = "".join(reasoning_text)
+                return True, text, ordered_tcs
+            except httpx.HTTPError as exc:
                 if attempt < self.retry_attempts and not full_text:
                     delay = self._retry_delay(attempt)
                     if on_status is not None:
@@ -751,6 +771,12 @@ class AgentEngine:
                     False,
                     f"Не удалось подключиться к `{url}`: **{exc}**.\n\n"
                     "Проверьте настройки через `/connect` или переключитесь на `rbit/smart-local` в `/models`.",
+                    [],
+                )
+            except Exception as exc:
+                return (
+                    False,
+                    f"Ошибка обработки ответа модели: **{type(exc).__name__}: {exc}**",
                     [],
                 )
 
@@ -777,7 +803,7 @@ class AgentEngine:
         for attempt in range(1, self.retry_attempts + 1):
             try:
                 resp = await client.post(url, headers=headers, json=payload)
-            except Exception as exc:
+            except httpx.HTTPError as exc:
                 if attempt < self.retry_attempts:
                     delay = self._retry_delay(attempt)
                     if on_status is not None:
@@ -809,7 +835,13 @@ class AgentEngine:
                 )
             data = resp.json()
             choice = data["choices"][0]["message"]
-            return True, choice.get("content") or "", choice.get("tool_calls") or []
+            content = choice.get("content") or ""
+            tool_calls = choice.get("tool_calls") or []
+            if not content and not tool_calls:
+                reasoning = choice.get("reasoning")
+                if isinstance(reasoning, str):
+                    content = reasoning
+            return True, content, tool_calls
         return False, f"Не удалось получить ответ от `{url}` после повторных попыток.", []
 
     async def _run_git_full(self, *args: str, timeout: float = 15.0) -> tuple[int, str]:
