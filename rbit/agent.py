@@ -31,6 +31,8 @@ from .tools import (
 )
 
 MAX_PARALLEL_TOOLS = 4
+HISTORY_UNITS = 24
+TOOL_HISTORY_CHARS = 2000
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 logger = logging.getLogger("rbit.agent")
 HTTP_LIMITS = httpx.Limits(max_keepalive_connections=10, max_connections=20)
@@ -459,8 +461,9 @@ class AgentEngine:
             }
         ]
 
-        for m in session.messages[-18:]:
-            if m.role in ("user", "assistant"):
+        units: list[list[dict[str, Any]]] = []
+        for m in session.messages:
+            if m.role == "user":
                 text = m.content
                 if m is user_msg and m.attachments:
                     att_sem = asyncio.Semaphore(MAX_PARALLEL_TOOLS)
@@ -474,7 +477,43 @@ class AgentEngine:
 
                     attached_blocks = await asyncio.gather(*(_read_attachment(rel) for rel in m.attachments))
                     text = "\n\n".join(attached_blocks) + "\n\n" + text
-                api_messages.append({"role": m.role, "content": text})
+                units.append([{"role": "user", "content": text}])
+            elif m.role == "assistant":
+                assistant_msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": m.content or "",
+                }
+                tool_messages: list[dict[str, Any]] = []
+                if m.tool_calls:
+                    calls: list[dict[str, Any]] = []
+                    for tc in m.tool_calls:
+                        try:
+                            args_repr = json.dumps(tc.arguments, ensure_ascii=False)
+                        except (TypeError, ValueError):
+                            args_repr = "{}"
+                        call_id = f"call_{tc.id}"
+                        calls.append(
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": tc.name, "arguments": args_repr},
+                            }
+                        )
+                        payload = tc.output or ""
+                        if tc.diff:
+                            payload = f"{payload}\n\nDiff:\n{tc.diff}" if payload else f"Diff:\n{tc.diff}"
+                        tool_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "name": tc.name,
+                                "content": payload[:TOOL_HISTORY_CHARS],
+                            }
+                        )
+                    assistant_msg["tool_calls"] = calls
+                units.append([assistant_msg] + tool_messages)
+        for unit in units[-HISTORY_UNITS:]:
+            api_messages.extend(unit)
 
         headers = self._build_headers(api_key)
 

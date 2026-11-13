@@ -67,6 +67,9 @@ All notable changes to rbit are documented here. The format follows
 
 ### Fixed
 
+- Continuing a session now replays previous tool calls and their results to the model.
+  Previously only plain user/assistant text was sent, so the model forgot files it had
+  read, diffs it produced, and commands it had run in earlier turns.
 - Clicking a tool card no longer steals keyboard focus from the prompt input; `Enter` on an
   empty prompt toggles the newest card instead.
 - `rbit --allow-outside run ...` is parsed before the subcommand instead of treating `run`

@@ -2412,3 +2412,70 @@ def test_diff_and_tool_card_styling() -> None:
         ToolCallRecord(id="g1", name="git", arguments={}, summary="2 files", status="success")
     )
     assert "Git" in _flatten_render(git_card)
+
+@pytest.mark.asyncio
+async def test_previous_tool_results_are_replayed_in_history(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    cfg: dict[str, Any] = {"api_key": "test"}
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg)
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "done"}}]},
+        )
+
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    session = Session()
+    session.messages = [
+        ChatMessage(id="u1", role="user", content="read a.py"),
+        ChatMessage(
+            id="a1",
+            role="assistant",
+            content="",
+            model="openai/gpt-4o-mini",
+            tool_calls=[
+                ToolCallRecord(
+                    id="t1",
+                    name="read",
+                    arguments={"filePath": "a.py"},
+                    status="success",
+                    output="HELLO_FROM_FILE",
+                )
+            ],
+        ),
+        ChatMessage(id="u2", role="user", content="what was in the file?"),
+    ]
+
+    async def invoke_tool(name: str, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(True, "ok", "ok")
+
+    async def on_status(_s: str) -> None:
+        pass
+
+    await engine._run_openai_compatible(
+        session=session,
+        user_msg=session.messages[-1],
+        agent_mode="build",
+        model_id="openai/gpt-4o-mini",
+        api_base="https://mock.local/v1",
+        api_key="test",
+        invoke_tool=invoke_tool,
+        on_status=on_status,
+    )
+
+    assert captured
+    messages = captured[0]["messages"]
+    tool_msg = next(m for m in messages if m["role"] == "tool")
+    assert tool_msg["tool_call_id"] == "call_t1"
+    assert tool_msg["name"] == "read"
+    assert "HELLO_FROM_FILE" in tool_msg["content"]
+    assistant_with_calls = next(m for m in messages if m.get("tool_calls"))
+    call = assistant_with_calls["tool_calls"][0]
+    assert call["id"] == "call_t1"
+    assert call["function"]["name"] == "read"
+    assert "a.py" in call["function"]["arguments"]
+    assert [m["role"] for m in messages][-1] == "user"
