@@ -498,6 +498,7 @@ class RbitApp(App[None]):
         self._busy_worker: Any = None
         self._queued_prompt: str | None = None
         self._auto_fix_round: bool = False
+        self._stream_chars: int = 0
         self._spin_frame: int = 0
         self._has_inline_notices: bool = False
         self._sidebar_override_on_home: bool = False
@@ -665,6 +666,8 @@ class RbitApp(App[None]):
         if self._queued_prompt and self.is_busy:
             preview = self._queued_prompt.strip().replace("\n", " ")[:28]
             return f"{self.busy_status}  ·  в очереди: {preview}…".strip()
+        if self._stream_chars and self.is_busy:
+            return f"{self.busy_status}  ·  ≈{self._stream_chars // 4} tok"
         return self.busy_status
 
     @property
@@ -2158,6 +2161,7 @@ class RbitApp(App[None]):
         import time as _time
 
         self._turn_started = _time.monotonic()
+        self._stream_chars = 0
         # Bind the turn to the session it started with, so a mid-turn session
         # switch can never route the reply into the wrong session.
         session = self.session
@@ -2225,6 +2229,7 @@ class RbitApp(App[None]):
                     scroll.mount(self._live_card)
             else:
                 await self._live_card.update_stream(partial_md)
+            self._stream_chars = len(partial_md)
             self._smart_scroll_end()
 
         async def run_engine_once(msg: ChatMessage) -> ChatMessage:
