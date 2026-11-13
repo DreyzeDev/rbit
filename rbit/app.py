@@ -2177,6 +2177,7 @@ class RbitApp(App[None]):
 
         self._turn_started = _time.monotonic()
         self._stream_chars = 0
+        self._files_at_turn_start = dict(session.modified_files)
         # Bind the turn to the session it started with, so a mid-turn session
         # switch can never route the reply into the wrong session.
         session = self.session
@@ -2353,6 +2354,16 @@ class RbitApp(App[None]):
 
                 if _time.monotonic() - self._turn_started > 30:
                     self._os_notify("Ход завершён")
+            changed_files = {
+                rel: st
+                for rel, st in session.modified_files.items()
+                if getattr(self, "_files_at_turn_start", {}).get(rel) != st
+            }
+            if changed_files and self.config_data.get("turn_recap", True):
+                lines = ["Files changed this turn:"]
+                for rel, st in list(changed_files.items())[-12:]:
+                    lines.append(f"  • {rel}  [+{st.added} -{st.removed}]")
+                self._post_notice("\n".join(lines))
             if queued:
                 self.call_after_refresh(self._submit_prompt, queued)
             elif self.config_data.get("auto_title", True) and len(session.messages) <= 2 and session.title in (
