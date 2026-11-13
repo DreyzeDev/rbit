@@ -202,6 +202,23 @@ async def _run_doctor(workspace: Path) -> int:
         str(storage.memory_path),
     )
     tbl.add_row("Saved Sessions", "OK", f"{len(storage.list_sessions())} sessions · {len(storage.list_checkpoints())} checkpoints")
+    tbl.add_row("Storage Backend", "OK", str(cfg.get("storage_backend") or "json (sessions)"))
+    tbl.add_row("Bash Sandbox", "ON" if cfg.get("bash_sandbox") else "OFF", "config bash_sandbox")
+    tbl.add_row("Session Security", "ENCRYPTED" if cfg.get("encrypt_sessions") else "PLAIN", "config encrypt_sessions (+RBIT_PASSPHRASE)")
+    keyring_ok = bool(storage.resolve_api_key(cfg)) or bool((cfg.get("api_key") or "").strip())
+    tbl.add_row("API Key Source", "OK" if keyring_ok else "MISSING", "keyring" if str(cfg.get("api_key")) == "keyring" else "config")
+    try:
+        from rbit.tools import detect_language_servers
+
+        lsp = detect_language_servers()
+        found = [k for k, v in lsp.items() if v]
+        tbl.add_row("Language Servers", "FOUND" if found else "NONE", ", ".join(found) or "pylsp/pyright/clangd/tsls not on PATH (grep/lint still work)")
+    except Exception as exc:
+        tbl.add_row("Language Servers", "ERR", str(exc)[:60])
+    rg = shutil.which("rg")
+    tbl.add_row("ripgrep (fast grep)", "OK" if rg else "FALLBACK", rg or "python fallback in use")
+    ruff = shutil.which("ruff")
+    tbl.add_row("ruff (lint tool)", "OK" if ruff else "FALLBACK", ruff or "built-in syntax diagnostics only")
 
     console.print(tbl)
     return 0
