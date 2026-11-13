@@ -663,7 +663,9 @@ class RbitApp(App[None]):
         )
         self.query_one(SessionHeaderBar).update_header(self.session, model_id, self.engine.extra_models)
         session_title = (self.session.title or "New Session").strip()
-        self.title = f"rbit · {session_title}" if session_title else "rbit"
+        new_title = f"rbit · {session_title}" if session_title else "rbit"
+        if self.title != new_title:
+            self.title = new_title
         self.query_one(SidebarPanel).refresh_all(
             self.session,
             model_id,
