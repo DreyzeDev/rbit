@@ -5,6 +5,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -29,3 +32,23 @@ jobs:
             rbit-dist/*.dmg
             rbit-dist/*.AppImage
           if-no-files-found: warn
+      - name: Attach installers to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          # The release is created by release.yml; wait for it, create if missing.
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              found=1
+              break
+            fi
+            sleep 30
+          done
+          if [ -z "$found" ]; then
+            gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" --notes "rbit desktop installers" || true
+          fi
+          gh release upload "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+            rbit-dist/*.exe rbit-dist/*.dmg rbit-dist/*.AppImage --clobber
