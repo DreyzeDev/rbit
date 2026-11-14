@@ -1411,6 +1411,21 @@ def _run_serve(args: argparse.Namespace) -> int:
                 self.wfile.write((_json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
                 self.wfile.flush()
 
+        def do_DELETE(self) -> None:  # noqa: N802
+            if not self.path.startswith("/v1/sessions/"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            sid = self.path.rsplit("/", 1)[-1]
+            ok = bool(storage.find_session(sid)) and storage.delete_session(sid)
+            body = _json.dumps({"deleted": bool(ok), "id": sid}).encode("utf-8")
+            self.send_response(200 if ok else 404)
+            self._cors()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     Console().print(f"rbit serve on http://127.0.0.1:{args.port}  (POST /v1/turns, GET /health, GET /v1/models)")
     try:
