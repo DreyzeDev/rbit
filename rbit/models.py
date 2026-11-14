@@ -170,7 +170,7 @@ def _migrate_session_dict(data: dict[str, Any]) -> dict[str, Any]:
 @dataclass
 class Session:
     id: str = field(default_factory=short_id)
-    title: str = "New Session"
+    title: str = "Новая сессия"
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M"))
     messages: list[ChatMessage] = field(default_factory=list)
     todos: list[TodoItem] = field(default_factory=list)

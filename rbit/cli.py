@@ -1184,8 +1184,9 @@ def _run_serve(args: argparse.Namespace) -> int:
     approvals: dict[str, dict] = {}
     caution_re = _re.compile(
         r"\brm\s+-[a-z]*r[a-z]*f|-\w+f\w*r\b(?=\s)|\bgit\s+reset\s+--hard\b|"
-        r"\bgit\s+push\b[^;\n]*--force|\bdrop\s+(table|database)\b|\bmkfs\b|\bformat\s+[a-z]:",
-        _re.IGNORECASE,
+        r"\bgit\s+push\b[^;\n]*--force|\bdrop\s+(table|database)\b|\bmkfs\b|\bformat\s+[a-z]:|"
+        r"^\s*(del|rd|erase|remove-item)\s+\S",
+        _re.IGNORECASE | _re.MULTILINE,
     )
 
     def _settle_future(fut, value: bool) -> None:
@@ -1246,7 +1247,7 @@ def _run_serve(args: argparse.Namespace) -> int:
                 sink.put({"type": "tool_call", "name": rec.name, "arguments": rec.arguments})
 
             async def on_tool_end(rec: ToolCallRecord) -> None:
-                sink.put({"type": "tool_result", "name": rec.name, "summary": rec.summary})
+                sink.put({"type": "tool_result", "name": rec.name, "summary": rec.summary, "output": rec.output})
 
             async def on_stream_chunk(partial: str) -> None:
                 sink.put({"type": "delta", "text": partial})
@@ -1260,6 +1261,9 @@ def _run_serve(args: argparse.Namespace) -> int:
             async def _turn() -> None:
                 user = ChatMessage(id=short_id(), role="user", content=prompt_text)
                 session.messages.append(user)
+                # Persist the user message immediately: a turn may take minutes
+                # (tool approvals), and closing the app must not lose it.
+                storage.save_session(session)
                 if effort_override in EFFORT_LEVELS:
                     cfg["effort"] = effort_override
                 agent_mode = agent_override if agent_override in ("build", "plan") else "build"
@@ -1275,6 +1279,9 @@ def _run_serve(args: argparse.Namespace) -> int:
                     on_thinking=on_thinking,
                     on_reasoning_chunk=on_reasoning_chunk,
                 )
+                # run_turn returns the assistant reply without appending it to
+                # the session — persist it, or history keeps only user messages.
+                session.messages.append(reply)
                 storage.save_session(session)
                 sink.put({"type": "message", "content": reply.content, "session_id": session.id})
 
@@ -1338,6 +1345,15 @@ def _run_serve(args: argparse.Namespace) -> int:
                     self.send_response(404)
                     self.end_headers()
             elif self.path == "/v1/models":
+                provider_models = [ModelInfo.from_dict(item) for item in cfg.get("provider_models") or []]
+                provider_models = [m for m in provider_models if m.id]
+                # With a configured provider, the built-in registry ids are not
+                # valid for it (they would fall back to the canned reply) — show
+                # the provider's real catalog plus the built-in Smart Agent.
+                pool = provider_models if (provider_models and str(cfg.get("api_key") or "").strip()) else list(AVAILABLE_MODELS)
+                if provider_models and str(cfg.get("api_key") or "").strip():
+                    smart = next((m for m in AVAILABLE_MODELS if m.id == "rbit/smart-local"), None)
+                    pool = ([smart] if smart else []) + provider_models
                 listed = [
                     {
                         "id": m.id,
@@ -1346,23 +1362,24 @@ def _run_serve(args: argparse.Namespace) -> int:
                         "context_window": m.context_window,
                         "cost_per_1k": m.cost_per_1k,
                     }
-                    for m in AVAILABLE_MODELS
+                    for m in pool
                 ]
-                seen = {m.id for m in AVAILABLE_MODELS}
-                for item in cfg.get("provider_models") or []:
-                    m = ModelInfo.from_dict(item)
-                    if m.id and m.id not in seen:
-                        listed.append(
-                            {
-                                "id": m.id,
-                                "name": m.name,
-                                "provider": m.provider,
-                                "context_window": m.context_window,
-                                "cost_per_1k": m.cost_per_1k,
-                            }
-                        )
-                        seen.add(m.id)
-                body = _json.dumps({"models": listed}, ensure_ascii=False).encode("utf-8")
+                seen = {m.id for m in pool}
+                if not (provider_models and str(cfg.get("api_key") or "").strip()):
+                    for item in cfg.get("provider_models") or []:
+                        m = ModelInfo.from_dict(item)
+                        if m.id and m.id not in seen:
+                            listed.append(
+                                {
+                                    "id": m.id,
+                                    "name": m.name,
+                                    "provider": m.provider,
+                                    "context_window": m.context_window,
+                                    "cost_per_1k": m.cost_per_1k,
+                                }
+                            )
+                            seen.add(m.id)
+                body = _json.dumps({"models": listed, "current": model_id}, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self._cors()
                 self.send_header("Content-Type", "application/json")
