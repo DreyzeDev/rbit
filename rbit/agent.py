@@ -116,6 +116,7 @@ PROMPT_PROFILES: dict[str, dict[str, Any]] = {
 }
 
 PROVIDER_LABELS = {
+    "coarena.ai": "Coarena",
     "openrouter.ai": "OpenRouter",
     "api.openai.com": "OpenAI",
     "api.anthropic.com": "Anthropic",

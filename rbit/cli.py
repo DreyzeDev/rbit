@@ -1169,7 +1169,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     from rbit.agent import AgentEngine
-    from rbit.models import AVAILABLE_MODELS, ChatMessage, Session, ToolCallRecord, short_id
+    from rbit.models import AVAILABLE_MODELS, ChatMessage, ModelInfo, Session, ToolCallRecord, short_id
     from rbit.tools import ToolExecutor
 
     workspace = _resolve_workspace(args.dir)
@@ -1301,6 +1301,20 @@ def _run_serve(args: argparse.Namespace) -> int:
                     }
                     for m in AVAILABLE_MODELS
                 ]
+                seen = {m.id for m in AVAILABLE_MODELS}
+                for item in cfg.get("provider_models") or []:
+                    m = ModelInfo.from_dict(item)
+                    if m.id and m.id not in seen:
+                        listed.append(
+                            {
+                                "id": m.id,
+                                "name": m.name,
+                                "provider": m.provider,
+                                "context_window": m.context_window,
+                                "cost_per_1k": m.cost_per_1k,
+                            }
+                        )
+                        seen.add(m.id)
                 body = _json.dumps({"models": listed}, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self._cors()
