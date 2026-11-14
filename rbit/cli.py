@@ -1165,6 +1165,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     """Local HTTP endpoint: POST /v1/turns streams a full agent turn as NDJSON."""
     import json as _json
     import queue as _queue
+    import re as _re
     import threading as _threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1177,6 +1178,19 @@ def _run_serve(args: argparse.Namespace) -> int:
     cfg = storage.load_config()
     model_id = str(cfg.get("model", "rbit/smart-local"))
     sessions: dict[str, Session] = {}
+    # Interactive tool approvals: with RBIT_APPROVALS=1 the desktop client gets
+    # a `tool_approval` event for every non-read-only bash command and answers
+    # via POST /v1/approvals. Without it everything runs unattended.
+    approvals: dict[str, dict] = {}
+    caution_re = _re.compile(
+        r"\brm\s+-[a-z]*r[a-z]*f|-\w+f\w*r\b(?=\s)|\bgit\s+reset\s+--hard\b|"
+        r"\bgit\s+push\b[^;\n]*--force|\bdrop\s+(table|database)\b|\bmkfs\b|\bformat\s+[a-z]:",
+        _re.IGNORECASE,
+    )
+
+    def _settle_future(fut, value: bool) -> None:
+        if not fut.done():
+            fut.set_result(bool(value))
 
     def run_turn_events(
         prompt_text: str,
@@ -1190,7 +1204,37 @@ def _run_serve(args: argparse.Namespace) -> int:
         asyncio.set_event_loop(loop)
         try:
             executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=lambda: cfg)
-            executor.always_allow_bash = True
+            approvals_on = os.environ.get("RBIT_APPROVALS") == "1"
+            executor.always_allow_bash = not approvals_on
+
+            async def _permission(tool: str, payload: str) -> bool:
+                """Asks the connected client to approve a tool call (bash)."""
+                aid = short_id()
+                fut = loop.create_future()
+                approvals[aid] = {
+                    "fut": fut,
+                    "loop": loop,
+                    "executor": executor,
+                    "input": payload,
+                }
+                sink.put(
+                    {
+                        "type": "tool_approval",
+                        "id": aid,
+                        "tool": tool,
+                        "input": payload,
+                        "destructive": bool(caution_re.search(payload)),
+                    }
+                )
+                try:
+                    return await asyncio.wait_for(fut, timeout=180)
+                except (asyncio.TimeoutError, TimeoutError):
+                    return False
+                finally:
+                    approvals.pop(aid, None)
+
+            if approvals_on:
+                executor.permission_cb = _permission
             executor.allow_outside_paths = bool(getattr(args, "allow_outside", False))
             engine = AgentEngine(workspace=workspace, executor=executor, storage=storage, get_config=lambda: cfg)
 
@@ -1371,6 +1415,35 @@ def _run_serve(args: argparse.Namespace) -> int:
                 self.end_headers()
 
         def do_POST(self) -> None:  # noqa: N802
+            if self.path == "/v1/approvals":
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    req = _json.loads(self.rfile.read(length) or b"{}")
+                except ValueError:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                aid = str(req.get("id") or "")
+                entry = approvals.pop(aid, None) if aid else None
+                approved = bool(req.get("approved"))
+                if entry and not entry["fut"].done():
+                    if approved and req.get("always") and entry.get("executor") is not None:
+                        # "Don't ask again": allow the command's 2-word prefix for this turn.
+                        try:
+                            prefix = entry["executor"]._bash_prefix(str(entry.get("input") or ""))
+                            if prefix and prefix not in entry["executor"].allowed_bash_prefixes:
+                                entry["executor"].allowed_bash_prefixes.append(prefix)
+                        except Exception:
+                            pass
+                    entry["loop"].call_soon_threadsafe(_settle_future, entry["fut"], approved)
+                body = _json.dumps({"ok": True, "id": aid, "approved": approved}).encode("utf-8")
+                self.send_response(200)
+                self._cors()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path != "/v1/turns":
                 self.send_response(404)
                 self.end_headers()
