@@ -1415,6 +1415,23 @@ def _run_serve(args: argparse.Namespace) -> int:
                 self.end_headers()
 
         def do_POST(self) -> None:  # noqa: N802
+            if self.path == "/v1/sessions":
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    req = _json.loads(self.rfile.read(length) or b"{}")
+                except ValueError:
+                    req = {}
+                s = Session()
+                s.title = (str(req.get("title") or "").strip()[:80] or "Новая сессия")
+                storage.save_session(s)
+                body = _json.dumps({"id": s.id, "title": s.title}, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self._cors()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path.startswith("/v1/sessions/") and self.path.endswith("/rename"):
                 sid = self.path[len("/v1/sessions/") : -len("/rename")]
                 length = int(self.headers.get("Content-Length") or 0)
