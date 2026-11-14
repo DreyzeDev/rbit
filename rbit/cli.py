@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -231,22 +231,6 @@ async def _run_doctor(workspace: Path) -> int:
     ruff = shutil.which("ruff")
     tbl.add_row("ruff (lint tool)", "OK" if ruff else "FALLBACK", ruff or "built-in syntax diagnostics only")
 
-    if models:
-        per_model = {}
-        for s in sessions:
-            for m in s.messages:
-                if m.role == "assistant" and m.model:
-                    per_model[m.model] = per_model.get(m.model, 0) + m.tokens
-        top = sorted(per_model.items(), key=lambda kv: -kv[1])
-        if models > 0:
-            top = top[:models]
-        mtbl = Table(title="Models", border_style="#282828")
-        mtbl.add_column("Model", style="bold #eeeeee")
-        mtbl.add_column("Tokens", justify="right")
-        for name, tok in top:
-            mtbl.add_row(name, f"{tok:,}")
-        console.print(mtbl)
-
     console.print(tbl)
     return 0
 
@@ -452,6 +436,21 @@ def _run_stats(workspace: Path, days: int | None = None, models: int | None = No
         )
     )
     console.print(Panel(panel_body, title=f"[bold #fab283]rbit Workspace Stats[/] ({workspace.name})", border_style="#282828"))
+    if models:
+        per_model = {}
+        for s in sessions:
+            for m in s.messages:
+                if m.role == "assistant" and m.model:
+                    per_model[m.model] = per_model.get(m.model, 0) + m.tokens
+        top = sorted(per_model.items(), key=lambda kv: -kv[1])
+        if models > 0:
+            top = top[:models]
+        mtbl = Table(title="Models", border_style="#282828")
+        mtbl.add_column("Model", style="bold #eeeeee")
+        mtbl.add_column("Tokens", justify="right")
+        for name, tok in top:
+            mtbl.add_row(name, f"{tok:,}")
+        console.print(mtbl)
     return 0
 
 
@@ -1265,7 +1264,7 @@ def main(argv: list[str] | None = None) -> int:
             p = argparse.ArgumentParser(prog="rbit stats")
             p.add_argument("dir", nargs="?", help="Workspace directory")
             p.add_argument("--days", type=int, default=None, help="Stats for the last N days")
-            p.add_argument("--models", nargs="?", const=5, default=None, help="Show per-model stats (top N)")
+            p.add_argument("--models", nargs="?", const=5, default=None, type=int, help="Show per-model stats (top N)")
             parsed = p.parse_args(rest)
             return _run_stats(_resolve_workspace(parsed.dir), parsed.days, parsed.models)
 
