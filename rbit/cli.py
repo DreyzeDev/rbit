@@ -1168,7 +1168,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     import threading as _threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    from rbit.agent import AgentEngine
+    from rbit.agent import EFFORT_LEVELS, AgentEngine
     from rbit.models import AVAILABLE_MODELS, ChatMessage, ModelInfo, Session, ToolCallRecord, short_id
     from rbit.tools import ToolExecutor
 
@@ -1184,6 +1184,7 @@ def _run_serve(args: argparse.Namespace) -> int:
         sink: "_queue.Queue",  # type: ignore[name-defined]
         model_override: str = "",
         agent_override: str = "",
+        effort_override: str = "",
     ):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -1215,6 +1216,8 @@ def _run_serve(args: argparse.Namespace) -> int:
             async def _turn() -> None:
                 user = ChatMessage(id=short_id(), role="user", content=prompt_text)
                 session.messages.append(user)
+                if effort_override in EFFORT_LEVELS:
+                    cfg["effort"] = effort_override
                 agent_mode = agent_override if agent_override in ("build", "plan") else "build"
                 reply = await engine.run_turn(
                     session=session,
@@ -1391,6 +1394,7 @@ def _run_serve(args: argparse.Namespace) -> int:
             sessions[session.id] = session
             model_req = str(req.get("model") or "").strip()
             agent_req = str(req.get("agent") or "").strip()
+            effort_req = str(req.get("effort") or "").strip().lower()
 
             self.send_response(200)
             self._cors()
@@ -1398,7 +1402,7 @@ def _run_serve(args: argparse.Namespace) -> int:
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             events: _queue.Queue = _queue.Queue()
-            worker = _threading.Thread(target=run_turn_events, args=(prompt_text, session, events, model_req, agent_req), daemon=True)
+            worker = _threading.Thread(target=run_turn_events, args=(prompt_text, session, events, model_req, agent_req, effort_req), daemon=True)
             worker.start()
             while True:
                 item = events.get()
