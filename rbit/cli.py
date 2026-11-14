@@ -64,12 +64,21 @@ async def _run_headless(args: argparse.Namespace) -> int:
         prompt_text = (prompt_text + "\n\n" + stdin_text).strip()
     elif not prompt_text and not sys.stdin.isatty():
         prompt_text = sys.stdin.read().strip()
+    if getattr(args, "files", None):
+        prompt_text = prompt_text + "".join(" @" + f for f in args.files)
 
     if not prompt_text:
         console.print("[bold #e06c75]Error:[/] Prompt is required for `rbit run`.")
         return 1
 
-    if len(session.messages) == 0 and session.title == "New Session":
+    if getattr(args, "fork", False) and (getattr(args, "continue_last", False) or getattr(args, "session", None)):
+        forked = Session(title=f"{session.title} (fork)")
+        forked.messages = list(session.messages)
+        storage.save_session(forked)
+        session = forked
+    if getattr(args, "title", None) is not None:
+        session.title = args.title or prompt_text[:44]
+    elif len(session.messages) == 0 and session.title == "New Session":
         session.title = prompt_text[:44]
 
     executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=lambda: cfg)
@@ -222,15 +231,175 @@ async def _run_doctor(workspace: Path) -> int:
     ruff = shutil.which("ruff")
     tbl.add_row("ruff (lint tool)", "OK" if ruff else "FALLBACK", ruff or "built-in syntax diagnostics only")
 
+    if models:
+        per_model = {}
+        for s in sessions:
+            for m in s.messages:
+                if m.role == "assistant" and m.model:
+                    per_model[m.model] = per_model.get(m.model, 0) + m.tokens
+        top = sorted(per_model.items(), key=lambda kv: -kv[1])
+        if models > 0:
+            top = top[:models]
+        mtbl = Table(title="Models", border_style="#282828")
+        mtbl.add_column("Model", style="bold #eeeeee")
+        mtbl.add_column("Tokens", justify="right")
+        for name, tok in top:
+            mtbl.add_row(name, f"{tok:,}")
+        console.print(mtbl)
+
     console.print(tbl)
     return 0
 
 
-def _run_stats(workspace: Path) -> int:
+def _run_models(workspace: Path, provider: str | None, verbose: bool, refresh: bool) -> int:
+    from rbit.models import ModelInfo, get_model_info
+    from rbit.agent import discover_ollama_models
+
+    console = Console()
+    storage = StorageManager(workspace)
+    cfg = storage.load_config()
+    rows = []
+    if refresh:
+        engine = AgentEngine(workspace=workspace, executor=ToolExecutor(workspace=workspace, session=Session(), get_config=lambda: cfg), get_config=lambda: cfg)
+        key = storage.resolve_api_key(cfg).strip()
+        base = str(cfg.get("api_base") or "")
+        if base and key:
+            ok, message, fetched = asyncio.run(engine.fetch_provider_models(base, key))
+            if ok and fetched:
+                engine.add_provider_models(fetched)
+                cfg["provider_models"] = [m.to_dict() for m in engine.extra_models]
+                storage.save_config(cfg)
+                console.print(f"[dim]cache refreshed: {message}[/]")
+    for m in cfg.get("provider_models") or []:
+        try:
+            rows.append(ModelInfo.from_dict(m) if isinstance(m, dict) else m)
+        except Exception:
+            continue
+    try:
+        rows.extend(asyncio.run(discover_ollama_models()))
+    except Exception:
+        pass
+    known = get_model_info(cfg.get("model", ""), rows)
+    if known and not any(r.id == known.id for r in rows):
+        rows.insert(0, known)
+    if provider:
+        rows = [r for r in rows if provider.lower() in r.id.lower() or provider.lower() in r.provider.lower()]
+    if not rows:
+        console.print("No models found. Configure /connect or run with --refresh.")
+        return 1
+    for r in sorted(rows, key=lambda x: x.id):
+        meta = f"  | {r.context_window:,} ctx | ${r.cost_per_1k}/1k" if verbose else ""
+        console.print(f"{r.id} [dim]({r.provider})[/]{meta}")
+    return 0
+
+
+def _run_auth(workspace: Path, cmd: str, url: str | None) -> int:
+    from rbit.agent import AgentEngine
+    from rbit.models import Session
+    from rbit.tools import ToolExecutor
+
+    console = Console()
+    storage = StorageManager(workspace)
+    cfg = storage.load_config()
+    if cmd == "list":
+        base = str(cfg.get("api_base") or "(not set)")
+        key = storage.resolve_api_key(cfg)
+        masked = (key[:6] + "..." + key[-4:]) if len(key) > 12 else ("set" if key else "MISSING")
+        console.print(f"api_base : {base}")
+        console.print(f"api_key  : {masked}")
+        console.print(f"model    : {cfg.get('model')}")
+        if str(cfg.get("api_key")) == "keyring":
+            console.print("storage  : OS keyring")
+        return 0
+    if cmd == "login":
+        base = (url or str(cfg.get("api_base") or "")).rstrip("/") or console.input("API base URL: ")
+        if base.endswith("/chat/completions"):
+            base = base[: -len("/chat/completions")]
+        import getpass
+
+        key = getpass.getpass("API key (input hidden): ").strip()
+        if not key:
+            console.print("[red]No key entered.[/]")
+            return 1
+        cfg["api_base"] = base
+        cfg["api_key"] = key
+        storage.save_config(cfg)
+        engine = AgentEngine(workspace=workspace, executor=ToolExecutor(workspace=workspace, session=Session(), get_config=lambda: cfg), get_config=lambda: cfg)
+        ok, message = asyncio.run(engine.validate_api_key(base, key))
+        console.print(("[bold #7fd88f]OK[/] " if ok else "[bold #e06c75]FAIL[/] ") + message)
+        return 0 if ok else 1
+    if cmd == "logout":
+        cfg["api_key"] = ""
+        storage.save_config(cfg)
+        storage.delete_secret("api_key")
+        console.print("API key removed.")
+        return 0
+    return 1
+
+
+def _run_pr(workspace: Path, number: int) -> int:
+    import subprocess
+
+    def git(*args: str):
+        return subprocess.run(["git", *args], cwd=str(workspace), capture_output=True, text=True)
+
+    fetch = git("fetch", "origin", f"pull/{number}/head:pr-{number}")
+    if fetch.returncode != 0:
+        Console().print(f"[red]git fetch failed:[/] {fetch.stderr.strip()[:300]}")
+        return 1
+    co = git("checkout", f"pr-{number}")
+    if co.returncode != 0:
+        Console().print(f"[red]git checkout failed:[/] {co.stderr.strip()[:300]}")
+        return 1
+    Console().print(f"[bold #7fd88f]OK[/] Checked out pr-{number}. Run `rbit` here to work on the PR.")
+    return 0
+
+
+def _run_agent(workspace: Path, cmd: str, name: str | None) -> int:
+    console = Console()
+    if cmd == "list":
+        console.print("[bold #eeeeee]Built-in agents[/]")
+        console.print("  - build: full access (default)")
+        console.print("  - plan: read-only planning")
+        console.print("[bold #eeeeee]Skill agents[/] (.rbit/skills/*.md)")
+        skills_dir = workspace / ".rbit" / "skills"
+        found = sorted(skills_dir.glob("*.md")) if skills_dir.exists() else []
+        if found:
+            for f in found:
+                console.print(f"  - {f.stem}")
+        else:
+            console.print("  (none - rbit agent create <name>)")
+        return 0
+    if cmd == "create" and name:
+        skills_dir = workspace / ".rbit" / "skills"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        target = skills_dir / f"{name}.md"
+        if target.exists():
+            console.print(f"[red]Skill already exists:[/] {target}")
+            return 1
+        body_lines = [
+            "---",
+            "description: Describe what this agent does",
+            "mode: build",
+            "---",
+            f"You are the `{name}` agent.",
+            "",
+            "Describe the workflow, rules and output format here.",
+        ]
+        target.write_text(chr(10).join(body_lines) + chr(10), encoding="utf-8")
+        console.print(f"OK Skill agent created: {target}  -> run via /skill {name}")
+        return 0
+    return 1
+
+
+def _run_stats(workspace: Path, days: int | None = None, models: int | None = None) -> int:
     console = Console()
     storage = StorageManager(workspace)
     sessions = storage.list_sessions()
     checkpoints = storage.list_checkpoints()
+    if days:
+        cutoff = datetime.now() - timedelta(days=days)
+        sessions = [s for s in sessions if s.created_at[:10] >= cutoff.date().isoformat()]
 
     total_msgs = sum(len(s.messages) for s in sessions)
     total_tokens = sum(s.total_tokens for s in sessions)
@@ -849,7 +1018,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "export", "map", "lint", "init", "commit", "update", "backup", "describe", "serve", "import", "watch", "voice"}
+    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "backup", "describe", "serve", "import", "watch", "voice", "models", "auth", "web", "pr", "agent"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -867,6 +1036,9 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("-a", "--agent", choices=["build", "plan"], default="build", help="Agent mode")
             p.add_argument("-c", "--continue", dest="continue_last", action="store_true", help="Continue latest session")
             p.add_argument("-s", "--session", help="Continue specific session ID")
+            p.add_argument("--fork", action="store_true", help="Fork the session before continuing (requires -c/-s)")
+            p.add_argument("-f", "--file", action="append", default=None, help="File(s) to attach to the message")
+            p.add_argument("--title", nargs="?", const="", default=None, help="Session title (truncated prompt if no value)")
             p.add_argument("-d", "--dir", help="Target workspace directory")
             p.add_argument("--stdin", action="store_true", help="Read the prompt (or extra context) from stdin")
             p.add_argument(
@@ -915,10 +1087,11 @@ def main(argv: list[str] | None = None) -> int:
         if sub == "serve":
             p = argparse.ArgumentParser(prog="rbit serve", description="Local HTTP endpoint exposing rbit turns as NDJSON")
             p.add_argument("--port", type=int, default=8333)
+            p.add_argument("--hostname", default="127.0.0.1", help="Hostname to listen on")
             p.add_argument("-d", "--dir", help="Workspace directory")
             p.add_argument("--allow-outside", action="store_true")
             parsed = p.parse_args(rest)
-            return _run_serve(parsed)
+            return _run_serve(parsed, hostname=parsed.hostname)
 
         if sub == "import":
             p = argparse.ArgumentParser(prog="rbit import", description="Import a session from JSON (rbit or OpenAI messages) or Markdown")
@@ -971,6 +1144,71 @@ def main(argv: list[str] | None = None) -> int:
             storage.save_session(sess)
             Console().print(f"✓ Imported {len(messages)} messages as session `{sess.id}`")
             return 0
+
+        if sub == "models":
+            p = argparse.ArgumentParser(prog="rbit models", description="List available models")
+            p.add_argument("provider", nargs="?", help="Filter by provider prefix (e.g. glm, am)")
+            p.add_argument("--verbose", action="store_true", help="Include cost and context metadata")
+            p.add_argument("--refresh", action="store_true", help="Refresh the provider model cache")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            return _run_models(_resolve_workspace(parsed.dir), parsed.provider, parsed.verbose, parsed.refresh)
+
+        if sub == "auth":
+            p = argparse.ArgumentParser(prog="rbit auth", description="Manage provider credentials")
+            sub2 = p.add_subparsers(dest="auth_cmd")
+            sub2.add_parser("list", aliases=["ls"], help="List configured provider credentials")
+            login_p = sub2.add_parser("login", help="Log in to a provider (base URL + API key)")
+            login_p.add_argument("url", nargs="?", help="API base URL (defaults to the current one)")
+            sub2.add_parser("logout", help="Remove the stored API key")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            return _run_auth(_resolve_workspace(parsed.dir), parsed.auth_cmd or "list", getattr(parsed, "url", None))
+
+        if sub == "session":
+            p = argparse.ArgumentParser(prog="rbit session", description="Manage sessions")
+            sub2 = p.add_subparsers(dest="session_cmd")
+            sub2.add_parser("list", help="List sessions")
+            del_p = sub2.add_parser("delete", help="Delete a session by id or prefix")
+            del_p.add_argument("session_id", help="Session id or prefix")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            workspace = _resolve_workspace(parsed.dir)
+            if parsed.session_cmd == "delete":
+                storage = StorageManager(workspace)
+                target = storage.find_session(parsed.session_id)
+                if not target:
+                    Console().print(f"[red]Session not found:[/] {parsed.session_id}")
+                    return 1
+                storage.delete_session(target.id)
+                Console().print(f"OK Deleted session `{target.id}` ({target.title})")
+                return 0
+            return _run_sessions_list(workspace)
+
+        if sub == "web":
+            p = argparse.ArgumentParser(prog="rbit web", description="Start the rbit backend and open the desktop UI in a browser")
+            p.add_argument("--port", type=int, default=8333)
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            p.add_argument("--allow-outside", action="store_true")
+            parsed = p.parse_args(rest)
+            return _run_serve(parsed, hostname="127.0.0.1", open_browser=True)
+
+        if sub == "pr":
+            p = argparse.ArgumentParser(prog="rbit pr", description="Fetch and checkout a GitHub PR, then start rbit there")
+            p.add_argument("number", type=int, help="PR number")
+            p.add_argument("-d", "--dir", help="Repository directory")
+            parsed = p.parse_args(rest)
+            return _run_pr(_resolve_workspace(parsed.dir), parsed.number)
+
+        if sub == "agent":
+            p = argparse.ArgumentParser(prog="rbit agent", description="Manage agents (profiles and skills)")
+            sub2 = p.add_subparsers(dest="agent_cmd")
+            sub2.add_parser("list", help="List available agents")
+            create_p = sub2.add_parser("create", help="Create a skill agent (.rbit/skills/<name>.md)")
+            create_p.add_argument("name", help="Agent/skill name")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            return _run_agent(_resolve_workspace(parsed.dir), parsed.agent_cmd or "list", getattr(parsed, "name", None))
 
         if sub == "backup":
             p = argparse.ArgumentParser(prog="rbit backup", description="Archive the .rbit state directory")
@@ -1026,8 +1264,10 @@ def main(argv: list[str] | None = None) -> int:
         if sub == "stats":
             p = argparse.ArgumentParser(prog="rbit stats")
             p.add_argument("dir", nargs="?", help="Workspace directory")
+            p.add_argument("--days", type=int, default=None, help="Stats for the last N days")
+            p.add_argument("--models", nargs="?", const=5, default=None, help="Show per-model stats (top N)")
             parsed = p.parse_args(rest)
-            return _run_stats(_resolve_workspace(parsed.dir))
+            return _run_stats(_resolve_workspace(parsed.dir), parsed.days, parsed.models)
 
         if sub == "sessions":
             p = argparse.ArgumentParser(prog="rbit sessions")
@@ -1161,7 +1401,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 
-def _run_serve(args: argparse.Namespace) -> int:
+def _run_serve(args: argparse.Namespace, hostname: str = "127.0.0.1", open_browser: bool = False) -> int:
     """Local HTTP endpoint: POST /v1/turns streams a full agent turn as NDJSON."""
     import json as _json
     import queue as _queue
@@ -1558,8 +1798,13 @@ def _run_serve(args: argparse.Namespace) -> int:
             self.end_headers()
             self.wfile.write(body)
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    Console().print(f"rbit serve on http://127.0.0.1:{args.port}  (POST /v1/turns, GET /health, GET /v1/models)")
+    server = ThreadingHTTPServer((hostname, args.port), Handler)
+    if open_browser:
+        import webbrowser
+        import threading as _threading2
+
+        _threading2.Timer(1.2, lambda: webbrowser.open(f"http://{hostname}:{args.port}/")).start()
+    Console().print(f"rbit serve on http://{hostname}:{args.port}  (POST /v1/turns, GET /health, GET /v1/models, GET /v1/sessions)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
