@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import signal
 import socket
 import subprocess
@@ -28,6 +29,7 @@ class ServiceState:
     workspace: str
     started_at: float
     log: str = ""
+    token: str = ""
 
     @property
     def url(self) -> str:
@@ -42,6 +44,7 @@ class ServiceState:
             "workspace": self.workspace,
             "started_at": self.started_at,
             "log": self.log,
+            "token": self.token,
         }
 
     @classmethod
@@ -53,6 +56,7 @@ class ServiceState:
             workspace=str(data.get("workspace") or ""),
             started_at=float(data.get("started_at") or 0),
             log=str(data.get("log") or ""),
+            token=str(data.get("token") or ""),
         )
 
 
@@ -111,6 +115,11 @@ class ServiceManager:
         if settings:
             data["settings"] = settings
         self.state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        if os.name != "nt":
+            try:
+                os.chmod(self.state_path, 0o600)
+            except OSError:
+                pass
 
     def clear(self) -> None:
         try:
@@ -150,6 +159,7 @@ class ServiceManager:
         log_path = self.state_path.parent / "service.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_file = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 - handed to the child
+        token = secrets.token_urlsafe(32)
         command = [
             sys.executable,
             "-m",
@@ -167,6 +177,7 @@ class ServiceManager:
             "stderr": log_file,
             "stdin": subprocess.DEVNULL,
             "cwd": str(workspace),
+            "env": {**os.environ, "RBIT_SERVER_TOKEN": token},
         }
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
@@ -181,6 +192,7 @@ class ServiceManager:
             workspace=str(workspace),
             started_at=time.time(),
             log=str(log_path),
+            token=token,
         )
         self.write(state)
         for _ in range(50):
@@ -230,6 +242,11 @@ class ServiceManager:
     def _write_raw(self, data: dict[str, Any]) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        if os.name != "nt":
+            try:
+                os.chmod(self.state_path, 0o600)
+            except OSError:
+                pass
 
     def get_settings(self) -> dict[str, Any]:
         settings = self._raw().get("settings")

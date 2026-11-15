@@ -15,6 +15,7 @@ All notable changes to rbit are documented here. The format follows
   (Exa/Tavily/Firecrawl with DuckDuckGo fallback).
 - Tools for terminal sessions (`terminal`), image generation (`image_generate`) and artifacts/schedules, plus model variants and multi-provider websearch.
 - Cron-style schedules, schedule runner lock, MCP resource list/read tool, ACP session replay, terminal/image tools.
+- Server API bearer-token auth (`RBIT_SERVER_TOKEN`/service-generated token), pair-cookie flow for the web UI, 0600 service state, and keyring-backed multi-credentials.
 - Native Anthropic Messages API support (`protocol: anthropic`) with tool_use/tool_result loop.
 - Server API additions: `/v1/artifacts`, `/v1/schedules`, `/v1/fs`, `/v1/usage`,
   `/v1/config`, `/v1/skills`, `/v1/vcs/status`, `/v1/reload`, plus OpenAPI IDs.

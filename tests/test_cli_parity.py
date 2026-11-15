@@ -42,12 +42,13 @@ def test_service_settings_round_trip(tmp_path: Path) -> None:
 
 def test_service_state_serialization(tmp_path: Path) -> None:
     manager = ServiceManager(state_path=tmp_path / "service.json")
-    state = ServiceState(pid=123, port=8333, host="127.0.0.1", workspace=str(tmp_path), started_at=1.0)
+    state = ServiceState(pid=123, port=8333, host="127.0.0.1", workspace=str(tmp_path), started_at=1.0, token="tok")
     manager.write(state)
     loaded = manager.read()
     assert loaded is not None
     assert loaded.url == "http://127.0.0.1:8333"
     assert loaded.workspace == str(tmp_path)
+    assert loaded.token == "tok"
 
 
 def test_api_operations_cover_server(tmp_path: Path) -> None:

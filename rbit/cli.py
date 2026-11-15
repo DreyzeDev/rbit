@@ -412,7 +412,13 @@ def _run_auth(
                     "name": cred_name,
                     "active": cred_name == active,
                     "api_base": credential.get("api_base"),
-                    "api_key": _mask_secret(str(credential.get("api_key") or "")),
+                    "api_key": _mask_secret(
+                        (
+                            storage.load_secret(f"credential:{cred_name}") or ""
+                            if credential.get("api_key") == "keyring"
+                            else str(credential.get("api_key") or "")
+                        )
+                    ),
                     "model": credential.get("model"),
                 }
             )
@@ -451,16 +457,20 @@ def _run_auth(
         if not key:
             console.print("[red]No key entered.[/]")
             return 1
+        keyring_saved = storage.store_secret(f"credential:{cred_name}", key)
         credential = {
             "api_base": base,
-            "api_key": key,
+            "api_key": "keyring" if keyring_saved else key,
             "model": model or cfg.get("model"),
         }
         credentials[cred_name] = credential
         cfg["credentials"] = credentials
         cfg["active_credential"] = cred_name
         cfg["api_base"] = base
-        cfg["api_key"] = key
+        if storage.store_secret("api_key", key):
+            cfg["api_key"] = "keyring"
+        else:
+            cfg["api_key"] = key
         if model:
             cfg["model"] = model
         storage.save_config(cfg)
@@ -476,6 +486,7 @@ def _run_auth(
         cred_name = name or active
         if cred_name and cred_name in credentials:
             del credentials[cred_name]
+            storage.delete_secret(f"credential:{cred_name}")
             cfg["credentials"] = credentials
             if cred_name == active:
                 cfg["active_credential"] = ""
@@ -498,14 +509,30 @@ def _run_auth(
             return 1
         cfg["active_credential"] = target
         cfg["api_base"] = credential.get("api_base") or cfg.get("api_base")
-        cfg["api_key"] = credential.get("api_key") or ""
+        source_key = (
+            storage.load_secret(f"credential:{target}") or ""
+            if credential.get("api_key") == "keyring"
+            else str(credential.get("api_key") or "")
+        )
+        if source_key and storage.store_secret("api_key", source_key):
+            cfg["api_key"] = "keyring"
+        else:
+            cfg["api_key"] = source_key
         if credential.get("model"):
             cfg["model"] = credential["model"]
         storage.save_config(cfg)
         console.print(f"active credential: {target}")
         return 0
     if cmd == "export":
-        data = {name: credentials[name]} if name else credentials
+        resolved_credentials: dict[str, Any] = {}
+        for cred_name, credential in credentials.items():
+            if not isinstance(credential, dict):
+                continue
+            resolved = dict(credential)
+            if resolved.get("api_key") == "keyring":
+                resolved["api_key"] = storage.load_secret(f"credential:{cred_name}") or ""
+            resolved_credentials[cred_name] = resolved
+        data = {name: resolved_credentials[name]} if name else resolved_credentials
         if name and name not in credentials:
             console.print(f"[red]Unknown credential:[/] {name}")
             return 1
@@ -2241,6 +2268,10 @@ def _run_api(args: argparse.Namespace) -> int:
             path = path.replace(placeholder, value)
             params.pop(key)
     headers = _parse_pairs(getattr(args, "header", None))
+    if not server:
+        state = ServiceManager().running()
+        if state is not None and state.token and "Authorization" not in headers:
+            headers["Authorization"] = f"Bearer {state.token}"
     raw_data = getattr(args, "data", None)
     data: Any = None
     if raw_data:
@@ -2611,6 +2642,8 @@ def build_openapi_spec() -> dict:
         "openapi": "3.1.0",
         "info": {"title": "rbit local API", "version": "1.3.1"},
         "servers": [{"url": "http://127.0.0.1:4096"}],
+        "components": {"securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}}},
+        "security": [{"bearerAuth": []}],
         "paths": {
             "/health": {"get": {"operationId": "health", "summary": "Health probe", "responses": {"200": {"description": "OK"}}}},
             "/v1/models": {
@@ -2754,6 +2787,13 @@ def _run_serve(
     storage = StorageManager(workspace)
     cfg = storage.load_config()
     model_id = str(cfg.get("model", "rbit/smart-local"))
+    server_token = os.environ.get("RBIT_SERVER_TOKEN") or str(cfg.get("server_token") or "")
+    try:
+        from rbit.service import ServiceManager
+
+        pair_token = str(ServiceManager().get_setting("pair_token") or "")
+    except Exception:  # noqa: BLE001 - pairing is optional
+        pair_token = ""
     sessions: dict[str, Session] = {}
     # Interactive tool approvals: with RBIT_APPROVALS=1 the desktop client gets
     # a `tool_approval` event for every non-read-only bash command and answers
@@ -2873,6 +2913,35 @@ def _run_serve(
         def log_message(self, *a) -> None:  # quiet
             return
 
+        def _authorized(self) -> bool:
+            if not server_token:
+                return True
+            if self.path in ("/health", "/openapi.json", "/v1/openapi.json"):
+                return True
+            expected = f"Bearer {server_token}"
+            if self.headers.get("Authorization", "") == expected:
+                return True
+            if self.path.startswith("/v1/"):
+                return False
+            if not pair_token:
+                return False
+            from urllib.parse import parse_qs, urlparse
+
+            query = parse_qs(urlparse(self.path).query)
+            cookie = self.headers.get("Cookie", "")
+            pair_cookie = ""
+            for part in cookie.split(";"):
+                if part.strip().startswith("rbit_pair="):
+                    pair_cookie = part.strip().split("=", 1)[1]
+            return pair_token in (query.get("pair", [""])[0], pair_cookie)
+
+        def _deny(self) -> None:
+            self.send_response(401)
+            self._cors()
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"unauthorized"}')
+
         def _send_json(self, payload: Any, status: int = 200) -> None:
             body = _json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
             self.send_response(status)
@@ -2896,6 +2965,9 @@ def _run_serve(
             self.end_headers()
 
         def do_GET(self) -> None:  # noqa: N802
+            if not self._authorized():
+                self._deny()
+                return
             if self.path == "/health":
                 body = _json.dumps({"status": "ok", "workspace": str(workspace)}).encode()
                 self.send_response(200)
@@ -2999,6 +3071,8 @@ def _run_serve(
                     self.send_response(200)
                     self._cors()
                     self.send_header("Content-Type", "text/html; charset=utf-8")
+                    if pair_token:
+                        self.send_header("Set-Cookie", f"rbit_pair={pair_token}; HttpOnly; SameSite=Lax; Path=/")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
@@ -3108,6 +3182,9 @@ def _run_serve(
                 self.end_headers()
 
         def do_POST(self) -> None:  # noqa: N802
+            if not self._authorized():
+                self._deny()
+                return
             if self.path == "/v1/reload":
                 nonlocal cfg, model_id
                 cfg = storage.load_config()
@@ -3270,6 +3347,9 @@ def _run_serve(
                 self.wfile.flush()
 
         def do_DELETE(self) -> None:  # noqa: N802
+            if not self._authorized():
+                self._deny()
+                return
             if self.path.startswith("/v1/schedules/"):
                 from rbit.scheduler import Scheduler
 
