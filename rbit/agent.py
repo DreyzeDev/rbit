@@ -669,6 +669,9 @@ class AgentEngine:
         )
         self._active_profile_tools = profile.get("allowed_tools")
         self._active_profile_readonly = bool(profile.get("read_only"))
+        custom_agent_tools = cfg_prompt.get("agent_tools")
+        if isinstance(custom_agent_tools, list):
+            self._active_profile_tools = {str(tool) for tool in custom_agent_tools}
         system_text = api_messages[0]["content"]
         if agent_mode == "build" and cfg_prompt.get("plan_first", True):
             system_text += (
@@ -677,6 +680,9 @@ class AgentEngine:
             )
         if profile["prompt"]:
             system_text += f"\n\n{profile['prompt']}"
+        custom_agent_prompt = str(cfg_prompt.get("agent_prompt") or "").strip()
+        if custom_agent_prompt:
+            system_text += f"\n\n{custom_agent_prompt}"
         api_messages[0]["content"] = system_text
 
         units: list[list[dict[str, Any]]] = []

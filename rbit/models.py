@@ -176,6 +176,7 @@ class Session:
     todos: list[TodoItem] = field(default_factory=list)
     modified_files: dict[str, FileChangeStat] = field(default_factory=dict)
     finished: bool = True
+    archived: bool = False
 
     @property
     def total_tokens(self) -> int:
@@ -197,6 +198,7 @@ class Session:
             "todos": [t.to_dict() for t in self.todos],
             "modified_files": {k: v.to_dict() for k, v in self.modified_files.items()},
             "finished": self.finished,
+            "archived": self.archived,
         }
 
     @classmethod
@@ -213,6 +215,7 @@ class Session:
                 for k, v in data.get("modified_files", {}).items()
             },
             finished=data.get("finished", True),
+            archived=bool(data.get("archived", False)),
         )
 
 

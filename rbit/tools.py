@@ -577,6 +577,11 @@ class ToolExecutor:
             return True, "allow"
         if effect == "deny":
             return False, "deny"
+        auto = os.environ.get("RBIT_AUTO_APPROVE") == "1"
+        if self.get_config is not None and self.get_config().get("auto_approve"):
+            auto = True
+        if auto:
+            return True, "auto"
         if self.permission_cb is None:
             return False, "approval-required"
         approved = await self.permission_cb("bash" if action == "shell" else action, resource)

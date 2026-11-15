@@ -92,6 +92,11 @@ def _load_module(name: str, app: Any) -> Any:
         if not path.is_absolute():
             workspace = Path(getattr(app, "workspace", Path.cwd()))
             path = workspace / path
+        if path.is_dir():
+            for candidate in (path / "__init__.py", path / "plugin.py", path / "main.py"):
+                if candidate.exists():
+                    path = candidate
+                    break
         module_name = f"rbit_plugin_{path.stem}_{abs(hash(str(path.resolve()))) % 100000}"
         spec = importlib.util.spec_from_file_location(module_name, path)
         if spec is None or spec.loader is None:

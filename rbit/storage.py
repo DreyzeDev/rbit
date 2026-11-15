@@ -280,7 +280,7 @@ class StorageManager:
     def _decode_session_file(self, raw: str) -> dict[str, Any]:
         return json.loads(self._decrypt(raw))
 
-    def list_sessions(self) -> list[Session]:
+    def list_sessions(self, include_archived: bool = False) -> list[Session]:
         if not self.sessions_dir.exists():
             return []
         sessions: list[Session] = []
@@ -308,11 +308,13 @@ class StorageManager:
                         continue
             finally:
                 conn.close()
+        if not include_archived:
+            sessions = [session for session in sessions if not session.archived]
         return sessions
 
     def find_session(self, id_or_prefix: str) -> Session | None:
         q = id_or_prefix.strip().lower()
-        for s in self.list_sessions():
+        for s in self.list_sessions(include_archived=True):
             if s.id.lower() == q or s.id.lower().startswith(q):
                 return s
         return None

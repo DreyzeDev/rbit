@@ -564,6 +564,17 @@ class MCPManager:
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.configs = _normalize_configs(config)
+        tokens = config.get("mcp_oauth")
+        if isinstance(tokens, dict):
+            for name, token in tokens.items():
+                entry = self.configs.get(str(name))
+                if not isinstance(entry, dict) or not token:
+                    continue
+                entry = dict(entry)
+                headers = dict(entry.get("headers") or {})
+                headers.setdefault("Authorization", f"Bearer {token}")
+                entry["headers"] = headers
+                self.configs[str(name)] = entry
         self.status: dict[str, dict[str, Any]] = {}
         self.tools: dict[str, MCPTool] = {}
         self._tool_owner: dict[str, MCPClient] = {}
