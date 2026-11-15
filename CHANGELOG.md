@@ -8,6 +8,30 @@ All notable changes to rbit are documented here. The format follows
 
 ### Added
 
+- Full MCP client: stdio + streamable HTTP servers from `mcp` (opencode-style) or
+  legacy `mcp_servers`, `<server>_<tool>` namespacing, `/mcp add|remove|reload`,
+  `rbit mcp list|test|add|remove`, live sidebar status.
+- Permissions policy: ordered `permissions` rules (`allow|ask|deny`, last match wins,
+  wildcards), legacy `permission` map, per-agent rules, `external_directory` boundary,
+  interactive "always allow" memory, shell deny-before-execute.
+- Project instructions: hierarchical `AGENTS.md`/`CLAUDE.md`, global rules,
+  `instructions` globs and remote URLs (cached), injected as `<rules>` blocks.
+- Opt-in formatters (`formatter: true|{...}`): ~25 built-ins plus custom commands,
+  environment/extensions overrides, auto-run after write/edit/multi_edit/apply_patch.
+- LSP client: pyright/pylsp, TypeScript, gopls, rust-analyzer, clangd, bash/yaml/json/
+  css/html, zls, terraform-ls, lua, php, ruby, swift and custom servers; diagnostics
+  tool uses LSP when `lsp` is enabled, with built-in syntax fallback.
+- Plugin hooks: local `plugins` modules plus entry points; `tool.execute.before/after`,
+  `chat.params`, and `event` hooks with mutable contexts.
+- Skills: model-callable `skill` tool, `.rbit/skills/*.md` and `*/SKILL.md`, global
+  skills, frontmatter descriptions, `{args}` substitution, prompt listing.
+- Subagents: custom `.rbit/agents/*.md` (frontmatter tools/mode), read-only by default,
+  `mode: build` opt-in, background runs, available-agent listing.
+- `websearch` tool (DuckDuckGo HTML/lite, result parsing, cache, config switch) and
+  URL/line-range attachments (`@file#L12-L34`).
+- `rbit acp`: Agent Client Protocol server over stdio (initialize, session/new,
+  session/prompt streaming chunks, cancel) for Zed-style editors.
+- `rbit serve` now exposes OpenAPI at `/openapi.json`.
 - Second-echelon features: `rbit watch` (file watcher with optional agent reaction),
   macro replay (`/macro`, `.rbit/macros/*.json`), `/mcp` server config manager,
   LSP-server detection in the sidebar/doctor, plugin loading (`rbit.plugins` entry
