@@ -23,6 +23,10 @@ from textual.widgets import Input, OptionList, Static
 
 from . import __version__
 from .agent import AgentEngine
+from .lsp import LSPManager
+from .mcp import MCPManager
+from .plugins import PluginRegistry
+from .skills import load_skills
 from .modals import (
     CheckpointModal,
     CommandPaletteModal,
@@ -524,6 +528,12 @@ class RbitApp(App[None]):
             on_todos_updated=self._on_todos_updated,
             on_files_updated=self._on_files_updated,
         )
+        self.mcp = MCPManager.from_config(self.config_data, self.workspace)
+        self.executor.mcp = self.mcp
+        self.lsp = LSPManager.from_config(self.workspace, self.config_data)
+        self.executor.lsp = self.lsp
+        self.plugins = PluginRegistry()
+        self.executor.plugins = self.plugins
         if allow_outside_paths:
             self.executor.allow_outside_paths = True
         if self.config_data.get("readonly"):
@@ -590,7 +600,7 @@ class RbitApp(App[None]):
             self.BINDINGS = merged
         from .plugins import load_plugins
 
-        self._loaded_plugins = load_plugins(self)
+        self._loaded_plugins = load_plugins(self, self.config_data, self.plugins)
         self.register_theme(RBIT_DARK)
         self.register_theme(RBIT_LIGHT)
         self.register_theme(RBIT_HIGH_CONTRAST)
@@ -617,6 +627,7 @@ class RbitApp(App[None]):
         self._sync_ui()
         self.query_one("#prompt-input", Input).focus()
         self._discover_models()
+        self._connect_mcp()
 
         if self.initial_prompt:
             self.set_timer(0.15, lambda: self._submit_prompt(self.initial_prompt or ""))
@@ -640,12 +651,30 @@ class RbitApp(App[None]):
         )
 
     def on_unmount(self) -> None:
+        try:
+            self.mcp.terminate()
+        except Exception:
+            pass
+        try:
+            self.lsp.terminate()
+        except Exception:
+            pass
         self.storage.release_lock()
         if self._save_timer is None:
             return
         self._save_timer.stop()
         self._save_timer = None
         self._flush_save_session()
+
+    @work
+    async def _connect_mcp(self) -> None:
+        await self.mcp.start()
+        if self.mcp.tool_count:
+            self.notify(
+                f"MCP: {self.mcp.tool_count} tool(s) from {len(self.mcp.clients)} server(s).",
+                timeout=2.5,
+            )
+        self._sync_ui()
 
     @work
     async def _discover_models(self, force: bool = False) -> None:
@@ -798,6 +827,8 @@ class RbitApp(App[None]):
             checkpoints_count=cp_count,
             extra_models=self.engine.extra_models,
             ollama_online=self.engine.ollama_online,
+            mcp_status=self.mcp.status,
+            mcp_configs=self.mcp.configs,
         )
         self.query_one(BottomStatusBar).update_bar(self.workspace, self.git_branch)
 
@@ -816,7 +847,10 @@ class RbitApp(App[None]):
             PermissionModal(tool_name, detail, command=detail if tool_name == "bash" else "")
         )
         if choice == "always":
-            self.executor.always_allow_bash = True
+            if tool_name in ("bash", "shell"):
+                self.executor.always_allow_bash = True
+            else:
+                self.executor.remember_permission(tool_name, detail)
             return True
         if choice == "prefix":
             prefix = " ".join(detail.split()[:2])
@@ -1391,25 +1425,8 @@ class RbitApp(App[None]):
         return self.workspace / ".rbit" / "skills"
 
     def _load_skills(self) -> dict[str, dict[str, str]]:
-        """name → meta (description/mode/attach) + body, from .rbit/skills/*.md."""
-        skills: dict[str, dict[str, str]] = {}
-        d = self._skills_dir()
-        if not d.exists():
-            return skills
-        for f in sorted(d.glob("*.md")):
-            text = f.read_text(encoding="utf-8", errors="replace")
-            meta = {"description": "", "mode": "", "attach": "", "body": text}
-            if text.startswith("---"):
-                end = text.find("---", 3)
-                if end != -1:
-                    header = text[3:end]
-                    meta["body"] = text[end + 3:].strip()
-                    for line in header.splitlines():
-                        if ":" in line:
-                            k, v = line.split(":", 1)
-                            meta[k.strip().lower()] = v.strip()
-            skills[f.stem] = meta
-        return skills
+        """name → meta (description/mode/attach) + body, from project and global skills."""
+        return load_skills(self.workspace)
 
     def _cmd_skill(self, arg: str) -> None:
         skills = self._load_skills()
@@ -1458,36 +1475,85 @@ class RbitApp(App[None]):
         self._update_layout_mode()
 
     def _cmd_mcp(self, arg: str) -> None:
-        """Manages configured MCP server entries in config (launching is a future step)."""
-        servers = self.config_data.get("mcp_servers")
-        if not isinstance(servers, dict):
-            servers = {}
-        parts = arg.split(maxsplit=2)
-        if parts and parts[0] in ("add", "remove") :
+        """Lists and manages MCP servers; connections are reloaded in the background."""
+        parts = arg.split()
+        op = parts[0].lower() if parts else ""
+        configs = self.config_data.get("mcp")
+        if not isinstance(configs, dict):
+            configs = {}
+        legacy = self.config_data.get("mcp_servers")
+        if not isinstance(legacy, dict):
+            legacy = {}
+
+        if op in ("add", "remove"):
             name = parts[1].strip() if len(parts) > 1 else ""
             if not name:
-                self.notify("Usage: /mcp add <name> <command…> | /mcp remove <name>", severity="warning")
+                self.notify("Usage: /mcp add <name> <command…> | /mcp add <name> --url <url> | /mcp remove <name>", severity="warning")
                 return
-            if parts[0] == "remove":
-                servers.pop(name, None)
+            if op == "remove":
+                configs.pop(name, None)
+                legacy.pop(name, None)
+                self.config_data["mcp"] = configs
+                self.config_data["mcp_servers"] = legacy
+                self.storage.save_config(self.config_data)
                 self.notify(f"MCP server removed: {name}", timeout=2.0)
+                self._reload_mcp()
+                return
+            rest = parts[2:]
+            if rest and rest[0] in ("--url", "-u"):
+                url = rest[1] if len(rest) > 1 else ""
+                if not url:
+                    self.notify("Usage: /mcp add <name> --url <https://…>", severity="warning")
+                    return
+                configs[name] = {"type": "remote", "url": url}
+            elif rest and rest[0] in ("--header", "-H") and len(rest) > 1:
+                configs[name] = {"type": "remote", "url": rest[1], "headers": {}}
             else:
-                servers[name] = {"command": parts[2] if len(parts) > 2 else ""}
-                self.notify(f"MCP server added: {name} (config saved)", timeout=2.0)
-            self.config_data["mcp_servers"] = servers
+                command = " ".join(rest).strip()
+                if not command:
+                    self.notify("Usage: /mcp add <name> <command…>", severity="warning")
+                    return
+                configs[name] = {"type": "local", "command": command}
+            self.config_data["mcp"] = configs
             self.storage.save_config(self.config_data)
-            self._cmd_mcp("")
+            self.notify(f"MCP server added: {name} (connecting…)", timeout=2.0)
+            self._reload_mcp()
             return
+
+        if op in ("reload", "restart"):
+            self.notify("Reconnecting MCP servers…", timeout=1.5)
+            self._reload_mcp()
+            return
+
         lines = ["[bold #eeeeee]MCP servers[/]", ""]
-        if servers:
-            for name, entry in servers.items():
-                cmd_text = entry.get("command", "") if isinstance(entry, dict) else str(entry)
-                lines.append(f"  • [bold]{name}[/] — {cmd_text}")
-        else:
+        if not configs and not legacy:
             lines.append("  (none configured — /mcp add <name> <command>)")
+        for name in list(configs) + [n for n in legacy if n not in configs]:
+            status = self.mcp.status.get(name) or {}
+            if status.get("connected"):
+                count = int(status.get("tools") or 0)
+                lines.append(f"  [bold #7fd88f]●[/] [bold]{name}[/] — {count} tool(s), {status.get('transport', 'stdio')}")
+            else:
+                error = status.get("error") or "not connected"
+                lines.append(f"  [bold #e06c75]●[/] [bold]{name}[/] — {error}")
+        if self.mcp.tools:
+            lines.append("")
+            lines.append("[bold #eeeeee]Tools[/]")
+            for exposed, tool in self.mcp.tools.items():
+                lines.append(f"  • [bold]{exposed}[/] — {tool.description[:80]}")
         lines.append("")
-        lines.append("[#808080]Запуск серверов пока не подключён — конфигурация сохраняется для будущих версий.[/]")
+        lines.append("[#808080]/mcp add <name> <command…> · /mcp add <name> --url <url> · /mcp reload[/]")
         self._post_notice("\n".join(lines))
+
+    @work(exclusive=True)
+    async def _reload_mcp(self) -> None:
+        await self.mcp.close()
+        self.mcp = MCPManager.from_config(self.config_data, self.workspace)
+        self.executor.mcp = self.mcp
+        await self.mcp.start()
+        if self.mcp.tool_count:
+            self.notify(f"MCP ready: {self.mcp.tool_count} tool(s).", timeout=2.0)
+        self._sync_ui()
 
     def action_history_search(self) -> None:
         self.push_screen(PromptHistoryModal(self.prompt_history), self._on_history_picked)
@@ -1707,10 +1773,10 @@ class RbitApp(App[None]):
             return None
         problems: list[str] = []
         for rel in mutated:
-            res = self.executor._tool_diagnostics({"filePath": rel})
-        m = re.search(r"(\d+) issues", (res.summary or "").lower())
-        if m and int(m.group(1)) > 0:
-            problems.append(f"`{rel}` — {res.output[:400]}")
+            res = await self.executor._tool_diagnostics({"filePath": rel})
+            m = re.search(r"(\d+) issues", (res.summary or "").lower())
+            if m and int(m.group(1)) > 0:
+                problems.append(f"`{rel}` — {res.output[:400]}")
         if not problems and self.config_data.get("test_gate", True):
             code_exts = (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java")
             if any(rel.endswith(code_exts) for rel in mutated):
@@ -2300,8 +2366,9 @@ class RbitApp(App[None]):
             if rel in VIRTUAL_ATTACHMENTS:
                 valid_attachments.append(rel)
                 continue
+            target = re.sub(r"#L\d+(?:-L?\d+)?$", "", rel, flags=re.IGNORECASE) or rel
             try:
-                if self.executor.resolve_path(rel).exists():
+                if self.executor.resolve_path(target).exists():
                     valid_attachments.append(rel)
             except ValueError:
                 continue

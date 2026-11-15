@@ -16,8 +16,10 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import parse_qs, unquote, urlparse
 
 try:
     import tomllib
@@ -26,7 +28,9 @@ except ImportError:  # pragma: no cover - Python < 3.11
 
 import httpx
 
+from .formatters import format_file, formatter_enabled
 from .models import CheckpointMeta, FileChangeStat, FileSnapshot, Session, TodoItem, short_id
+from .skills import load_skills, skill_tool_schema
 from .storage import StorageManager
 
 IGNORED_DIRS = {
@@ -69,12 +73,64 @@ READONLY_BASH_PREFIXES = (
 )
 
 READONLY_TOOLS: frozenset[str] = frozenset(
-    {"read", "glob", "grep", "webfetch", "diagnostics", "lint", "symbols", "git", "list_changes"}
+    {"read", "glob", "grep", "webfetch", "websearch", "diagnostics", "lint", "symbols", "git", "list_changes", "skill"}
 )
 
 MUTATING_TOOLS: frozenset[str] = frozenset({"write", "edit", "multi_edit", "apply_patch"})
 
 _STATEMENT_SPLIT = re.compile(r"(?:;|\|\||&&|\||\r?\n)")
+
+
+class _SearchResultsParser(HTMLParser):
+    """Collects DuckDuckGo HTML result anchors and snippets."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: list[dict[str, str]] = []
+        self._in_title = False
+        self._in_snippet = False
+        self._current: dict[str, str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = {key: value or "" for key, value in attrs}
+        classes = attributes.get("class", "").split()
+        if tag == "a" and ("result__a" in classes or "result-link" in classes):
+            self._current = {"title": "", "url": attributes.get("href", ""), "snippet": ""}
+            self.results.append(self._current)
+            self._in_title = True
+        elif tag == "a" and self._current is not None and not self._current.get("url"):
+            self._current["url"] = attributes.get("href", "")
+        elif "result__snippet" in classes or "result-snippet" in classes:
+            self._in_snippet = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a":
+            self._in_title = False
+        if tag in ("td", "div", "span") and self._in_snippet:
+            self._in_snippet = False
+
+    def handle_data(self, data: str) -> None:
+        if self._current is None:
+            return
+        text = data.strip()
+        if not text:
+            return
+        if self._in_title:
+            self._current["title"] = (self._current["title"] + " " + text).strip()
+        elif self._in_snippet:
+            self._current["snippet"] = (self._current["snippet"] + " " + text).strip()
+
+
+def _clean_search_url(url: str) -> str:
+    if url.startswith("//"):
+        url = "https:" + url
+    parsed = urlparse(url)
+    if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l/"):
+        target = parse_qs(parsed.query).get("uddg")
+        if target:
+            return unquote(target[0])
+    return url
+
 
 def is_readonly_bash_command(command: str) -> bool:
     """A command is read-only only if EVERY statement starts with a whitelisted
@@ -319,6 +375,41 @@ class ToolResult:
 
 PermissionCallback = Callable[[str, str], Awaitable[bool]]
 
+PERMISSION_PATH_TOOLS: dict[str, str] = {
+    "read": "read",
+    "write": "edit",
+    "edit": "edit",
+    "multi_edit": "edit",
+    "apply_patch": "edit",
+    "notebook": "edit",
+    "symbols": "read",
+    "diagnostics": "read",
+    "lint": "read",
+}
+
+
+def _expand_home(value: str) -> str:
+    if value == "~" or value.startswith("~/"):
+        return str(Path.home()) + value[1:]
+    if value == "$HOME" or value.startswith("$HOME/"):
+        return str(Path.home()) + value[5:]
+    return value
+
+
+def permission_pattern_matches(pattern: str, value: str, *, action: str = "") -> bool:
+    """Whole-value wildcard matching (`*`, `?`) with opencode's shell suffix rule."""
+    pattern = _expand_home(str(pattern)).replace("\\", "/")
+    value = str(value).replace("\\", "/")
+    if action == "shell" and pattern.endswith(" *") and not value.rstrip().endswith(" "):
+        bare = pattern[:-2]
+        if value.strip() == bare:
+            return True
+    lower = action in ("read", "edit", "glob", "external_directory") or (action == "shell" and os.name == "nt")
+    if lower:
+        pattern = pattern.lower()
+        value = value.lower()
+    return fnmatch.fnmatchcase(value, pattern)
+
 
 class PathOutsideWorkspace(ValueError):
     """Raised when a tool path resolves outside the workspace and is not allowed."""
@@ -338,6 +429,10 @@ class ToolExecutor:
         on_todos_updated: Callable[[list[TodoItem]], None] | None = None,
         on_files_updated: Callable[[], None] | None = None,
         get_config: Callable[[], dict[str, Any]] | None = None,
+        mcp: Any = None,
+        lsp: Any = None,
+        plugins: Any = None,
+        http_client: Any = None,
     ) -> None:
         self.workspace = workspace.resolve()
         self.session = session
@@ -346,16 +441,22 @@ class ToolExecutor:
         self.on_todos_updated = on_todos_updated
         self.on_files_updated = on_files_updated
         self.get_config = get_config
+        self.mcp = mcp
+        self.lsp = lsp
+        self.plugins = plugins
+        self.http_client = http_client
         self.undo_stack: list[FileSnapshot] = []
         self.redo_stack: list[FileSnapshot] = []
         self.always_allow_bash: bool = False
         self.allowed_bash_prefixes: list[str] = []
+        self.saved_permissions: list[dict[str, str]] = []
         self.allow_secret_reads: bool = False
         self.allow_outside_paths: bool = False
         self._auto_checkpoint_done: bool = False
         self._gitignore: GitIgnoreMatcher | None = None
         self._background_procs: list[asyncio.subprocess.Process] = []
         self._webfetch_cache: dict[str, tuple[float, str]] = {}
+        self._websearch_cache: dict[str, tuple[float, str]] = {}
         self._file_cache: tuple[float, list[str]] | None = None
         self.session_readonly: bool = False
         self.extra_roots: list[Path] = []
@@ -391,16 +492,14 @@ class ToolExecutor:
         p = Path(raw_path)
         if not p.is_absolute():
             p = self.workspace / p
-        else:
-            # Monorepo support: absolute paths inside a configured extra root are allowed.
-            resolved = p.resolve()
-            for root in self.extra_roots:
-                try:
-                    resolved.relative_to(root)
-                    return resolved
-                except ValueError:
-                    continue
         p = p.resolve()
+        # Monorepo / approved external-directory support.
+        for root in self.extra_roots:
+            try:
+                p.relative_to(root)
+                return p
+            except ValueError:
+                continue
         try:
             p.relative_to(self.workspace)
         except ValueError:
@@ -415,6 +514,183 @@ class ToolExecutor:
             return bool(self.get_config().get("allow_outside_paths", False))
         return False
 
+    # --- Permissions (opencode-compatible ordered rules) ---
+    def permission_rule_chain(self, agent_mode: str = "build") -> list[dict[str, str]]:
+        """Global rules first, agent rules last (later matches win)."""
+        cfg = self.get_config() if self.get_config is not None else {}
+        rules: list[dict[str, str]] = []
+        legacy = cfg.get("permission")
+        if isinstance(legacy, dict):
+            for action, mapping in legacy.items():
+                if isinstance(mapping, dict):
+                    for resource, effect in mapping.items():
+                        if isinstance(effect, str):
+                            rules.append({"action": str(action), "resource": str(resource), "effect": effect})
+                elif isinstance(mapping, str):
+                    rules.append({"action": str(action), "resource": "*", "effect": mapping})
+        configured = cfg.get("permissions")
+        if isinstance(configured, list):
+            for entry in configured:
+                if not isinstance(entry, dict):
+                    continue
+                action = entry.get("action")
+                resource = entry.get("resource")
+                effect = entry.get("effect")
+                if isinstance(action, str) and isinstance(resource, str) and effect in ("allow", "deny", "ask"):
+                    rules.append({"action": action, "resource": resource, "effect": effect})
+        agents = cfg.get("agents")
+        if isinstance(agents, dict):
+            agent_cfg = agents.get(agent_mode)
+            if isinstance(agent_cfg, dict) and isinstance(agent_cfg.get("permissions"), list):
+                for entry in agent_cfg["permissions"]:
+                    if not isinstance(entry, dict):
+                        continue
+                    action = entry.get("action")
+                    resource = entry.get("resource")
+                    effect = entry.get("effect")
+                    if isinstance(action, str) and isinstance(resource, str) and effect in ("allow", "deny", "ask"):
+                        rules.append({"action": action, "resource": resource, "effect": effect})
+        rules.extend(self.saved_permissions)
+        return rules
+
+    def remember_permission(self, action: str, resource: str, effect: str = "allow") -> None:
+        """Stores an in-session approval (the TUI 'always allow' choice)."""
+        entry = {"action": action, "resource": resource, "effect": effect}
+        if entry not in self.saved_permissions:
+            self.saved_permissions.append(entry)
+
+    def resolve_permission_effect(self, action: str, resource: str, agent_mode: str = "build") -> str | None:
+        """Returns the last matching effect, or None when no rule covers the request."""
+        matched: str | None = None
+        for rule in self.permission_rule_chain(agent_mode):
+            if not permission_pattern_matches(rule["action"], action):
+                continue
+            if permission_pattern_matches(rule["resource"], resource, action=action):
+                matched = rule["effect"]
+        return matched
+
+    async def _authorize(self, action: str, resource: str, agent_mode: str) -> tuple[bool, str]:
+        effect = self.resolve_permission_effect(action, resource, agent_mode)
+        if effect is None:
+            return True, "no-rule"
+        if effect == "allow":
+            return True, "allow"
+        if effect == "deny":
+            return False, "deny"
+        if self.permission_cb is None:
+            return False, "approval-required"
+        approved = await self.permission_cb("bash" if action == "shell" else action, resource)
+        return bool(approved), "ask"
+
+    def _permission_requests(self, name: str, args: dict[str, Any]) -> list[tuple[str, str]]:
+        """Maps a tool call to opencode-style (action, resource) pairs."""
+        requests: list[tuple[str, str]] = []
+        path_action = PERMISSION_PATH_TOOLS.get(name)
+        if path_action:
+            raw = args.get("filePath") or args.get("path")
+            if isinstance(raw, str) and raw.strip():
+                requests.append((path_action, raw.strip()))
+            if name == "apply_patch":
+                for line in str(args.get("patch") or "").splitlines():
+                    if line.startswith("+++ "):
+                        candidate = line[4:].strip().split("\t", 1)[0]
+                        candidate = candidate.removeprefix("b/")
+                        if candidate and candidate != "/dev/null":
+                            requests.append((path_action, candidate))
+        elif name in ("glob", "grep"):
+            pattern = str(args.get("pattern") or "").strip()
+            if pattern:
+                requests.append((name, pattern))
+        elif name == "webfetch":
+            url = str(args.get("url") or "").strip()
+            if url:
+                requests.append(("webfetch", url))
+        elif name == "subagent":
+            agent = str(args.get("agent") or "explore").strip() or "explore"
+            requests.append(("subagent", agent))
+            requests.append(("task", agent))
+        elif name == "bash":
+            command = str(args.get("command") or "").strip()
+            if command:
+                requests.append(("shell", command))
+        elif self.mcp is not None and name in getattr(self.mcp, "tool_names", set()):
+            requests.append((name, "*"))
+        return requests
+
+    def _permission_resource_path(self, raw: str) -> tuple[str, Path | None]:
+        """Returns the rule resource (relative inside, absolute outside) and the target path."""
+        candidate = Path(_expand_home(raw))
+        if not candidate.is_absolute():
+            candidate = self.workspace / candidate
+        try:
+            target = candidate.resolve()
+        except OSError:
+            target = candidate
+        try:
+            relative = target.relative_to(self.workspace)
+            return relative.as_posix(), target
+        except ValueError:
+            return target.as_posix(), target
+
+    async def _preflight_permissions(
+        self, name: str, args: dict[str, Any], agent_mode: str
+    ) -> ToolResult | None:
+        requests = self._permission_requests(name, args)
+        if not requests:
+            return None
+        for action, raw_resource in requests:
+            external = False
+            resource = raw_resource
+            target: Path | None = None
+            if action in ("read", "edit"):
+                resource, target = self._permission_resource_path(raw_resource)
+                if target is not None:
+                    try:
+                        target.relative_to(self.workspace)
+                    except ValueError:
+                        in_extra = False
+                        for root in self.extra_roots:
+                            try:
+                                target.relative_to(root)
+                                in_extra = True
+                                break
+                            except ValueError:
+                                continue
+                        external = not in_extra
+            if external and target is not None:
+                boundary = f"{target.parent.as_posix()}/*"
+                allowed, reason = await self._authorize("external_directory", boundary, agent_mode)
+                if reason == "no-rule":
+                    boundary = target.parent.as_posix()
+                    allowed, reason = await self._authorize("external_directory", boundary, agent_mode)
+                if reason == "no-rule":
+                    allowed, reason = await self._authorize("external_directory", "*", agent_mode)
+                if reason != "no-rule" and not allowed:
+                    return ToolResult(
+                        False,
+                        f"blocked: external path ({target.name})",
+                        f"`{target}` is outside the workspace and `external_directory` is set to "
+                        f"`{reason}`. Adjust `permissions` or enable `allow_outside_paths`.",
+                    )
+                if reason != "no-rule" and allowed and target.parent not in self.extra_roots:
+                    self.extra_roots.append(target.parent)
+            allowed, reason = await self._authorize(action, resource, agent_mode)
+            if not allowed:
+                detail = (
+                    "denied by a permission rule"
+                    if reason == "deny"
+                    else "requires approval, but no interactive client is attached"
+                    if reason == "approval-required"
+                    else "rejected by the user"
+                )
+                return ToolResult(
+                    False,
+                    f"blocked: {action} {resource[:40]}",
+                    f"Permission denied: `{action}` on `{resource}` — {detail}. "
+                    "Update the `permissions` array in .rbit/config.json to allow it.",
+                )
+        return None
+
     def rel_display(self, path: Path) -> str:
         try:
             return str(path.relative_to(self.workspace))
@@ -423,6 +699,15 @@ class ToolExecutor:
 
     def invalidate_file_cache(self) -> None:
         self._file_cache = None
+
+    def mcp_tool_schemas(self) -> list[dict[str, Any]]:
+        """OpenAI-style schemas for every tool exposed by connected MCP servers."""
+        if self.mcp is None:
+            return []
+        try:
+            return list(self.mcp.schemas())
+        except Exception:
+            return []
 
     def list_workspace_files(self, limit: int = 250) -> list[str]:
         now = time.monotonic()
@@ -696,7 +981,10 @@ class ToolExecutor:
         agent_mode: str = "build",
     ) -> ToolResult:
         t0 = time.perf_counter()
-        if self.session_readonly and (name in ("write", "edit", "multi_edit", "apply_patch", "notebook") or name == "bash"):
+        is_mcp = self.mcp is not None and name in getattr(self.mcp, "tool_names", set())
+        if self.session_readonly and (
+            is_mcp or name in ("write", "edit", "multi_edit", "apply_patch", "notebook") or name == "bash"
+        ):
             return ToolResult(
                 ok=False,
                 summary=f"{name} blocked: read-only session",
@@ -710,6 +998,27 @@ class ToolExecutor:
                 output="Plan mode is read-only. Press Tab to switch to Build mode to modify files.",
                 duration_ms=int((time.perf_counter() - t0) * 1000),
             )
+
+        if self.plugins is not None:
+            hook_ctx = await self.plugins.trigger(
+                "tool.execute.before",
+                {"tool": name, "args": args, "agent_mode": agent_mode},
+            )
+            if hook_ctx.get("deny"):
+                reason = str(hook_ctx.get("reason") or "blocked by plugin")
+                return ToolResult(
+                    ok=False,
+                    summary=f"{name} blocked by plugin",
+                    output=reason,
+                    duration_ms=int((time.perf_counter() - t0) * 1000),
+                )
+            if isinstance(hook_ctx.get("args"), dict):
+                args = hook_ctx["args"]
+
+        permission_block = await self._preflight_permissions(name, args, agent_mode)
+        if permission_block is not None:
+            permission_block.duration_ms = int((time.perf_counter() - t0) * 1000)
+            return permission_block
 
         try:
             if name in ("write", "edit", "multi_edit", "apply_patch"):
@@ -734,7 +1043,9 @@ class ToolExecutor:
             elif name == "git":
                 res = await self._tool_git(args)
             elif name == "diagnostics":
-                res = await asyncio.to_thread(self._tool_diagnostics, args)
+                res = await self._tool_diagnostics(args)
+            elif name == "skill":
+                res = await asyncio.to_thread(self._tool_skill, args)
             elif name == "lint":
                 res = await self._tool_lint(args)
             elif name == "notebook":
@@ -745,8 +1056,13 @@ class ToolExecutor:
                 res = self._tool_todowrite(args)
             elif name == "webfetch":
                 res = await self._tool_webfetch(args)
+            elif name == "websearch":
+                res = await self._tool_websearch(args)
             elif name == "bash":
                 res = await self._tool_bash(args, agent_mode=agent_mode)
+            elif is_mcp:
+                mcp_result = await self.mcp.call(name, args)
+                res = ToolResult(mcp_result.ok, mcp_result.summary, mcp_result.output)
             else:
                 res = ToolResult(False, f"Unknown tool: {name}", f"Unknown tool: {name}")
         except PathOutsideWorkspace as exc:
@@ -762,8 +1078,63 @@ class ToolExecutor:
         res.output = redact_secrets(res.output)
         if res.diff:
             res.diff = redact_secrets(res.diff)
+        if res.ok and name in ("write", "edit", "multi_edit", "apply_patch"):
+            formatted = await asyncio.to_thread(self._format_mutated_files, name, args)
+            if formatted:
+                res.output = f"{res.output}\n\n{formatted}".strip()
+        if self.plugins is not None:
+            hook_ctx = await self.plugins.trigger(
+                "tool.execute.after",
+                {"tool": name, "args": args, "result": res, "agent_mode": agent_mode},
+            )
+            if isinstance(hook_ctx.get("result"), ToolResult):
+                res = hook_ctx["result"]
+            await self.plugins.trigger(
+                "event",
+                {"type": "tool.result", "tool": name, "ok": res.ok, "agent_mode": agent_mode},
+            )
         res.duration_ms = int((time.perf_counter() - t0) * 1000)
         return res
+
+    def _mutation_paths(self, name: str, args: dict[str, Any]) -> list[Path]:
+        if name == "apply_patch":
+            paths: list[Path] = []
+            for line in str(args.get("patch") or "").splitlines():
+                if not line.startswith("+++ "):
+                    continue
+                candidate = line[4:].strip().split("\t", 1)[0].removeprefix("b/")
+                if candidate and candidate != "/dev/null":
+                    try:
+                        paths.append(self.resolve_path(candidate))
+                    except PathOutsideWorkspace:
+                        continue
+            return paths
+        raw = args.get("filePath") or args.get("path")
+        if not raw:
+            return []
+        try:
+            return [self.resolve_path(str(raw))]
+        except PathOutsideWorkspace:
+            return []
+
+    def _format_mutated_files(self, name: str, args: dict[str, Any]) -> str:
+        config = self.get_config() if self.get_config is not None else None
+        if not formatter_enabled(config):
+            return ""
+        notes: list[str] = []
+        for path in self._mutation_paths(name, args):
+            if not path.is_file():
+                continue
+            result = format_file(path, config, self.workspace)
+            if not result.ran:
+                continue
+            rel = self.rel_display(path)
+            if result.ok:
+                state = "formatted" if result.changed else "already formatted"
+                notes.append(f"{result.name}: {rel} ({state})")
+            else:
+                notes.append(f"{result.name}: {rel} failed (tool output kept unchanged)")
+        return "\n".join(notes)
 
     def _tool_read(self, args: dict[str, Any]) -> ToolResult:
         raw = args.get("filePath") or args.get("path") or "."
@@ -1459,11 +1830,11 @@ class ToolExecutor:
                 (text or "No lint issues.")[:6000],
             )
 
-        diag = self._tool_diagnostics(args)
+        diag = await self._tool_diagnostics(args)
         note = "ruff/pyflakes not installed â€” ran built-in syntax diagnostics only (pip install ruff)."
         return ToolResult(diag.ok, f"fallback: {diag.summary}", f"{diag.output}\n\n{note}")
 
-    def _tool_diagnostics(self, args: dict[str, Any]) -> ToolResult:
+    async def _tool_diagnostics(self, args: dict[str, Any]) -> ToolResult:
         raw = str(args.get("filePath") or args.get("path") or ".").strip()
         target = self.resolve_path(raw)
         if not target.exists():
@@ -1476,6 +1847,41 @@ class ToolExecutor:
         else:
             targets = [self.workspace / rel for rel in self.list_workspace_files(limit=300)]
 
+        if self.lsp is not None and getattr(self.lsp, "configured_count", 0):
+            supported = [path for path in targets if self.lsp.definition_for(path) is not None]
+            if supported:
+                results = await self.lsp.diagnostics_for_many(supported)
+                issues = [
+                    f"{self.rel_display(diag.path)}:{diag.line}:{diag.column} {diag.severity}: {diag.message}"
+                    + (f" ({diag.source})" if diag.source else "")
+                    for diags in results.values()
+                    for diag in diags
+                ]
+                checked = len(supported)
+                if not issues:
+                    return ToolResult(
+                        True,
+                        f"0 issues ({checked} checked via LSP)",
+                        f"No LSP diagnostics in {checked} file(s).",
+                    )
+                return ToolResult(
+                    True,
+                    f"{len(issues)} issues ({checked} checked via LSP)",
+                    "\n".join(f"- {item}" for item in issues),
+                )
+
+        return self.builtin_diagnostics(args, targets)
+
+    def builtin_diagnostics(self, args: dict[str, Any], targets: list[Path] | None = None) -> ToolResult:
+        raw = str(args.get("filePath") or args.get("path") or ".").strip()
+        target = self.resolve_path(raw)
+        if not target.exists():
+            rel = self.rel_display(target)
+            return ToolResult(False, f"{rel} not found", f"Path not found: {rel}")
+        if targets is None:
+            targets = [target] if target.is_file() else [
+                self.workspace / rel for rel in self.list_workspace_files(limit=300)
+            ]
         all_issues: list[str] = []
         checked = 0
         for fpath in targets:
@@ -1496,6 +1902,38 @@ class ToolExecutor:
             f"{len(all_issues)} issues ({checked} checked)",
             "\n".join(f"- {item}" for item in all_issues),
         )
+
+    def _tool_skill(self, args: dict[str, Any]) -> ToolResult:
+        skills = load_skills(self.workspace)
+        if not skills:
+            return ToolResult(
+                False,
+                "no skills installed",
+                "No skills found. Add `.rbit/skills/<name>.md` or `~/.config/rbit/skills/<name>/SKILL.md`.",
+            )
+        name = str(args.get("name") or "").strip()
+        if not name:
+            return ToolResult(
+                False,
+                "missing skill name",
+                "Pass `name`. Available: " + ", ".join(sorted(skills)),
+            )
+        skill = skills.get(name)
+        if skill is None:
+            return ToolResult(
+                False,
+                f"unknown skill: {name}",
+                "Available skills: " + ", ".join(sorted(skills)),
+            )
+        body = str(skill.get("body") or "")
+        extra = str(args.get("args") or "")
+        body = body.replace("{args}", extra).replace("$ARGUMENTS", extra)
+        description = skill.get("description") or ""
+        header = f"Skill: {name}" + (f" — {description}" if description else "")
+        return ToolResult(True, f"skill {name} loaded", f"{header}\n\n{body}")
+
+    def skill_tool_schema(self) -> dict[str, Any] | None:
+        return skill_tool_schema(load_skills(self.workspace))
 
     def _tool_notebook(self, args: dict[str, Any]) -> ToolResult:
         """Cell-level access to .ipynb files: read / set_cell / insert_cell / delete_cell."""
@@ -1643,8 +2081,11 @@ class ToolExecutor:
         cached = self._webfetch_cache.get(url)
         if cached and time.time() - cached[0] < 600:
             return ToolResult(True, f"cached · Markdown {len(cached[1])} chars", cached[1])
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": "rbit-cli/1.2"})
+        if self.http_client is not None:
+            resp = await self.http_client.get(url, headers={"User-Agent": "rbit-cli/1.2"}, follow_redirects=True)
+        else:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers={"User-Agent": "rbit-cli/1.2"})
         raw = resp.text
         cleaned = html_to_markdown(raw) if "<" in raw else raw.strip()
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
@@ -1655,6 +2096,71 @@ class ToolExecutor:
             resp.status_code < 400,
             f"HTTP {resp.status_code} · Markdown {len(cleaned)} chars",
             cleaned,
+        )
+
+    async def _tool_websearch(self, args: dict[str, Any]) -> ToolResult:
+        config = self.get_config() if self.get_config is not None else {}
+        if config.get("websearch") is False:
+            return ToolResult(False, "websearch disabled", "Enable `websearch` in `.rbit/config.json`.")
+        query = str(args.get("query") or args.get("q") or "").strip()
+        if not query:
+            return ToolResult(False, "empty query", "`query` is required.")
+        try:
+            limit = int(args.get("num_results") or 6)
+        except (TypeError, ValueError):
+            limit = 6
+        limit = max(1, min(10, limit))
+        cache_key = f"{query.lower()}::{limit}"
+        cached = self._websearch_cache.get(cache_key)
+        if cached and time.time() - cached[0] < 300:
+            return ToolResult(True, f"cached websearch: {limit} result(s)", cached[1])
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+            )
+        }
+        attempts = [
+            ("https://html.duckduckgo.com/html/", {"q": query}),
+            ("https://lite.duckduckgo.com/lite/", {"q": query}),
+        ]
+        errors: list[str] = []
+        for url, params in attempts:
+            try:
+                if self.http_client is not None:
+                    resp = await self.http_client.get(url, params=params, headers=headers, follow_redirects=True)
+                else:
+                    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                        resp = await client.get(url, params=params, headers=headers)
+            except httpx.HTTPError as exc:
+                errors.append(f"{url}: {exc}")
+                continue
+            if resp.status_code >= 400:
+                errors.append(f"{url}: HTTP {resp.status_code}")
+                continue
+            parser = _SearchResultsParser()
+            parser.feed(resp.text)
+            results: list[str] = []
+            seen: set[str] = set()
+            for item in parser.results:
+                target = _clean_search_url(item.get("url", ""))
+                if not target.startswith(("http://", "https://")) or target in seen:
+                    continue
+                seen.add(target)
+                title = item.get("title") or target
+                snippet = item.get("snippet") or ""
+                results.append(f"{len(results) + 1}. {title}\n   {target}\n   {snippet}".rstrip())
+                if len(results) >= limit:
+                    break
+            if results:
+                text = "\n\n".join(results)
+                self._websearch_cache[cache_key] = (time.time(), text)
+                return ToolResult(True, f"{len(results)} result(s) for: {query}", text)
+            errors.append(f"{url}: no results parsed")
+        return ToolResult(
+            False,
+            f"websearch failed for: {query}",
+            "No results. " + ("; ".join(errors[-2:]) if errors else "Try a different query."),
         )
 
     def _sandbox_violation(self, command: str) -> str | None:
@@ -1714,7 +2220,8 @@ class ToolExecutor:
             )
 
         if (
-            not is_readonly
+            self.resolve_permission_effect("shell", command, agent_mode) is None
+            and not is_readonly
             and not self.always_allow_bash
             and not self._prefix_allowed(command)
             and self.permission_cb is not None
@@ -2043,15 +2550,33 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "subagent",
-            "description": "Delegate read-only codebase exploration to a fresh-context explore subagent and get back a compact summary with file:line references.",
+            "description": (
+                "Delegate a goal to a fresh-context subagent and get back a compact summary. "
+                "Built-in agents: explore (read-only). Custom agents come from `.rbit/agents/*.md`."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "goal": {"type": "string"},
-                    "agent": {"type": "string", "enum": ["explore"]},
+                    "agent": {"type": "string", "description": "Subagent name (default: explore)."},
                     "background": {"type": "boolean", "description": "Run without blocking the current turn."}
                 },
                 "required": ["goal"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "websearch",
+            "description": "Search the web (DuckDuckGo) and return titles, URLs, and snippets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "num_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                },
+                "required": ["query"],
             },
         },
     },

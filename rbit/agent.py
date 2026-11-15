@@ -22,7 +22,10 @@ from .models import (
     get_model_info,
     short_id,
 )
+from .rules import load_rules
+from .skills import load_skills, skills_prompt
 from .storage import StorageManager
+from .subagents import READONLY_TOOL_NAMES, SubagentDef, load_subagents, subagent_names
 from .tools import (
     OPENAI_TOOLS_SCHEMA,
     READONLY_TOOLS,
@@ -101,7 +104,7 @@ PROMPT_PROFILES: dict[str, dict[str, Any]] = {
             "with file:line references and priorities; never modify anything."
         ),
         "read_only": True,
-        "allowed_tools": set(READONLY_TOOLS) | {"todowrite"},
+        "allowed_tools": set(READONLY_TOOLS) | {"todowrite", "skill"},
     },
     "docs": {
         "prompt": (
@@ -109,8 +112,8 @@ PROMPT_PROFILES: dict[str, dict[str, Any]] = {
             "keep terminology consistent and examples runnable."
         ),
         "allowed_tools": {
-            "read", "glob", "grep", "webfetch", "diagnostics", "lint", "symbols", "git",
-            "write", "edit", "multi_edit", "apply_patch", "todowrite",
+            "read", "glob", "grep", "webfetch", "websearch", "diagnostics", "lint", "symbols", "git",
+            "write", "edit", "multi_edit", "apply_patch", "todowrite", "skill",
         },
     },
 }
@@ -179,6 +182,8 @@ Active Agent Mode: {agent_mode}
 {shell_note}
 {mode_note}
 {memory_section}
+{rules_section}
+{skills_section}
 Respond concisely in the user's language (Russian if the user writes in Russian) using GitHub-flavored Markdown.
 Use tools (`read`, `glob`, `grep`, `symbols`, `git`, `diagnostics`, `write`, `edit`, `multi_edit`, `apply_patch`, `webfetch`, `bash`, `todowrite`) proactively when working with files, URLs, or tasks.
 If `write`, `edit`, `multi_edit`, or `apply_patch` reports `Diagnostics` syntax errors in its tool output, fix them immediately in the same turn before finishing.
@@ -237,10 +242,14 @@ class AgentEngine:
         self._active_profile_readonly: bool = False
 
     def _tools_for_payload(self) -> list[dict[str, Any]]:
+        schemas = list(OPENAI_TOOLS_SCHEMA) + self.executor.mcp_tool_schemas()
+        skill_schema = self.executor.skill_tool_schema()
+        if skill_schema is not None:
+            schemas.append(skill_schema)
         allowed = self._active_profile_tools
         if allowed is None:
-            return OPENAI_TOOLS_SCHEMA
-        return [t for t in OPENAI_TOOLS_SCHEMA if t["function"]["name"] in allowed]
+            return schemas
+        return [t for t in schemas if t["function"]["name"] in allowed]
 
     def _cached_messages(self, url: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Marks the stable system prefix cacheable for providers with prompt
@@ -627,6 +636,10 @@ class AgentEngine:
         )
         project_mem = self.storage.load_project_memory()
         memory_section = f"\nProject Rules & Memory:\n{project_mem}\n" if project_mem else ""
+        rules_text = await load_rules(self.workspace, self.get_config())
+        rules_section = f"\nProject Instructions:\n{rules_text}\n" if rules_text else ""
+        skills_text = skills_prompt(load_skills(self.workspace))
+        skills_section = f"\n{skills_text}\n" if skills_text else ""
         shell_note = (
             "Shell: Windows PowerShell 5.1 — write PowerShell commands "
             "(`Get-ChildItem`, `New-Item -ItemType Directory`, `$env:VAR`); "
@@ -644,6 +657,8 @@ class AgentEngine:
                     shell_note=shell_note,
                     mode_note=mode_note,
                     memory_section=memory_section,
+                    rules_section=rules_section,
+                    skills_section=skills_section,
                 ),
             }
         ]
@@ -675,11 +690,12 @@ class AgentEngine:
                     async def _read_attachment(rel: str) -> str:
                         if rel in VIRTUAL_ATTACHMENTS:
                             return await self._virtual_attachment(rel)
+                        actual, offset, limit = self._attachment_spec(rel)
                         # Image attachments become vision content parts, not text.
-                        suffix = Path(rel).suffix.lower()
+                        suffix = Path(actual).suffix.lower()
                         if suffix in (".png", ".jpg", ".jpeg", ".webp", ".gif") and self.get_config().get("send_images", True):
                             try:
-                                img_path = self.executor.resolve_path(rel)
+                                img_path = self.executor.resolve_path(actual)
                                 if img_path.exists() and img_path.stat().st_size <= 5 * 1024 * 1024:
                                     import base64 as _b64
 
@@ -701,7 +717,11 @@ class AgentEngine:
                             except Exception:
                                 logger.debug("image attachment failed: %s", rel, exc_info=True)
                         async with att_sem:
-                            res = await self.executor.execute("read", {"filePath": rel, "limit": 160}, agent_mode)
+                            res = await self.executor.execute(
+                                "read",
+                                {"filePath": actual, "offset": offset, "limit": limit},
+                                agent_mode,
+                            )
                         return f'<file path="{rel}">\n{res.output}\n</file>'
 
                     attached_blocks = await asyncio.gather(*(_read_attachment(rel) for rel in m.attachments))
@@ -971,6 +991,17 @@ class AgentEngine:
                         )
                     )
 
+    async def _apply_chat_params(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
+        plugins = getattr(self.executor, "plugins", None)
+        if plugins is None:
+            return payload
+        context = await plugins.trigger(
+            "chat.params",
+            {"payload": payload, "model": model_id, "model_id": model_id},
+        )
+        updated = context.get("payload")
+        return updated if isinstance(updated, dict) else payload
+
     async def _stream_chat_step(
         self,
         client: httpx.AsyncClient,
@@ -1002,6 +1033,7 @@ class AgentEngine:
         max_tokens = (self.get_config() or {}).get("max_tokens")
         if max_tokens:
             payload["max_tokens"] = int(max_tokens)
+        payload = await self._apply_chat_params(payload, model_id)
         full_text: list[str] = []
         reasoning_text: list[str] = []
         tc_acc: dict[int, dict[str, Any]] = {}
@@ -1187,6 +1219,7 @@ class AgentEngine:
         max_tokens = (self.get_config() or {}).get("max_tokens")
         if max_tokens:
             payload["max_tokens"] = int(max_tokens)
+        payload = await self._apply_chat_params(payload, model_id)
         for attempt in range(1, self.retry_attempts + 1):
             try:
                 _t_req = time.perf_counter()
@@ -1308,6 +1341,7 @@ class AgentEngine:
         }
         if model_supports_tools(model_id, self.get_config()) and self._tools_for_payload():
             payload["tools"] = self._tools_for_payload()
+        payload = await self._apply_chat_params(payload, model_id)
         full_text: list[str] = []
         reasoning_text: list[str] = []
         tcs: list[dict[str, Any]] = []
@@ -1402,6 +1436,19 @@ class AgentEngine:
         code, out = await self._run_git_full(*args, timeout=timeout)
         return out if code == 0 else ""
 
+    @staticmethod
+    def _attachment_spec(rel: str) -> tuple[str, int, int]:
+        """Parses `path#L12-L34` / `path#L12` attachments into (path, offset, limit)."""
+        match = re.match(r"^(.*?)#L(\d+)(?:-L?(\d+))?$", rel, re.IGNORECASE)
+        if not match:
+            return rel, 1, 160
+        path = match.group(1) or rel
+        start = max(1, int(match.group(2)))
+        end = int(match.group(3)) if match.group(3) else start + 159
+        if end < start:
+            start, end = end, start
+        return path, start, max(1, min(500, end - start + 1))
+
     async def _virtual_attachment(self, name: str) -> str:
         """Expands @diff / @git / @staged / @tree into ready-to-use prompt context."""
         if name == "diff":
@@ -1445,20 +1492,17 @@ class AgentEngine:
         model_id: str,
         api_base: str,
         api_key: str,
+        subagent: SubagentDef | None = None,
     ) -> str:
+        definition = subagent or load_subagents(self.workspace, self.get_config())["explore"]
         headers = self._build_headers(api_key)
-        writable = {"write", "edit", "multi_edit", "apply_patch", "bash", "todowrite", "subagent"}
-        tools = [t for t in OPENAI_TOOLS_SCHEMA if t["function"]["name"] not in writable]
+        allowed = definition.tools if definition.tools is not None else set(READONLY_TOOL_NAMES)
+        tools = [t for t in OPENAI_TOOLS_SCHEMA if t["function"]["name"] in allowed]
+        system_prompt = definition.prompt.replace("{workspace}", f"Workspace: {self.workspace}")
+        if str(self.workspace) not in system_prompt:
+            system_prompt += f"\nWorkspace: {self.workspace}"
         messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an explore subagent inside rbit. You have ONLY read-only tools. "
-                    f"Workspace: {self.workspace}\n"
-                    "Investigate the user's goal and return a compact summary (max ~200 words) "
-                    "with concrete `file:line` references. Do not ask questions."
-                ),
-            },
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": goal},
         ]
         steps = 0
@@ -1498,19 +1542,21 @@ class AgentEngine:
                     fn = tc.get("function") or {}
                     fn_name = fn.get("name", "")
                     tc_id = tc.get("id") or f"call_{short_id()}"
-                    if fn_name not in READONLY_TOOLS:
+                    if fn_name not in allowed:
                         messages.append(
                             {
                                 "role": "tool",
                                 "tool_call_id": tc_id,
                                 "name": fn_name,
-                                "content": "Rejected: subagent is read-only.",
+                                "content": f"Rejected: tool `{fn_name}` is not allowed for subagent `{definition.name}`.",
                             }
                         )
                         continue
                     used.append(fn_name)
                     res = await self.executor.execute(
-                        fn_name, self._parse_tool_args(fn.get("arguments")), agent_mode="plan"
+                        fn_name,
+                        self._parse_tool_args(fn.get("arguments")),
+                        agent_mode="plan" if definition.read_only else "build",
                     )
                     messages.append(
                         {
@@ -1523,7 +1569,7 @@ class AgentEngine:
         finally:
             if self.http_client is None:
                 await client_ctx.aclose()
-        suffix = f"\n\n(subagent steps: {steps}, tools: {', '.join(sorted(set(used))) or 'none'})"
+        suffix = f"\n\n(subagent {definition.name} steps: {steps}, tools: {', '.join(sorted(set(used))) or 'none'})"
         return (last_content or "Subagent finished without findings.") + suffix
 
     async def _run_subagent(
@@ -1540,24 +1586,34 @@ class AgentEngine:
         if not goal:
             return ToolResult(False, "missing goal", "`goal` is required for subagent.")
         kind = str(args.get("agent") or "explore").strip().lower()
-        if kind != "explore":
+        definitions = load_subagents(self.workspace, self.get_config())
+        definition = definitions.get(kind)
+        if definition is None:
             return ToolResult(
-                False, f"unsupported agent: {kind}", 'Only agent="explore" is supported for now.'
+                False,
+                f"unsupported agent: {kind}",
+                "Available subagents: " + ", ".join(subagent_names(definitions)),
             )
 
         if args.get("background"):
-            return self._start_background_subagent(goal, model_id, api_base, api_key, session)
+            return self._start_background_subagent(goal, model_id, api_base, api_key, session, definition)
 
         if model_id and api_base:
-            text = await self._explore_with_llm(goal, model_id, api_base, api_key)
-        else:
+            text = await self._explore_with_llm(goal, model_id, api_base, api_key, subagent=definition)
+        elif definition.name == "explore":
             text = await self._explore_deterministic(goal)
+        else:
+            return ToolResult(
+                False,
+                f"subagent {definition.name} requires a remote model",
+                "Custom subagents need an API model; the built-in explore agent can run locally.",
+            )
 
         duration = int((time.perf_counter() - t0) * 1000)
         return ToolResult(
             True,
-            f"explore · {len(text)} chars",
-            f"Subagent explore result for: {goal}\n\n{text}",
+            f"{definition.name} · {len(text)} chars",
+            f"Subagent {definition.name} result for: {goal}\n\n{text}",
             duration_ms=duration,
         )
 
@@ -1568,17 +1624,21 @@ class AgentEngine:
         api_base: str,
         api_key: str,
         session: Session | None,
+        subagent: SubagentDef | None = None,
     ) -> ToolResult:
-        """Launches an explore subagent that does NOT block the current turn;
+        """Launches a subagent that does NOT block the current turn;
         the result lands in the chat (and the session file) when ready."""
         started_at = time.strftime("%H:%M")
+        definition = subagent or load_subagents(self.workspace, self.get_config())["explore"]
 
         async def runner() -> None:
             try:
                 if model_id and api_base:
-                    text = await self._explore_with_llm(goal, model_id, api_base, api_key)
-                else:
+                    text = await self._explore_with_llm(goal, model_id, api_base, api_key, subagent=definition)
+                elif definition.name == "explore":
                     text = await self._explore_deterministic(goal)
+                else:
+                    text = f"Subagent `{definition.name}` requires a remote model."
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1588,7 +1648,7 @@ class AgentEngine:
                 id=short_id(),
                 role="assistant",
                 content=(
-                    f"**[Subagent · background]** `{goal}`\n\n{text}\n\n"
+                    f"**[Subagent {definition.name} · background]** `{goal}`\n\n{text}\n\n"
                     f"*(запущен в {started_at}, готов — вывод выше)*"
                 ),
                 agent="build",
@@ -1610,7 +1670,7 @@ class AgentEngine:
         return ToolResult(
             True,
             f"background subagent started ({time.strftime('%H:%M')})",
-            f"Explore subagent started in the BACKGROUND for: {goal}\n"
+            f"Subagent {definition.name} started in the BACKGROUND for: {goal}\n"
             "The current turn continues without waiting. The result will be posted "
             "to the chat (and saved to the session) when the subagent finishes.",
             duration_ms=0,

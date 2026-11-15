@@ -830,6 +830,8 @@ class SidebarPanel(Vertical):
         checkpoints_count: int = 0,
         extra_models: list[ModelInfo] | None = None,
         ollama_online: bool | None = None,
+        mcp_status: dict[str, dict[str, Any]] | None = None,
+        mcp_configs: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         info = get_model_info(model_id, extra_models)
         used = session.total_tokens
@@ -850,16 +852,28 @@ class SidebarPanel(Vertical):
             ctx.append(f"\n{checkpoints_count} checkpoints", style="#fab283")
         self.query_one("#sb-context", Static).update(ctx)
 
-        # 3. MCP
+        # 3. MCP (real connected servers; /mcp manages them)
         mcp = Text()
         mcp.append("MCP\n", style="bold #eeeeee")
-        mcp.append("• ", style="bold #7fd88f")
-        mcp.append("rbit-tools ", style="#eeeeee")
-        mcp.append("Connected", style="#808080")
-        if api_connected:
-            mcp.append("\n• ", style="bold #7fd88f")
-            mcp.append("remote-llm ", style="#eeeeee")
-            mcp.append("Streaming", style="#808080")
+        configured = list((mcp_configs or {}).keys())
+        if not configured:
+            mcp.append("No servers (/mcp add)", style="#686868")
+        else:
+            for name in configured[:6]:
+                status = (mcp_status or {}).get(name) or {}
+                if status.get("connected"):
+                    mcp.append("• ", style="bold #7fd88f")
+                    mcp.append(f"{name} ", style="#eeeeee")
+                    count = int(status.get("tools") or 0)
+                    mcp.append(f"{count} tool{'s' if count != 1 else ''}", style="#808080")
+                else:
+                    mcp.append("• ", style="bold #e06c75")
+                    mcp.append(f"{name} ", style="#eeeeee")
+                    error = str(status.get("error") or "idle")
+                    mcp.append(error[:16], style="#808080")
+                mcp.append("\n")
+            if len(configured) > 6:
+                mcp.append(f"+{len(configured) - 6} more\n", style="#686868")
         self.query_one("#sb-mcp", Static).update(mcp)
 
         # 4. LSP
