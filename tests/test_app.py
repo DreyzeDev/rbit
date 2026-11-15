@@ -27,6 +27,7 @@ from rbit.modals import (
     SearchResultsModal,
 )
 from rbit.models import ChatMessage, ModelInfo, Session, ToolCallRecord, search_session, short_id
+from rbit.storage import StorageManager
 from rbit.tools import (
     PathOutsideWorkspace,
     ToolExecutor,
@@ -3758,3 +3759,73 @@ async def test_test_gate_feeds_failures_to_fix_round(tmp_path: Path) -> None:
                 break
         await pilot.pause()
     assert calls["n"] == 2  # test gate triggered the fix round
+
+@pytest.mark.asyncio
+async def test_fetch_provider_models_parses_opencode_catalog(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session())
+    engine = AgentEngine(
+        workspace=tmp_path, executor=executor, get_config=lambda: {"api_key": "x"}
+    )
+
+    payload = {
+        "data": [
+            {
+                "id": "glm-5.3-flash",
+                "name": "GLM-5.3-Flash",
+                "limit": {"context": 1_000_000},
+                "cost": {"text": {"input": {"price": 0.15}, "output": {"price": 0.5}}},
+            }
+        ]
+    }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ok, _message, models = await engine.fetch_provider_models(
+        "https://opencode.ai/inference/openai/v1", "k"
+    )
+    await engine.http_client.aclose()
+    engine.http_client = None
+
+    assert ok is True
+    assert len(models) == 1
+    info = models[0]
+    assert info.provider == "opencode"
+    assert info.name == "GLM-5.3-Flash"
+    assert info.context_window == 1_000_000
+    assert abs(info.cost_per_1k - 0.000325) < 1e-9
+
+
+def test_profile_save_does_not_flatten_root_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    storage = StorageManager(ws)
+    storage.config_path.parent.mkdir(parents=True, exist_ok=True)
+    storage.save_config(
+        {
+            "theme": "rbit-dark",
+            "api_base": "https://anymodel.org/v1",
+            "api_key": "root-key",
+            "model": "root-model",
+        }
+    )
+    monkeypatch.setenv("RBIT_PROFILE", "opencode")
+    storage.save_config(
+        {
+            "theme": "rbit-dark",
+            "api_base": "https://opencode.ai/inference/openai/v1",
+            "api_key": "profile-key",
+            "model": "glm-5.3-flash",
+            "profiles": {},
+        }
+    )
+    raw = json.loads(storage.config_path.read_text(encoding="utf-8"))
+    assert raw["api_base"] == "https://anymodel.org/v1"
+    assert raw["api_key"] == "root-key"
+    assert raw["profiles"]["opencode"]["api_base"] == "https://opencode.ai/inference/openai/v1"
+    assert raw["profiles"]["opencode"]["api_key"] == "profile-key"
+    assert "profiles" not in raw["profiles"]["opencode"]
+

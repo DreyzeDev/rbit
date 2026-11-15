@@ -117,6 +117,7 @@ PROMPT_PROFILES: dict[str, dict[str, Any]] = {
 
 PROVIDER_LABELS = {
     "coarena.ai": "Coarena",
+    "opencode.ai": "opencode",
     "openrouter.ai": "OpenRouter",
     "api.openai.com": "OpenAI",
     "api.anthropic.com": "Anthropic",
@@ -386,6 +387,9 @@ class AgentEngine:
                 model_id = str(entry.get("id") or entry.get("name") or "")
             else:
                 continue
+            display_name = (
+                str(entry.get("name") or "").strip() if isinstance(entry, dict) else ""
+            )
             model_id = model_id.strip()
             if not model_id or model_id in seen:
                 continue
@@ -393,8 +397,12 @@ class AgentEngine:
             context_window = 200_000
             cost_per_1k = 0.0
             if isinstance(entry, dict):
+                limit = entry.get("limit") or {}
+                raw_context = entry.get("context_length")
+                if not raw_context and isinstance(limit, dict):
+                    raw_context = limit.get("context")
                 try:
-                    context_window = int(entry.get("context_length") or 200_000)
+                    context_window = int(raw_context or 200_000)
                 except (TypeError, ValueError):
                     context_window = 200_000
                 pricing = entry.get("pricing") or {}
@@ -402,14 +410,24 @@ class AgentEngine:
                     prompt_p = float(pricing.get("prompt") or 0)
                     completion_p = float(pricing.get("completion") or 0)
                     if prompt_p or completion_p:
-                        # Per-token prices from OpenRouter-style listings → per-1k blended.
+                        # Per-token prices from OpenRouter-style listings -> per-1k blended.
                         cost_per_1k = round((prompt_p + completion_p) / 2 * 1000, 6)
                 except (TypeError, ValueError):
                     cost_per_1k = 0.0
+                text_cost = (entry.get("cost") or {}).get("text") if isinstance(entry.get("cost"), dict) else None
+                if not cost_per_1k and isinstance(text_cost, dict):
+                    try:
+                        # opencode-style catalog: USD per 1M tokens.
+                        in_p = float((text_cost.get("input") or {}).get("price") or 0)
+                        out_p = float((text_cost.get("output") or {}).get("price") or 0)
+                        if in_p or out_p:
+                            cost_per_1k = round((in_p + out_p) / 2 / 1000, 6)
+                    except (TypeError, ValueError):
+                        cost_per_1k = 0.0
             models.append(
                 ModelInfo(
                     id=model_id,
-                    name=_pretty_model_name(model_id),
+                    name=display_name or _pretty_model_name(model_id),
                     provider=provider,
                     context_window=context_window,
                     cost_per_1k=cost_per_1k,

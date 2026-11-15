@@ -181,10 +181,28 @@ class StorageManager:
         os.replace(tmp, path)
 
     def save_config(self, cfg: dict[str, Any]) -> None:
-        self._atomic_write_json(
-            self.config_path,
-            json.dumps(cfg, ensure_ascii=False, indent=2),
-        )
+        profile = (os.environ.get("RBIT_PROFILE") or "").strip()
+        if profile:
+            raw: dict[str, Any] = {}
+            if self.config_path.exists():
+                try:
+                    raw = json.loads(self.config_path.read_text(encoding="utf-8"))
+                except Exception:
+                    raw = {}
+            profiles = raw.get("profiles")
+            if not isinstance(profiles, dict):
+                profiles = {}
+            profiles[profile] = {k: v for k, v in cfg.items() if k != "profiles"}
+            raw["profiles"] = profiles
+            self._atomic_write_json(
+                self.config_path,
+                json.dumps(raw, ensure_ascii=False, indent=2),
+            )
+        else:
+            self._atomic_write_json(
+                self.config_path,
+                json.dumps(cfg, ensure_ascii=False, indent=2),
+            )
         if os.name != "nt":
             try:
                 os.chmod(self.config_path, 0o600)

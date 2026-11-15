@@ -23,6 +23,11 @@ All notable changes to rbit are documented here. The format follows
 
 - `rbit serve` — local HTTP endpoint: `POST /v1/turns` streams a full agent turn as
   NDJSON (status/thinking/delta/tool_call/message), `GET /health` for readiness.
+- opencode Console/Zen provider: models are discovered from
+  `https://opencode.ai/inference/v1/models` (base `.../inference/openai/v1`), and the
+  catalog schema (`limit.context`, `cost.text.*`, display names) is parsed. Store it as
+  a config profile (e.g. `profiles.opencode`) and run `rbit --profile opencode`.
+  Free `*-free` models are limited to the OpenCode client itself; paid models need credits.
 - `rbit backup` — zips the `.rbit` state directory; `rbit describe` — project
   structure, languages and README head.
 - `rbit run --readonly` (and `readonly` config): read-only session — mutating tools
@@ -125,6 +130,9 @@ All notable changes to rbit are documented here. The format follows
 
 ### Fixed
 
+- Saving the config while a profile is active (`--profile` / `RBIT_PROFILE`) now updates
+  that profile instead of flattening its values into the root config and silently
+  switching the default provider.
 - Pasting large/multi-line text into the prompt no longer truncates it to the first
   line: the whole paste is inserted (lines joined with spaces), from both the terminal
   bracketed-paste path and `ctrl+v`.
