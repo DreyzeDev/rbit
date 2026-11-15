@@ -8,6 +8,17 @@ All notable changes to rbit are documented here. The format follows
 
 ### Added
 
+- CLI parity: background `rbit service` (start/stop/status/restart/get/set/unset),
+  OpenAPI-driven `rbit api`, `rbit debug` (agents/config/paths/heap-dump), package
+  plugins (`rbit plugin add/list/check/update/remove`), multi-credential auth
+  (`switch/export/import`), MCP OAuth token management (`mcp auth/logout`),
+  `rbit upgrade`/`uninstall`/`reload`/`pair`/`mini`, `serve --cors/--service/--stdio`
+  and `POST /v1/reload`.
+- `rbit run` additions: `--worktree`, custom `--agent`, `--archived`, `--thinking`;
+  global `--auto/--yolo` permission auto-approval; archived sessions are hidden from
+  lists but still resumable.
+- `rbit sessions --max-count/--json/--all`, `session import` from URL, richer `stats`
+  (`--year/--tools/--cost/--full/--json/--limit`).
 - Full MCP client: stdio + streamable HTTP servers from `mcp` (opencode-style) or
   legacy `mcp_servers`, `<server>_<tool>` namespacing, `/mcp add|remove|reload`,
   `rbit mcp list|test|add|remove`, live sidebar status.
