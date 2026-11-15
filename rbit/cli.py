@@ -636,7 +636,7 @@ def _run_lint(workspace: Path, as_json: bool = False) -> int:
         output = "\n".join(part for part in (proc.stdout.strip(), proc.stderr.strip()) if part)
         output = output or "No lint issues."
     else:
-        res = executor._tool_diagnostics({"filePath": "."})
+        res = executor.builtin_diagnostics({"filePath": "."})
         ok = res.ok
         output = res.output
 
@@ -870,11 +870,12 @@ def _run_init(workspace: Path, force: bool = False, as_json: bool = False) -> in
     )
 
     rbit_path = workspace / "RBIT.md"
+    agents_path = workspace / "AGENTS.md"
     storage = StorageManager(workspace)
     storage.ensure_dirs()
     written: list[str] = []
     skipped: list[str] = []
-    for path, content in ((rbit_path, rbit_md), (storage.memory_path, memory)):
+    for path, content in ((rbit_path, rbit_md), (agents_path, rbit_md), (storage.memory_path, memory)):
         if path.exists() and not force:
             skipped.append(str(path))
             continue
@@ -891,7 +892,7 @@ def _run_init(workspace: Path, force: bool = False, as_json: bool = False) -> in
     return 0
 
 
-COMMANDS = "run doctor stats sessions export map lint init commit update"
+COMMANDS = "run doctor stats sessions export map lint init commit update mcp acp serve"
 
 COMPLETION_SCRIPTS: dict[str, str] = {
     "bash": (
@@ -1017,7 +1018,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "backup", "describe", "serve", "import", "watch", "voice", "models", "auth", "web", "pr", "agent"}
+    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "backup", "describe", "serve", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -1091,6 +1092,24 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--allow-outside", action="store_true")
             parsed = p.parse_args(rest)
             return _run_serve(parsed, hostname=parsed.hostname)
+
+        if sub == "acp":
+            p = argparse.ArgumentParser(prog="rbit acp", description="Agent Client Protocol server over stdio (for Zed)")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            from rbit.acp import run_acp
+
+            return asyncio.run(run_acp(_resolve_workspace(parsed.dir)))
+
+        if sub == "mcp":
+            p = argparse.ArgumentParser(prog="rbit mcp", description="Manage and test MCP servers")
+            p.add_argument("action", nargs="?", default="list", choices=["list", "test", "add", "remove"])
+            p.add_argument("name", nargs="?", default="")
+            p.add_argument("command", nargs=argparse.REMAINDER, help="Command for a local server")
+            p.add_argument("--url", help="Remote streamable-HTTP endpoint")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            return _run_mcp(parsed)
 
         if sub == "import":
             p = argparse.ArgumentParser(prog="rbit import", description="Import a session from JSON (rbit or OpenAI messages) or Markdown")
@@ -1341,8 +1360,11 @@ def main(argv: list[str] | None = None) -> int:
             "  rbit export [id]       Export session transcript to Markdown\n"
             "  rbit map [dir]         Repository map with sizes, languages & token budget\n"
             "  rbit lint [dir]        Lint workspace; exit code 1 on issues (--json)\n"
-            "  rbit init [dir]        Create RBIT.md + .rbit/memory.md from project scan\n"
+            "  rbit init [dir]        Create RBIT.md + AGENTS.md + .rbit/memory.md from project scan\n"
             "  rbit commit [dir]      Draft a commit message from git diff (--apply to commit)\n"
+            "  rbit serve             Local HTTP API (NDJSON turns, OpenAPI at /openapi.json)\n"
+            "  rbit acp               Agent Client Protocol server over stdio (Zed integration)\n"
+            "  rbit mcp list|test     List or test MCP servers; add/remove manage config\n"
             "  rbit update            Check PyPI for a newer release (--check to skip install)\n"
             "  rbit --generate-completion bash|zsh|powershell   Print shell completion script\n"            "\n"
             "Global flags: --quiet (warnings only), --verbose (info), --trace (debug)\n"
@@ -1398,6 +1420,167 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+
+
+def _run_mcp(args: argparse.Namespace) -> int:
+    """Implements `rbit mcp list|test|add|remove`."""
+    from .mcp import MCPManager
+
+    workspace = _resolve_workspace(getattr(args, "dir", None))
+    storage = StorageManager(workspace)
+    cfg = storage.load_config()
+    configs = cfg.get("mcp")
+    if not isinstance(configs, dict):
+        configs = {}
+    legacy = cfg.get("mcp_servers")
+    if not isinstance(legacy, dict):
+        legacy = {}
+    console = Console()
+    action = args.action
+
+    if action == "add":
+        name = (args.name or "").strip()
+        if not name:
+            console.print("[bold #e06c75]Usage:[/] rbit mcp add <name> <command…> | --url <url>")
+            return 2
+        if args.url:
+            configs[name] = {"type": "remote", "url": args.url}
+        else:
+            command = " ".join(args.command).strip()
+            if not command:
+                console.print("[bold #e06c75]Missing command or --url.[/]")
+                return 2
+            configs[name] = {"type": "local", "command": command}
+        cfg["mcp"] = configs
+        storage.save_config(cfg)
+        console.print(f"[bold #7fd88f]✓[/] MCP server added: {name}")
+        return 0
+
+    if action == "remove":
+        name = (args.name or "").strip()
+        if not name:
+            console.print("[bold #e06c75]Usage:[/] rbit mcp remove <name>")
+            return 2
+        existed = name in configs or name in legacy
+        configs.pop(name, None)
+        legacy.pop(name, None)
+        cfg["mcp"] = configs
+        cfg["mcp_servers"] = legacy
+        storage.save_config(cfg)
+        console.print(("[bold #7fd88f]✓[/] Removed " if existed else "[dim]Not found:[/] ") + name)
+        return 0 if existed else 1
+
+    async def _run() -> int:
+        manager = MCPManager.from_config(cfg, workspace)
+        await manager.start()
+        try:
+            if not manager.clients:
+                console.print("[dim]No MCP servers configured. Add one with `rbit mcp add <name> <command…>`.[/]")
+                return 0
+            table = Table(title="MCP servers", show_lines=False)
+            table.add_column("Server")
+            table.add_column("Transport")
+            table.add_column("Tools")
+            table.add_column("Status")
+            for name, status in manager.status.items():
+                if status.get("connected"):
+                    table.add_row(name, str(status.get("transport")), str(status.get("tools")), "[#7fd88f]connected[/]")
+                else:
+                    table.add_row(
+                        name,
+                        str(status.get("transport")),
+                        "0",
+                        f"[#e06c75]{status.get('error') or 'not connected'}[/]",
+                    )
+            console.print(table)
+            if action == "test" and manager.tools:
+                console.print("\n[bold]Tools[/]")
+                for exposed, tool in manager.tools.items():
+                    console.print(f"  • [bold]{exposed}[/] — {tool.description[:100]}")
+            failed = [name for name, status in manager.status.items() if not status.get("connected")]
+            return 1 if failed else 0
+        finally:
+            await manager.close()
+
+    return asyncio.run(_run())
+
+
+def build_openapi_spec() -> dict:
+    """OpenAPI 3.1 description of the local `rbit serve` API."""
+    return {
+        "openapi": "3.1.0",
+        "info": {"title": "rbit local API", "version": "1.3.1"},
+        "servers": [{"url": "http://127.0.0.1:4096"}],
+        "paths": {
+            "/health": {"get": {"summary": "Health probe", "responses": {"200": {"description": "OK"}}}},
+            "/v1/models": {
+                "get": {
+                    "summary": "List available models",
+                    "responses": {"200": {"description": "Model list", "content": {"application/json": {}}}},
+                }
+            },
+            "/v1/sessions": {
+                "get": {"summary": "List sessions", "responses": {"200": {"description": "Sessions"}}},
+                "post": {
+                    "summary": "Create a session",
+                    "requestBody": {"content": {"application/json": {}}},
+                    "responses": {"200": {"description": "Session"}},
+                },
+            },
+            "/v1/sessions/{id}": {
+                "get": {"summary": "Read a session", "responses": {"200": {"description": "Session"}}},
+                "parameters": [
+                    {"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}
+                ],
+            },
+            "/v1/sessions/{id}/rename": {
+                "post": {
+                    "summary": "Rename a session",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}
+                    ],
+                    "requestBody": {"content": {"application/json": {}}},
+                    "responses": {"200": {"description": "Renamed"}},
+                }
+            },
+            "/v1/turns": {
+                "post": {
+                    "summary": "Run an agent turn, streaming NDJSON events",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "prompt": {"type": "string"},
+                                        "session_id": {"type": "string"},
+                                        "model": {"type": "string"},
+                                        "mode": {"type": "string", "enum": ["build", "plan"]},
+                                    },
+                                    "required": ["prompt"],
+                                }
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "NDJSON stream of turn events",
+                            "content": {"application/x-ndjson": {}},
+                        }
+                    },
+                }
+            },
+            "/v1/approvals": {
+                "post": {
+                    "summary": "Answer an interactive tool approval",
+                    "requestBody": {"content": {"application/json": {}}},
+                    "responses": {"200": {"description": "Recorded"}},
+                }
+            },
+            "/openapi.json": {"get": {"summary": "This document", "responses": {"200": {"description": "OpenAPI"}}}},
+        },
+    }
 
 
 def _run_serve(args: argparse.Namespace, hostname: str = "127.0.0.1", open_browser: bool = False) -> int:
@@ -1549,6 +1732,14 @@ def _run_serve(args: argparse.Namespace, hostname: str = "127.0.0.1", open_brows
         def do_GET(self) -> None:  # noqa: N802
             if self.path == "/health":
                 body = _json.dumps({"status": "ok", "workspace": str(workspace)}).encode()
+                self.send_response(200)
+                self._cors()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path in ("/openapi.json", "/v1/openapi.json"):
+                body = _json.dumps(build_openapi_spec(), ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self._cors()
                 self.send_header("Content-Type", "application/json")
