@@ -229,3 +229,34 @@ async def test_build_subagent_can_write(tmp_path: Path) -> None:
 
     assert result.ok is True
     assert (tmp_path / "fixed.txt").read_text(encoding="utf-8") == "ok\n"
+
+@pytest.mark.asyncio
+async def test_artifact_tool_lifecycle(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session(), get_config=dict)
+    created = await executor.execute("artifact", {"action": "create", "name": "report.md", "content": "# Report\n"})
+    assert created.ok is True
+    assert (tmp_path / ".rbit" / "artifacts" / "report.md").exists()
+    read = await executor.execute("artifact", {"action": "read", "name": "report"})
+    assert read.ok is True and "# Report" in read.output
+    listed = await executor.execute("artifact", {"action": "list"})
+    assert "report.md" in listed.output
+    deleted = await executor.execute("artifact", {"action": "delete", "name": "report.md"})
+    assert deleted.ok is True
+    assert not (tmp_path / ".rbit" / "artifacts" / "report.md").exists()
+
+@pytest.mark.asyncio
+async def test_question_tool_callback_and_noninteractive(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session(), get_config=dict)
+    unavailable = await executor.execute("question", {"question": "Which OS?"})
+    assert unavailable.ok is False
+    assert "non-interactive" in unavailable.summary
+
+    async def answer(question: str, options: list[str]) -> str:
+        assert question == "Pick one"
+        assert options == ["a", "b"]
+        return "b"
+
+    executor = ToolExecutor(workspace=tmp_path, session=Session(), get_config=dict, question_cb=answer)
+    result = await executor.execute("question", {"question": "Pick one", "options": ["a", "b"]})
+    assert result.ok is True
+    assert result.output == "b"

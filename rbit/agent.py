@@ -240,12 +240,16 @@ class AgentEngine:
         self.last_api_latency: float | None = None
         self._active_profile_tools: set[str] | None = None
         self._active_profile_readonly: bool = False
+        self._active_variant: str | None = None
 
     def _tools_for_payload(self) -> list[dict[str, Any]]:
         schemas = list(OPENAI_TOOLS_SCHEMA) + self.executor.mcp_tool_schemas()
         skill_schema = self.executor.skill_tool_schema()
         if skill_schema is not None:
             schemas.append(skill_schema)
+        mcp_resource_schema = self.executor.mcp_resource_schema()
+        if mcp_resource_schema is not None:
+            schemas.append(mcp_resource_schema)
         allowed = self._active_profile_tools
         if allowed is None:
             return schemas
@@ -445,8 +449,30 @@ class AgentEngine:
         count = len(models)
         return True, f"Connected: {count} models available" if count else "Connected.", models
 
+    @staticmethod
+    def _split_model_variant(model_id: str) -> tuple[str, str | None]:
+        """Splits `provider/model#variant` (opencode syntax)."""
+        if "#" not in model_id:
+            return model_id, None
+        base, variant = model_id.rsplit("#", 1)
+        variant = variant.strip().lower()
+        if not base.strip() or not variant:
+            return model_id, None
+        return base.strip(), variant
+
     def _reasoning_effort(self, model_id: str) -> str | None:
         """Resolves the configured effort for this model, or None to omit the parameter."""
+        variant = self._active_variant
+        variant_effort = {
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "max": "high",
+            "thinking": "high",
+        }.get(variant or "")
+        if variant_effort and is_reasoning_model(model_id):
+            return variant_effort
         effort = str((self.get_config() or {}).get("effort") or "auto").lower()
         if effort == "auto":
             return "medium" if is_reasoning_model(model_id) else None
@@ -483,6 +509,8 @@ class AgentEngine:
     ) -> ChatMessage:
         t0 = time.perf_counter()
         cfg = self.get_config()
+        model_id, variant = self._split_model_variant(model_id)
+        self._active_variant = variant
         routing = cfg.get("model_routing")
         if isinstance(routing, dict) and routing.get("enabled"):
             routed = route_model_for_task(model_id, user_msg, routing)
@@ -545,7 +573,24 @@ class AgentEngine:
             await on_tool_end(rec)
             return res
 
-        if use_remote:
+        protocol = str(cfg.get("protocol") or "").lower()
+        native_anthropic = use_remote and (
+            protocol in ("anthropic", "claude") or "api.anthropic.com" in effective_base
+        )
+
+        if native_anthropic:
+            content = await self._run_anthropic_compatible(
+                session=session,
+                user_msg=user_msg,
+                agent_mode=agent_mode,
+                model_id=remote_model_id,
+                api_base=effective_base,
+                api_key=api_key,
+                invoke_tool=invoke_tool,
+                on_status=on_status,
+                on_stream_chunk=on_stream_chunk,
+            )
+        elif use_remote:
             content = await self._run_openai_compatible(
                 session=session,
                 user_msg=user_msg,
@@ -1007,6 +1052,141 @@ class AgentEngine:
         )
         updated = context.get("payload")
         return updated if isinstance(updated, dict) else payload
+
+    async def _run_anthropic_compatible(
+        self,
+        session: Session,
+        user_msg: ChatMessage,
+        agent_mode: str,
+        model_id: str,
+        api_base: str,
+        api_key: str,
+        invoke_tool: Callable[[str, dict[str, Any]], Awaitable[ToolResult]],
+        on_status: StatusHook,
+        on_stream_chunk: StreamHook | None = None,
+    ) -> str:
+        """Native Anthropic Messages API path (`protocol: anthropic`)."""
+        cfg = self.get_config()
+        base = api_base.rstrip("/").removesuffix("/chat/completions")
+        if base.endswith("/messages"):
+            base = base[: -len("/messages")]
+        endpoint = f"{base}/messages"
+        model = model_id.split("/", 1)[1] if model_id.startswith("anthropic/") else model_id
+        project_mem = self.storage.load_project_memory()
+        memory_section = f"\nProject Rules & Memory:\n{project_mem}\n" if project_mem else ""
+        rules_text = await load_rules(self.workspace, cfg)
+        rules_section = f"\nProject Instructions:\n{rules_text}\n" if rules_text else ""
+        skills_text = skills_prompt(load_skills(self.workspace))
+        skills_section = f"\n{skills_text}\n" if skills_text else ""
+        system_text = SYSTEM_PROMPT_TEMPLATE.format(
+            workspace=self.workspace,
+            agent_mode=agent_mode.upper(),
+            shell_note="Shell: Windows PowerShell 5.1." if os.name == "nt" else "Shell: POSIX sh/bash.",
+            mode_note="PLAN MODE ACTIVE: read-only." if agent_mode == "plan" else "BUILD MODE ACTIVE: full access.",
+            memory_section=memory_section,
+            rules_section=rules_section,
+            skills_section=skills_section,
+        )
+        messages: list[dict[str, Any]] = []
+        for message in session.messages:
+            if message.role == "user":
+                messages.append({"role": "user", "content": message.content})
+            elif message.role == "assistant":
+                blocks: list[dict[str, Any]] = []
+                if message.content:
+                    blocks.append({"type": "text", "text": message.content})
+                for call in message.tool_calls:
+                    blocks.append(
+                        {"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments}
+                    )
+                if blocks:
+                    messages.append({"role": "assistant", "content": blocks})
+                for call in message.tool_calls:
+                    if call.output:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": call.id,
+                                        "content": call.output[:8000],
+                                    }
+                                ],
+                            }
+                        )
+        if user_msg.attachments:
+            blocks = []
+            for rel in user_msg.attachments:
+                res = await self.executor.execute("read", {"filePath": rel, "limit": 160}, agent_mode=agent_mode)
+                blocks.append({"type": "text", "text": f'<file path="{rel}">\n{res.output}\n</file>'})
+            if messages and messages[-1]["role"] == "user":
+                messages[-1]["content"] = blocks + [{"type": "text", "text": str(messages[-1]["content"])}]
+        tools = []
+        for schema in self._tools_for_payload():
+            function = schema.get("function") or {}
+            tools.append(
+                {
+                    "name": function.get("name"),
+                    "description": function.get("description", ""),
+                    "input_schema": function.get("parameters") or {"type": "object", "properties": {}},
+                }
+            )
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": str(cfg.get("anthropic_version") or "2023-06-01"),
+            "Content-Type": "application/json",
+            **(cfg.get("extra_headers") or {}),
+        }
+        max_tokens = int(cfg.get("max_tokens") or 4096)
+        client_ctx = self.http_client or httpx.AsyncClient(timeout=120.0, limits=HTTP_LIMITS)
+        try:
+            for _ in range(10):
+                payload: dict[str, Any] = {
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "system": system_text,
+                    "messages": messages,
+                }
+                if tools and agent_mode != "plan":
+                    payload["tools"] = tools
+                try:
+                    response = await client_ctx.post(endpoint, headers=headers, json=payload)
+                except httpx.HTTPError as exc:
+                    return f"Anthropic network error: {exc}"
+                if response.status_code >= 400:
+                    return f"Anthropic API error ({response.status_code}): {response.text[:300]}"
+                try:
+                    data = response.json()
+                except ValueError:
+                    return "Anthropic error: malformed JSON response"
+                blocks = data.get("content") or []
+                text_parts = [block.get("text", "") for block in blocks if block.get("type") == "text"]
+                text = "".join(text_parts)
+                tool_calls = [block for block in blocks if block.get("type") == "tool_use"]
+                if not tool_calls:
+                    if on_stream_chunk is not None and text:
+                        await on_stream_chunk(text)
+                    return text
+                messages.append({"role": "assistant", "content": blocks})
+                results = []
+                for call in tool_calls:
+                    if on_status is not None:
+                        await on_status(f"tool: {call.get('name')}")
+                    result = await invoke_tool(str(call.get("name")), dict(call.get("input") or {}))
+                    results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": call.get("id"),
+                            "content": (result.output or result.summary)[:8000],
+                            **({"is_error": True} if not result.ok else {}),
+                        }
+                    )
+                messages.append({"role": "user", "content": results})
+            return "Anthropic turn stopped: too many tool iterations."
+        finally:
+            if self.http_client is None:
+                await client_ctx.aclose()
 
     async def _stream_chat_step(
         self,

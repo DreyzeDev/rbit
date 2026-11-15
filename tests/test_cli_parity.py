@@ -267,3 +267,37 @@ async def test_custom_agent_prompt_and_tool_filter(tmp_path: Path) -> None:
         )
     assert "CUSTOM AGENT PROMPT" in captured[0]["messages"][0]["content"]
     assert {tool["function"]["name"] for tool in captured[0]["tools"]} == {"read"}
+
+@pytest.mark.asyncio
+async def test_model_variant_suffix_sets_effort_and_strips_model(tmp_path: Path) -> None:
+    captured: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    cfg = {"api_key": "test", "api_base": "https://mock.local/v1", "effort": "auto"}
+    session = Session()
+    executor = ToolExecutor(workspace=tmp_path, session=session, get_config=lambda: cfg)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg, http_client=client)
+        user = ChatMessage(id=short_id(), role="user", content="hi")
+        session.messages.append(user)
+
+        async def _noop(_rec: ToolCallRecord) -> None:
+            return None
+
+        async def _status(_text: str) -> None:
+            return None
+
+        await engine.run_turn(
+            session=session,
+            user_msg=user,
+            agent_mode="build",
+            model_id="deepseek/deepseek-reasoner#high",
+            on_tool_start=_noop,
+            on_tool_end=_noop,
+            on_status=_status,
+        )
+    assert captured[0]["model"] == "deepseek/deepseek-reasoner"
+    assert captured[0]["reasoning_effort"] == "high"

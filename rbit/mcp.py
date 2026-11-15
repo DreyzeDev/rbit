@@ -467,6 +467,17 @@ class MCPClient:
                 break
         return tools
 
+    async def list_resources(self) -> list[dict[str, Any]]:
+        try:
+            result = await self._request("resources/list", {})
+        except MCPError:
+            return []
+        resources = result.get("resources")
+        return resources if isinstance(resources, list) else []
+
+    async def read_resource(self, uri: str) -> dict[str, Any]:
+        return await self._request("resources/read", {"uri": uri})
+
     async def call_tool(self, raw_name: str, arguments: dict[str, Any]) -> MCPCallResult:
         try:
             result = await self._request(
@@ -658,6 +669,19 @@ class MCPManager:
         if not result.ok and client.error:
             result.output = f"{result.output}\n\n{client.error}".strip()
         return result
+
+    async def list_resources(self) -> dict[str, list[dict[str, Any]]]:
+        result: dict[str, list[dict[str, Any]]] = {}
+        for name, client in self.clients.items():
+            if client.connected:
+                result[name] = await client.list_resources()
+        return result
+
+    async def read_resource(self, server: str, uri: str) -> dict[str, Any]:
+        client = self.clients.get(server)
+        if client is None:
+            raise MCPError(f"unknown MCP server: {server}")
+        return await client.read_resource(uri)
 
     def summary_lines(self) -> list[str]:
         lines: list[str] = []

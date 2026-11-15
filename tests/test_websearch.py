@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -96,3 +97,66 @@ async def test_websearch_cache_avoids_second_request(tmp_path: Path) -> None:
     assert first.ok is True and second.ok is True
     assert calls["n"] == 1
     assert second.summary.startswith("cached")
+
+@pytest.mark.asyncio
+async def test_tavily_provider(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "api.tavily.com"
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["query"] == "agentic coding"
+        return httpx.Response(
+            200,
+            json={"results": [{"title": "Tavily hit", "url": "https://t.example/a", "content": "Snippet A"}]},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        executor = ToolExecutor(
+            workspace=tmp_path,
+            session=Session(),
+            get_config=lambda: {"websearch": {"provider": "tavily", "api_key": "k"}},
+            http_client=client,
+        )
+        result = await executor.execute("websearch", {"query": "agentic coding"})
+    assert result.ok is True
+    assert "Tavily hit" in result.output
+    assert "https://t.example/a" in result.output
+
+
+@pytest.mark.asyncio
+async def test_exa_provider(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["x-api-key"] == "exa-key"
+        return httpx.Response(
+            200,
+            json={"results": [{"title": "Exa hit", "url": "https://e.example/a", "text": "Exa snippet"}]},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        executor = ToolExecutor(
+            workspace=tmp_path,
+            session=Session(),
+            get_config=lambda: {"websearch": {"provider": "exa", "api_key": "exa-key"}},
+            http_client=client,
+        )
+        result = await executor.execute("websearch", {"query": "x"})
+    assert result.ok is True
+    assert "Exa hit" in result.output
+
+
+@pytest.mark.asyncio
+async def test_missing_provider_key_falls_back_to_ddg(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.tavily.com":
+            return httpx.Response(401, text="no key")
+        return httpx.Response(200, text=HTML)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        executor = ToolExecutor(
+            workspace=tmp_path,
+            session=Session(),
+            get_config=lambda: {"websearch": {"provider": "tavily"}},
+            http_client=client,
+        )
+        result = await executor.execute("websearch", {"query": "fallback"})
+    assert result.ok is True
+    assert "First result" in result.output

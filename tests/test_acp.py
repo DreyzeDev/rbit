@@ -16,7 +16,18 @@ from rbit.cli import build_openapi_spec
 def test_openapi_has_core_paths() -> None:
     spec = build_openapi_spec()
     assert spec["openapi"].startswith("3.")
-    for path in ("/health", "/v1/models", "/v1/sessions", "/v1/turns", "/openapi.json"):
+    for path in (
+        "/health",
+        "/v1/models",
+        "/v1/sessions",
+        "/v1/turns",
+        "/v1/artifacts",
+        "/v1/schedules",
+        "/v1/fs",
+        "/v1/usage",
+        "/v1/config",
+        "/openapi.json",
+    ):
         assert path in spec["paths"]
 
 
@@ -120,3 +131,38 @@ def test_extract_prompt_merges_text_parts() -> None:
     assert ACPServer._extract_prompt([{"type": "text", "text": "a"}, {"type": "image"}, {"type": "text", "text": "b"}]) == "a\nb"
     assert ACPServer._extract_prompt("hi") == "hi"
     assert ACPServer._extract_prompt([]) == ""
+
+@pytest.mark.asyncio
+async def test_acp_modes_and_model_state(tmp_path: Path) -> None:
+    server = ACPServer(workspace=tmp_path)
+
+    async def notify(_payload: dict[str, Any]) -> None:
+        return None
+
+    created = await server.handle(
+        {"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {}}, notify
+    )
+    assert created["result"]["modes"]["currentModeId"] == "build"
+    session_id = created["result"]["sessionId"]
+    mode = await server.handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/set_mode",
+            "params": {"sessionId": session_id, "modeId": "plan"},
+        },
+        notify,
+    )
+    assert mode["result"] is None
+    assert server.modes[session_id] == "plan"
+    model = await server.handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/set_model",
+            "params": {"sessionId": session_id, "modelId": "openai/gpt-4.1"},
+        },
+        notify,
+    )
+    assert model["result"] is None
+    assert server.models[session_id] == "openai/gpt-4.1"

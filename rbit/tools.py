@@ -433,6 +433,7 @@ class ToolExecutor:
         lsp: Any = None,
         plugins: Any = None,
         http_client: Any = None,
+        question_cb: Callable[[str, list[str]], Awaitable[str | None]] | None = None,
     ) -> None:
         self.workspace = workspace.resolve()
         self.session = session
@@ -445,6 +446,8 @@ class ToolExecutor:
         self.lsp = lsp
         self.plugins = plugins
         self.http_client = http_client
+        self.question_cb = question_cb
+        self._terminal_shell = None
         self.undo_stack: list[FileSnapshot] = []
         self.redo_stack: list[FileSnapshot] = []
         self.always_allow_bash: bool = False
@@ -615,6 +618,10 @@ class ToolExecutor:
             requests.append(("subagent", agent))
             requests.append(("task", agent))
         elif name == "bash":
+            command = str(args.get("command") or "").strip()
+            if command:
+                requests.append(("shell", command))
+        elif name == "terminal":
             command = str(args.get("command") or "").strip()
             if command:
                 requests.append(("shell", command))
@@ -988,7 +995,7 @@ class ToolExecutor:
         t0 = time.perf_counter()
         is_mcp = self.mcp is not None and name in getattr(self.mcp, "tool_names", set())
         if self.session_readonly and (
-            is_mcp or name in ("write", "edit", "multi_edit", "apply_patch", "notebook") or name == "bash"
+            is_mcp or name in ("write", "edit", "multi_edit", "apply_patch", "notebook", "terminal", "image_generate") or name == "bash"
         ):
             return ToolResult(
                 ok=False,
@@ -1051,6 +1058,18 @@ class ToolExecutor:
                 res = await self._tool_diagnostics(args)
             elif name == "skill":
                 res = await asyncio.to_thread(self._tool_skill, args)
+            elif name == "artifact":
+                res = await asyncio.to_thread(self._tool_artifact, args)
+            elif name == "schedule":
+                res = await asyncio.to_thread(self._tool_schedule, args)
+            elif name == "question":
+                res = await self._tool_question(args)
+            elif name == "terminal":
+                res = await self._tool_terminal(args)
+            elif name == "image_generate":
+                res = await self._tool_image_generate(args)
+            elif name == "mcp_resource":
+                res = await self._tool_mcp_resource(args)
             elif name == "lint":
                 res = await self._tool_lint(args)
             elif name == "notebook":
@@ -1940,6 +1959,241 @@ class ToolExecutor:
     def skill_tool_schema(self) -> dict[str, Any] | None:
         return skill_tool_schema(load_skills(self.workspace))
 
+    def _artifact_dir(self) -> Path:
+        return self.storage.state_dir / "artifacts"
+
+    def _artifact_path(self, name: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name.strip()).strip("-.") or "artifact"
+        if not Path(safe).suffix:
+            safe += ".md"
+        return self._artifact_dir() / safe
+
+    def _tool_artifact(self, args: dict[str, Any]) -> ToolResult:
+        action = str(args.get("action") or "create").strip().lower()
+        directory = self._artifact_dir()
+        if action == "list":
+            if not directory.is_dir():
+                return ToolResult(True, "0 artifacts", "No artifacts yet.")
+            rows = []
+            for path in sorted(directory.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True):
+                if path.is_file():
+                    rows.append(f"- {path.name} ({path.stat().st_size} bytes)")
+            return ToolResult(True, f"{len(rows)} artifact(s)", "\n".join(rows) or "No artifacts yet.")
+        name = str(args.get("name") or args.get("filePath") or "").strip()
+        if not name:
+            return ToolResult(False, "missing name", "`name` is required for artifact create/read/delete.")
+        path = self._artifact_path(name)
+        if action in ("read", "get"):
+            if not path.exists():
+                return ToolResult(False, f"artifact not found: {name}", f"No artifact at {path.name}.")
+            text = path.read_text(encoding="utf-8", errors="replace")[:60_000]
+            return ToolResult(True, f"artifact {path.name} ({len(text)} chars)", text)
+        if action in ("delete", "remove"):
+            if not path.exists():
+                return ToolResult(False, f"artifact not found: {name}", f"No artifact at {path.name}.")
+            path.unlink()
+            return ToolResult(True, f"artifact deleted: {path.name}", f"Deleted {path.name}.")
+        if action in ("create", "write"):
+            content = str(args.get("content") or "")
+            directory.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            rel = self.rel_display(path)
+            return ToolResult(True, f"artifact {path.name} ({len(content)} chars)", f"Saved artifact: {rel}")
+        return ToolResult(
+            False,
+            f"unknown artifact action: {action}",
+            "Use action=create|read|list|delete.",
+        )
+
+    def _tool_schedule(self, args: dict[str, Any]) -> ToolResult:
+        from .scheduler import Scheduler
+
+        scheduler = Scheduler(self.workspace)
+        action = str(args.get("action") or "list").strip().lower()
+        if action == "list":
+            rows = scheduler.describe()
+            return ToolResult(True, f"{len(rows)} schedule(s)", "\n".join(rows) or "No schedules.")
+        if action in ("create", "add"):
+            entry, error = scheduler.add(
+                str(args.get("prompt") or ""),
+                str(args.get("schedule") or ""),
+                name=str(args.get("name") or ""),
+                model=str(args.get("model") or ""),
+                agent=str(args.get("agent") or "build"),
+            )
+            if entry is None:
+                return ToolResult(False, "schedule not created", error)
+            return ToolResult(
+                True,
+                f"schedule created: {entry['name']}",
+                f"Created schedule `{entry['id']}` ({entry['schedule']}).",
+            )
+        if action in ("remove", "delete"):
+            target = str(args.get("id") or args.get("name") or "").strip()
+            return ToolResult(
+                scheduler.remove(target),
+                f"schedule removed: {target}" if target else "missing id/name",
+                "Use action=list to see schedule IDs.",
+            )
+        return ToolResult(False, f"unknown schedule action: {action}", "Use action=create|list|remove.")
+
+    async def _tool_question(self, args: dict[str, Any]) -> ToolResult:
+        question = str(args.get("question") or "").strip()
+        if not question:
+            return ToolResult(False, "missing question", "`question` is required.")
+        raw_options = args.get("options")
+        if isinstance(raw_options, str):
+            options = [part.strip() for part in raw_options.split("|") if part.strip()]
+        elif isinstance(raw_options, list):
+            options = [str(part).strip() for part in raw_options if str(part).strip()]
+        else:
+            options = []
+        if self.question_cb is None:
+            choices = " Options: " + ", ".join(options) if options else ""
+            return ToolResult(
+                False,
+                "question unavailable in non-interactive mode",
+                f"Ask the user directly in your reply.{choices}",
+            )
+        answer = await self.question_cb(question, options)
+        if not answer:
+            return ToolResult(False, "question cancelled", "The user dismissed the question.")
+        return ToolResult(True, "answer received", answer)
+
+    async def _tool_terminal(self, args: dict[str, Any]) -> ToolResult:
+        from .terminal import PersistentShell, TerminalError
+
+        action = str(args.get("action") or "run").strip().lower()
+        if self._terminal_shell is None:
+            self._terminal_shell = PersistentShell(self.workspace)
+        shell: PersistentShell = self._terminal_shell
+        if action == "close":
+            await shell.close()
+            return ToolResult(True, "terminal closed", "Persistent terminal closed.")
+        if action in ("start", "open"):
+            try:
+                await shell.start()
+            except (OSError, TerminalError) as exc:
+                return ToolResult(False, "terminal start failed", str(exc))
+            return ToolResult(True, "terminal started", "Persistent terminal started.")
+        command = str(args.get("command") or "").strip()
+        if not command:
+            return ToolResult(False, "missing command", "`command` is required.")
+        try:
+            output = await shell.run(command)
+        except (OSError, TerminalError) as exc:
+            return ToolResult(False, "terminal failed", str(exc))
+        return ToolResult(True, f"terminal: {len(output)} chars", output or "(no output)")
+
+    async def _tool_image_generate(self, args: dict[str, Any]) -> ToolResult:
+        import base64
+
+        prompt = str(args.get("prompt") or "").strip()
+        if not prompt:
+            return ToolResult(False, "missing prompt", "`prompt` is required.")
+        config = self.get_config() if self.get_config is not None else {}
+        image_cfg = config.get("image") if isinstance(config.get("image"), dict) else {}
+        api_base = str(image_cfg.get("api_base") or config.get("api_base") or "https://api.openai.com/v1").rstrip("/")
+        api_base = api_base.removesuffix("/chat/completions")
+        api_key = str(image_cfg.get("api_key") or "").strip() or (
+            self.storage.resolve_api_key(config) if self.storage else ""
+        )
+        if not api_key:
+            return ToolResult(False, "image_generate: missing API key", "Configure `image.api_key` or the provider key.")
+        model = str(image_cfg.get("model") or args.get("model") or "gpt-image-1")
+        size = str(args.get("size") or "1024x1024")
+        body = {"model": model, "prompt": prompt, "size": size, "n": 1, "response_format": "b64_json"}
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        try:
+            if self.http_client is not None:
+                response = await self.http_client.post(f"{api_base}/images/generations", headers=headers, json=body)
+            else:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    response = await client.post(f"{api_base}/images/generations", headers=headers, json=body)
+        except httpx.HTTPError as exc:
+            return ToolResult(False, "image_generate failed", str(exc))
+        if response.status_code >= 400:
+            return ToolResult(False, f"image_generate HTTP {response.status_code}", response.text[:500])
+        try:
+            data = response.json()["data"][0]
+        except (ValueError, KeyError, IndexError, TypeError):
+            return ToolResult(False, "image_generate: malformed response", response.text[:300])
+        raw: bytes
+        if data.get("b64_json"):
+            raw = base64.b64decode(data["b64_json"])
+        elif data.get("url"):
+            url = str(data["url"])
+            if self.http_client is not None:
+                fetched = await self.http_client.get(url)
+            else:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    fetched = await client.get(url)
+            if fetched.status_code >= 400:
+                return ToolResult(False, "image download failed", f"HTTP {fetched.status_code}")
+            raw = fetched.content
+        else:
+            return ToolResult(False, "image_generate: no image data", "Provider returned neither b64_json nor url.")
+        name = str(args.get("name") or "generated").strip()
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or "generated"
+        if not Path(safe).suffix:
+            safe += ".png"
+        directory = self.storage.state_dir / "artifacts"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / safe
+        path.write_bytes(raw)
+        return ToolResult(True, f"image saved: {path.name} ({len(raw) // 1024} KiB)", f"Saved image artifact: {path}")
+
+    async def _tool_mcp_resource(self, args: dict[str, Any]) -> ToolResult:
+        if self.mcp is None or not getattr(self.mcp, "clients", {}):
+            return ToolResult(False, "no MCP servers", "Configure an MCP server first (`rbit mcp add`).")
+        action = str(args.get("action") or "list").strip().lower()
+        if action == "list":
+            resources = await self.mcp.list_resources()
+            rows = [
+                f"{server}: {item.get('uri')} ({item.get('name') or 'resource'})"
+                for server, items in resources.items()
+                for item in items
+            ]
+            return ToolResult(True, f"{len(rows)} MCP resource(s)", "\n".join(rows) or "No resources.")
+        if action == "read":
+            server = str(args.get("server") or "").strip()
+            uri = str(args.get("uri") or "").strip()
+            if not server or not uri:
+                return ToolResult(False, "missing server/uri", "Both `server` and `uri` are required.")
+            try:
+                result = await self.mcp.read_resource(server, uri)
+            except Exception as exc:  # noqa: BLE001 - MCP errors are user-facing
+                return ToolResult(False, "MCP resource read failed", str(exc))
+            contents = result.get("contents") if isinstance(result, dict) else None
+            if isinstance(contents, list):
+                text = "\n\n".join(
+                    str(item.get("text") or item.get("blob") or "") for item in contents if isinstance(item, dict)
+                )
+            else:
+                text = str(result)
+            return ToolResult(True, f"MCP resource: {uri}", text)
+        return ToolResult(False, f"unknown mcp_resource action: {action}", "Use action=list|read.")
+
+    def mcp_resource_schema(self) -> dict[str, Any] | None:
+        if self.mcp is None or not getattr(self.mcp, "clients", {}):
+            return None
+        return {
+            "type": "function",
+            "function": {
+                "name": "mcp_resource",
+                "description": "List or read MCP resources from configured servers.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "read"]},
+                        "server": {"type": "string"},
+                        "uri": {"type": "string"},
+                    },
+                    "required": ["action"],
+                },
+            },
+        }
+
     def _tool_notebook(self, args: dict[str, Any]) -> ToolResult:
         """Cell-level access to .ipynb files: read / set_cell / insert_cell / delete_cell."""
         raw = args.get("filePath") or args.get("path")
@@ -2105,7 +2359,8 @@ class ToolExecutor:
 
     async def _tool_websearch(self, args: dict[str, Any]) -> ToolResult:
         config = self.get_config() if self.get_config is not None else {}
-        if config.get("websearch") is False:
+        setting = config.get("websearch")
+        if setting is False:
             return ToolResult(False, "websearch disabled", "Enable `websearch` in `.rbit/config.json`.")
         query = str(args.get("query") or args.get("q") or "").strip()
         if not query:
@@ -2115,10 +2370,106 @@ class ToolExecutor:
         except (TypeError, ValueError):
             limit = 6
         limit = max(1, min(10, limit))
-        cache_key = f"{query.lower()}::{limit}"
+        provider = ""
+        api_key = ""
+        if isinstance(setting, dict):
+            provider = str(setting.get("provider") or "").lower()
+            api_key = str(setting.get("api_key") or "")
+        provider = provider or "duckduckgo"
+        cache_key = f"{provider}::{query.lower()}::{limit}"
         cached = self._websearch_cache.get(cache_key)
         if cached and time.time() - cached[0] < 300:
             return ToolResult(True, f"cached websearch: {limit} result(s)", cached[1])
+        errors: list[str] = []
+        items: list[dict[str, str]] = []
+        if provider in ("duckduckgo", "ddg", "auto"):
+            items, errors = await self._search_duckduckgo(query, limit)
+        elif provider in ("tavily", "exa", "firecrawl"):
+            key = api_key or os.environ.get(f"{provider.upper()}_API_KEY", "")
+            if not key:
+                errors.append(f"{provider}: api_key is missing")
+            else:
+                try:
+                    items = await self._search_api(provider, query, limit, key)
+                except httpx.HTTPError as exc:
+                    errors.append(f"{provider}: {exc}")
+        else:
+            errors.append(f"unknown websearch provider: {provider}")
+        if items:
+            text = self._format_search_results(items, limit)
+            self._websearch_cache[cache_key] = (time.time(), text)
+            return ToolResult(True, f"{min(len(items), limit)} result(s) for: {query}", text)
+        if provider not in ("duckduckgo", "ddg", "auto"):
+            items, fallback_errors = await self._search_duckduckgo(query, limit)
+            if items:
+                text = self._format_search_results(items, limit)
+                self._websearch_cache[cache_key] = (time.time(), text)
+                return ToolResult(True, f"{min(len(items), limit)} result(s) for: {query} (DDG fallback)", text)
+            errors.extend(fallback_errors)
+        return ToolResult(
+            False,
+            f"websearch failed for: {query}",
+            "No results. " + ("; ".join(errors[-3:]) if errors else "Try a different query."),
+        )
+
+    @staticmethod
+    def _format_search_results(items: list[dict[str, str]], limit: int) -> str:
+        lines: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            target = str(item.get("url") or "")
+            if not target.startswith(("http://", "https://")) or target in seen:
+                continue
+            seen.add(target)
+            title = item.get("title") or target
+            snippet = str(item.get("snippet") or "").strip()
+            lines.append(f"{len(lines) + 1}. {title}\n   {target}\n   {snippet}".rstrip())
+            if len(lines) >= limit:
+                break
+        return "\n\n".join(lines)
+
+    async def _search_api(self, provider: str, query: str, limit: int, key: str) -> list[dict[str, str]]:
+        if provider == "tavily":
+            url = "https://api.tavily.com/search"
+            headers = {"Content-Type": "application/json"}
+            body = {"api_key": key, "query": query, "max_results": limit, "search_depth": "basic"}
+        elif provider == "exa":
+            url = "https://api.exa.ai/search"
+            headers = {"Content-Type": "application/json", "x-api-key": key}
+            body = {"query": query, "numResults": limit, "contents": {"text": True}}
+        else:
+            url = "https://api.firecrawl.dev/v1/search"
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
+            body = {"query": query, "limit": limit}
+        if self.http_client is not None:
+            response = await self.http_client.post(url, headers=headers, json=body)
+        else:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(url, headers=headers, json=body)
+        if response.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"{provider} HTTP {response.status_code}: {response.text[:160]}",
+                request=response.request,
+                response=response,
+            )
+        data = response.json()
+        rows = data.get("results") if isinstance(data, dict) else None
+        if rows is None and isinstance(data, dict):
+            rows = data.get("data")
+        results: list[dict[str, str]] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            results.append(
+                {
+                    "title": str(row.get("title") or row.get("name") or ""),
+                    "url": str(row.get("url") or row.get("link") or ""),
+                    "snippet": str(row.get("content") or row.get("text") or row.get("description") or row.get("markdown") or ""),
+                }
+            )
+        return results
+
+    async def _search_duckduckgo(self, query: str, limit: int) -> tuple[list[dict[str, str]], list[str]]:
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -2145,28 +2496,18 @@ class ToolExecutor:
                 continue
             parser = _SearchResultsParser()
             parser.feed(resp.text)
-            results: list[str] = []
-            seen: set[str] = set()
-            for item in parser.results:
-                target = _clean_search_url(item.get("url", ""))
-                if not target.startswith(("http://", "https://")) or target in seen:
-                    continue
-                seen.add(target)
-                title = item.get("title") or target
-                snippet = item.get("snippet") or ""
-                results.append(f"{len(results) + 1}. {title}\n   {target}\n   {snippet}".rstrip())
-                if len(results) >= limit:
-                    break
-            if results:
-                text = "\n\n".join(results)
-                self._websearch_cache[cache_key] = (time.time(), text)
-                return ToolResult(True, f"{len(results)} result(s) for: {query}", text)
+            items = [
+                {
+                    "title": item.get("title", ""),
+                    "url": _clean_search_url(item.get("url", "")),
+                    "snippet": item.get("snippet", ""),
+                }
+                for item in parser.results
+            ]
+            if any(str(item.get("url", "")).startswith(("http://", "https://")) for item in items):
+                return items, errors
             errors.append(f"{url}: no results parsed")
-        return ToolResult(
-            False,
-            f"websearch failed for: {query}",
-            "No results. " + ("; ".join(errors[-2:]) if errors else "Try a different query."),
-        )
+        return [], errors
 
     def _sandbox_violation(self, command: str) -> str | None:
         """Best-effort path sandbox: block workspace escapes in bash commands.
@@ -2582,6 +2923,89 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                     "num_results": {"type": "integer", "minimum": 1, "maximum": 10},
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "image_generate",
+            "description": "Generate an image from a prompt and save it under .rbit/artifacts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "size": {"type": "string"},
+                    "name": {"type": "string"},
+                    "model": {"type": "string"},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal",
+            "description": "Run commands in a persistent shell session (start/run/close).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["run", "start", "close"]},
+                    "command": {"type": "string"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "question",
+            "description": "Ask the user a question, optionally with multiple-choice options.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule",
+            "description": "Create, list, or remove scheduled prompts (every 30m, daily 09:30, or ISO datetime).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["create", "list", "remove"]},
+                    "prompt": {"type": "string"},
+                    "schedule": {"type": "string"},
+                    "name": {"type": "string"},
+                    "id": {"type": "string"},
+                    "model": {"type": "string"},
+                    "agent": {"type": "string"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "artifact",
+            "description": "Create, read, list, or delete reusable artifacts stored in .rbit/artifacts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["create", "read", "list", "delete"]},
+                    "name": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["action"],
             },
         },
     },

@@ -879,3 +879,43 @@ class PermissionModal(ModalScreen[str]):
 
     def action_deny(self) -> None:
         self.dismiss("deny")
+
+class QuestionModal(ModalScreen[str | None]):
+    """Free-form/multiple-choice question from the agent."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, question: str, options: list[str]) -> None:
+        super().__init__()
+        self.question = question
+        self.options = options
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="oc-modal"):
+            yield Static(_modal_header("Agent question"), classes="oc-modal-header")
+            yield Static(self.question, classes="oc-perm-body")
+            if self.options:
+                yield OptionList(
+                    *[Option(option, id=str(index)) for index, option in enumerate(self.options)],
+                    id="question-options",
+                )
+            yield Input(placeholder="Type an answer...", id="question-input")
+            yield Label("enter submit   esc cancel", classes="oc-modal-foot")
+
+    def on_mount(self) -> None:
+        if self.options:
+            self.query_one("#question-options", OptionList).focus()
+        else:
+            self.query_one("#question-input", Input).focus()
+
+    @on(OptionList.OptionSelected, "#question-options")
+    def _option_selected(self, event: OptionList.OptionSelected) -> None:
+        index = int(event.option.id or 0)
+        self.dismiss(self.options[index] if 0 <= index < len(self.options) else None)
+
+    @on(Input.Submitted, "#question-input")
+    def _submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

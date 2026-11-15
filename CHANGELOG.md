@@ -8,6 +8,18 @@ All notable changes to rbit are documented here. The format follows
 
 ### Added
 
+- Agent parity additions: `question` tool (TUI modal, clear non-interactive
+  fallback), `artifact` storage/tool, `schedule` tool + `rbit schedule`
+  (`list/add/remove/run-due`), auto-compaction for headless runs, model variants
+  (`provider/model#low|medium|high`), and multi-provider websearch
+  (Exa/Tavily/Firecrawl with DuckDuckGo fallback).
+- Tools for terminal sessions (`terminal`), image generation (`image_generate`) and artifacts/schedules, plus model variants and multi-provider websearch.
+- Cron-style schedules, schedule runner lock, MCP resource list/read tool, ACP session replay, terminal/image tools.
+- Native Anthropic Messages API support (`protocol: anthropic`) with tool_use/tool_result loop.
+- Server API additions: `/v1/artifacts`, `/v1/schedules`, `/v1/fs`, `/v1/usage`,
+  `/v1/config`, `/v1/skills`, `/v1/vcs/status`, `/v1/reload`, plus OpenAPI IDs.
+- ACP: session modes (`build`/`plan`), per-session model selection, auto-approved
+  tool permissions for editor clients.
 - CLI parity: background `rbit service` (start/stop/status/restart/get/set/unset),
   OpenAPI-driven `rbit api`, `rbit debug` (agents/config/paths/heap-dump), package
   plugins (`rbit plugin add/list/check/update/remove`), multi-credential auth

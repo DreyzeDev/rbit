@@ -32,6 +32,8 @@ class ACPServer:
         self.sessions: dict[str, Session] = {}
         self.session_workspaces: dict[str, Path] = {}
         self.cancelled: set[str] = set()
+        self.modes: dict[str, str] = {}
+        self.models: dict[str, str] = {}
 
     async def _default_runner(
         self,
@@ -45,6 +47,12 @@ class ACPServer:
         workspace = self.session_workspaces.get(session_id, self.workspace)
         storage = StorageManager(workspace)
         executor = ToolExecutor(workspace=workspace, session=session, storage=storage)
+        executor.always_allow_bash = True
+
+        async def _allow(_tool: str, _detail: str) -> bool:
+            return True
+
+        executor.permission_cb = _allow
         engine = AgentEngine(workspace=workspace, executor=executor, storage=storage)
         user_msg = ChatMessage(id=short_id(), role="user", content=prompt)
         session.messages.append(user_msg)
@@ -62,8 +70,8 @@ class ACPServer:
         reply = await engine.run_turn(
             session=session,
             user_msg=user_msg,
-            agent_mode="build",
-            model_id=str(storage.load_config().get("model", "rbit/smart-local")),
+            agent_mode=self.modes.get(session_id, "build"),
+            model_id=self.models.get(session_id) or str(storage.load_config().get("model", "rbit/smart-local")),
             on_tool_start=_noop,
             on_tool_end=_noop,
             on_status=_status,
@@ -100,12 +108,42 @@ class ACPServer:
             cwd = Path(params.get("cwd") or self.workspace)
             self.sessions[session_id] = Session(id=session_id)
             self.session_workspaces[session_id] = cwd
-            return {"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": session_id}}
+            self.modes[session_id] = "build"
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "sessionId": session_id,
+                    "modes": {
+                        "currentModeId": "build",
+                        "availableModes": [
+                            {"id": "build", "name": "Build", "description": "Full access"},
+                            {"id": "plan", "name": "Plan", "description": "Read-only planning"},
+                        ],
+                    },
+                },
+            }
         if method == "session/load":
             session_id = str(params.get("sessionId") or "")
             if session_id not in self.sessions:
                 self.sessions[session_id] = Session(id=session_id)
             self.session_workspaces.setdefault(session_id, Path(params.get("cwd") or self.workspace))
+            for message in self.sessions[session_id].messages:
+                if message.role not in ("user", "assistant") or not message.content:
+                    continue
+                await notify(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk" if message.role == "assistant" else "user_message_chunk",
+                                "content": {"type": "text", "text": message.content},
+                            },
+                        },
+                    }
+                )
             return {"jsonrpc": "2.0", "id": request_id, "result": None}
         if method == "session/prompt":
             session_id = str(params.get("sessionId") or "")
@@ -151,7 +189,18 @@ class ACPServer:
             session_id = str(params.get("sessionId") or "")
             self.cancelled.add(session_id)
             return None
-        if method in ("session/set_mode", "session/set_model"):
+        if method == "session/set_mode":
+            session_id = str(params.get("sessionId") or "")
+            mode = str(params.get("modeId") or params.get("mode") or "build").lower()
+            if mode not in ("build", "plan"):
+                return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "unknown mode"}}
+            self.modes[session_id] = mode
+            return {"jsonrpc": "2.0", "id": request_id, "result": None}
+        if method == "session/set_model":
+            session_id = str(params.get("sessionId") or "")
+            model_id = str(params.get("modelId") or params.get("model") or "")
+            if session_id and model_id:
+                self.models[session_id] = model_id
             return {"jsonrpc": "2.0", "id": request_id, "result": None}
         if request_id is not None:
             return {

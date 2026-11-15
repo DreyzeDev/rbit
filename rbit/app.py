@@ -37,6 +37,7 @@ from .modals import (
     HelpModal,
     ModelSelectorModal,
     PermissionModal,
+    QuestionModal,
     SearchResultsModal,
     SessionPickerModal,
     ThemeSelectorModal,
@@ -524,6 +525,7 @@ class RbitApp(App[None]):
             session=self.session,
             storage=self.storage,
             permission_cb=self._ask_permission,
+            question_cb=self._ask_question,
             get_config=lambda: self.config_data,
             on_todos_updated=self._on_todos_updated,
             on_files_updated=self._on_files_updated,
@@ -841,6 +843,9 @@ class RbitApp(App[None]):
 
     def _on_files_updated(self) -> None:
         self._sync_ui()
+
+    async def _ask_question(self, question: str, options: list[str]) -> str | None:
+        return await self.push_screen_wait(QuestionModal(question, options))
 
     async def _ask_permission(self, tool_name: str, detail: str) -> bool:
         choice = await self.push_screen_wait(

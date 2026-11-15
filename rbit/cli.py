@@ -145,6 +145,22 @@ async def _run_headless(args: argparse.Namespace) -> int:
     )
     await engine.refresh_ollama_models()
 
+    if cfg.get("auto_compact", True) and len(session.messages) >= 8:
+        info = get_model_info(model_id, engine.extra_models)
+        if info.context_window and session.total_tokens / info.context_window * 100 >= int(cfg.get("auto_compact_at", 85)):
+            older = list(session.messages[:-2])
+            if older:
+                summary_text = await engine.summarize_session(older, model_id)
+                summary_msg = ChatMessage(
+                    id=short_id(),
+                    role="assistant",
+                    content=f"**[Compacted]** {len(older)} earlier message(s) → handoff summary\n\n{summary_text}",
+                    agent=agent_mode,
+                    model=model_id,
+                )
+                session.messages = [summary_msg] + session.messages[-2:]
+                storage.save_session(session)
+
     user_msg = ChatMessage(
         id=short_id(),
         role="user",
@@ -1271,7 +1287,7 @@ def _run_init(workspace: Path, force: bool = False, as_json: bool = False) -> in
 
 COMMANDS = (
     "run mini doctor stats sessions session export import map lint init commit update upgrade uninstall "
-    "mcp acp serve service api debug plugin auth models agent pr web watch voice backup describe reload pair"
+    "mcp acp serve service api debug plugin auth models agent pr web watch voice backup describe schedule reload pair"
 )
 
 COMPLETION_SCRIPTS: dict[str, str] = {
@@ -1403,7 +1419,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "reload", "pair", "mini"}
+    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "schedule", "reload", "pair", "mini"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -1511,6 +1527,23 @@ def main(argv: list[str] | None = None) -> int:
             from rbit.acp import run_acp
 
             return asyncio.run(run_acp(_resolve_workspace(parsed.dir)))
+
+        if sub == "schedule":
+            p = argparse.ArgumentParser(prog="rbit schedule", description="Manage scheduled prompts")
+            sub2 = p.add_subparsers(dest="schedule_cmd")
+            sub2.add_parser("list", help="List schedules")
+            add_p = sub2.add_parser("add", help="Add a schedule")
+            add_p.add_argument("prompt")
+            add_p.add_argument("schedule", help="every 30m | daily 09:30 | ISO datetime")
+            add_p.add_argument("--name", default="")
+            add_p.add_argument("-m", "--model", default="")
+            add_p.add_argument("-a", "--agent", default="build")
+            remove_p = sub2.add_parser("remove", help="Remove a schedule")
+            remove_p.add_argument("target", help="Schedule id or name")
+            sub2.add_parser("run-due", help="Run all schedules that are due")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            return _run_schedule(parsed)
 
         if sub == "service":
             p = argparse.ArgumentParser(prog="rbit service", description="Manage the background rbit server")
@@ -1885,6 +1918,7 @@ def main(argv: list[str] | None = None) -> int:
             "  rbit api <op|METHOD path>   Call the running server (OpenAPI operations)\n"
             "  rbit plugin add|list|check|update|remove   Manage package plugins\n"
             "  rbit debug agents|config|paths|heap-dump   Debugging tools\n"
+            "  rbit schedule list|add|remove|run-due   Manage scheduled prompts\n"
             "  rbit auth login|list|switch|export|import   Multi-credential management\n"
             "  rbit mini              Minimal interactive interface\n"
             "  rbit pair              Pair a browser/app with the running server\n"
@@ -2087,6 +2121,18 @@ API_OPERATIONS: dict[str, tuple[str, str]] = {
     "turns.create": ("POST", "/v1/turns"),
     "approvals.create": ("POST", "/v1/approvals"),
     "config.reload": ("POST", "/v1/reload"),
+    "artifacts.list": ("GET", "/v1/artifacts"),
+    "artifacts.create": ("POST", "/v1/artifacts"),
+    "artifacts.get": ("GET", "/v1/artifacts/{name}"),
+    "artifacts.delete": ("DELETE", "/v1/artifacts/{name}"),
+    "schedules.list": ("GET", "/v1/schedules"),
+    "schedules.create": ("POST", "/v1/schedules"),
+    "schedules.delete": ("DELETE", "/v1/schedules/{id}"),
+    "fs.read": ("GET", "/v1/fs"),
+    "usage.get": ("GET", "/v1/usage"),
+    "config.get": ("GET", "/v1/config"),
+    "skills.list": ("GET", "/v1/skills"),
+    "vcs.status": ("GET", "/v1/vcs/status"),
 }
 
 
@@ -2462,6 +2508,103 @@ async def _run_mini(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_schedule(args: argparse.Namespace) -> int:
+    from rbit.scheduler import Scheduler
+
+    console = Console()
+    workspace = _resolve_workspace(getattr(args, "dir", None))
+    scheduler = Scheduler(workspace)
+    cmd = args.schedule_cmd or "list"
+    if cmd == "list":
+        rows = scheduler.describe()
+        console.print("\n".join(rows) if rows else "No schedules.")
+        return 0
+    if cmd == "add":
+        entry, error = scheduler.add(
+            args.prompt,
+            args.schedule,
+            name=args.name or "",
+            model=args.model or "",
+            agent=args.agent or "build",
+        )
+        if entry is None:
+            console.print(f"[red]schedule:[/] {error}")
+            return 1
+        console.print(f"created {entry['id']} ({entry['schedule']})")
+        return 0
+    if cmd == "remove":
+        removed = scheduler.remove(args.target)
+        console.print(("removed " if removed else "not found: ") + args.target)
+        return 0 if removed else 1
+    if cmd == "run-due":
+        return asyncio.run(_run_schedule_due(workspace))
+    console.print(f"unknown schedule command: {cmd}")
+    return 2
+
+
+async def _run_schedule_due(workspace: Path) -> int:
+    from rbit.scheduler import Scheduler
+
+    console = Console()
+    scheduler = Scheduler(workspace)
+    lock_path = workspace / ".rbit" / "schedules.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        console.print("Another schedule runner is active.")
+        return 1
+    try:
+        os.write(lock_fd, str(os.getpid()).encode())
+        os.close(lock_fd)
+        entries = scheduler.due()
+        if not entries:
+            console.print("No scheduled prompts are due.")
+            return 0
+        storage = StorageManager(workspace)
+        cfg = storage.load_config()
+        ran = 0
+        for entry in entries:
+            session = Session(title=f"Schedule: {entry.get('name') or entry.get('id')}")
+            executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=lambda: cfg)
+            executor.always_allow_bash = True
+            engine = AgentEngine(workspace=workspace, executor=executor, get_config=lambda: cfg, storage=storage)
+            user = ChatMessage(id=short_id(), role="user", content=str(entry.get("prompt") or ""))
+            session.messages.append(user)
+
+            async def _noop(_record: Any) -> None:
+                return None
+
+            async def _status(_text: str) -> None:
+                return None
+
+            model_id = str(entry.get("model") or cfg.get("model", "rbit/smart-local"))
+            reply = await engine.run_turn(
+                session=session,
+                user_msg=user,
+                agent_mode=str(entry.get("agent") or "build"),
+                model_id=model_id,
+                on_tool_start=_noop,
+                on_tool_end=_noop,
+                on_status=_status,
+            )
+            session.messages.append(reply)
+            storage.save_session(session)
+            recurring = str(entry.get("schedule") or "").lower().startswith(("every", "daily")) or len(
+                str(entry.get("schedule") or "").split()
+            ) == 5
+            next_run = scheduler.next_run(str(entry.get("schedule") or ""), after=time.time() + 1) if recurring else None
+            scheduler.mark_run(str(entry.get("id")), next_run=next_run)
+            console.print(f"ran {entry.get('name')}: {reply.content[:200]}")
+            ran += 1
+        return 0 if ran else 1
+    finally:
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+
 def build_openapi_spec() -> dict:
     """OpenAPI 3.1 description of the local `rbit serve` API."""
     return {
@@ -2554,6 +2697,36 @@ def build_openapi_spec() -> dict:
                     "requestBody": {"content": {"application/json": {}}},
                     "responses": {"200": {"description": "Recorded"}},
                 }
+            },
+            "/v1/artifacts": {
+                "get": {"operationId": "artifacts.list", "summary": "List artifacts", "responses": {"200": {"description": "Artifacts"}}},
+                "post": {"operationId": "artifacts.create", "summary": "Create an artifact", "responses": {"201": {"description": "Created"}}},
+            },
+            "/v1/artifacts/{name}": {
+                "get": {"operationId": "artifacts.get", "summary": "Read an artifact", "responses": {"200": {"description": "Artifact"}}},
+                "delete": {"operationId": "artifacts.delete", "summary": "Delete an artifact", "responses": {"200": {"description": "Deleted"}}},
+            },
+            "/v1/schedules": {
+                "get": {"operationId": "schedules.list", "summary": "List schedules", "responses": {"200": {"description": "Schedules"}}},
+                "post": {"operationId": "schedules.create", "summary": "Create a schedule", "responses": {"201": {"description": "Created"}}},
+            },
+            "/v1/schedules/{id}": {
+                "delete": {"operationId": "schedules.delete", "summary": "Delete a schedule", "responses": {"200": {"description": "Deleted"}}},
+            },
+            "/v1/fs": {
+                "get": {"operationId": "fs.read", "summary": "Read a file or directory inside the workspace", "responses": {"200": {"description": "FS entry"}}},
+            },
+            "/v1/usage": {
+                "get": {"operationId": "usage.get", "summary": "Aggregate usage", "responses": {"200": {"description": "Usage"}}},
+            },
+            "/v1/config": {
+                "get": {"operationId": "config.get", "summary": "Effective redacted configuration", "responses": {"200": {"description": "Config"}}},
+            },
+            "/v1/skills": {
+                "get": {"operationId": "skills.list", "summary": "List skills", "responses": {"200": {"description": "Skills"}}},
+            },
+            "/v1/vcs/status": {
+                "get": {"operationId": "vcs.status", "summary": "Git status", "responses": {"200": {"description": "Status"}}},
             },
             "/openapi.json": {"get": {"summary": "This document", "responses": {"200": {"description": "OpenAPI"}}}},
         },
@@ -2700,6 +2873,15 @@ def _run_serve(
         def log_message(self, *a) -> None:  # quiet
             return
 
+        def _send_json(self, payload: Any, status: int = 200) -> None:
+            body = _json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+            self.send_response(status)
+            self._cors()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def _cors(self) -> None:
             origin = self.headers.get("Origin", "")
             allowed = origin if origin and cors_origins and origin in cors_origins else "*"
@@ -2730,6 +2912,86 @@ def _run_serve(
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif self.path.startswith("/v1/artifacts"):
+                from urllib.parse import unquote
+
+                artifact_dir = storage.state_dir / "artifacts"
+                name = unquote(self.path.split("/v1/artifacts", 1)[1].strip("/"))
+                if not name:
+                    entries = []
+                    if artifact_dir.is_dir():
+                        for path in sorted(artifact_dir.iterdir()):
+                            if path.is_file():
+                                entries.append({"name": path.name, "size": path.stat().st_size})
+                    self._send_json({"artifacts": entries})
+                else:
+                    safe = Path(name).name
+                    path = artifact_dir / safe
+                    if not path.is_file():
+                        self._send_json({"error": "artifact not found"}, 404)
+                    else:
+                        self._send_json({"name": safe, "content": path.read_text(encoding="utf-8", errors="replace")})
+            elif self.path == "/v1/schedules":
+                from rbit.scheduler import Scheduler
+
+                self._send_json({"schedules": Scheduler(workspace).load()})
+            elif self.path.startswith("/v1/fs"):
+                from urllib.parse import parse_qs, unquote, urlparse
+
+                query = parse_qs(urlparse(self.path).query)
+                raw = unquote((query.get("path") or ["."])[0])
+                try:
+                    target = (workspace / raw).resolve() if not Path(raw).is_absolute() else Path(raw).resolve()
+                    target.relative_to(workspace)
+                except (ValueError, OSError):
+                    self._send_json({"error": "path outside workspace"}, 403)
+                else:
+                    if target.is_dir():
+                        entries = [
+                            {"name": child.name, "type": "dir" if child.is_dir() else "file"}
+                            for child in sorted(target.iterdir())[:500]
+                        ]
+                        self._send_json({"path": str(target.relative_to(workspace)), "entries": entries})
+                    elif target.is_file():
+                        self._send_json(
+                            {
+                                "path": str(target.relative_to(workspace)),
+                                "content": target.read_text(encoding="utf-8", errors="replace")[:200_000],
+                            }
+                        )
+                    else:
+                        self._send_json({"error": "not found"}, 404)
+            elif self.path == "/v1/usage":
+                stored = storage.list_sessions(include_archived=True)
+                self._send_json(
+                    {
+                        "sessions": len(stored),
+                        "messages": sum(len(session.messages) for session in stored),
+                        "tokens": sum(session.total_tokens for session in stored),
+                        "tool_calls": sum(
+                            len(message.tool_calls) for session in stored for message in session.messages
+                        ),
+                    }
+                )
+            elif self.path == "/v1/config":
+                redacted = dict(cfg)
+                if redacted.get("api_key"):
+                    redacted["api_key"] = "***"
+                for profile in (redacted.get("profiles") or {}).values():
+                    if isinstance(profile, dict) and profile.get("api_key"):
+                        profile["api_key"] = "***"
+                self._send_json(redacted)
+            elif self.path == "/v1/skills":
+                from rbit.skills import load_skills
+
+                self._send_json({"skills": load_skills(workspace)})
+            elif self.path == "/v1/vcs/status":
+                import subprocess as _sp
+
+                proc = _sp.run(
+                    ["git", "status", "--porcelain"], cwd=str(workspace), capture_output=True, text=True, check=False
+                )
+                self._send_json({"ok": proc.returncode == 0, "status": proc.stdout})
             elif self.path in ("/", "/index.html"):
                 renderer = Path(__file__).resolve().parent.parent / "desktop" / "renderer" / "index.html"
                 if renderer.exists():
@@ -2858,6 +3120,44 @@ def _run_serve(
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if self.path == "/v1/artifacts":
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    req = _json.loads(self.rfile.read(length) or b"{}")
+                except ValueError:
+                    req = {}
+                name = str(req.get("name") or "").strip()
+                if not name:
+                    self._send_json({"error": "name is required"}, 422)
+                    return
+                safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or "artifact"
+                if not Path(safe).suffix:
+                    safe += ".md"
+                directory = storage.state_dir / "artifacts"
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / safe).write_text(str(req.get("content") or ""), encoding="utf-8")
+                self._send_json({"name": safe, "size": (directory / safe).stat().st_size}, 201)
+                return
+            if self.path == "/v1/schedules":
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    req = _json.loads(self.rfile.read(length) or b"{}")
+                except ValueError:
+                    req = {}
+                from rbit.scheduler import Scheduler
+
+                entry, error = Scheduler(workspace).add(
+                    str(req.get("prompt") or ""),
+                    str(req.get("schedule") or ""),
+                    name=str(req.get("name") or ""),
+                    model=str(req.get("model") or ""),
+                    agent=str(req.get("agent") or "build"),
+                )
+                if entry is None:
+                    self._send_json({"error": error}, 422)
+                else:
+                    self._send_json({"schedule": entry}, 201)
+                return
             if self.path == "/v1/sessions":
                 length = int(self.headers.get("Content-Length") or 0)
                 try:
@@ -2970,6 +3270,23 @@ def _run_serve(
                 self.wfile.flush()
 
         def do_DELETE(self) -> None:  # noqa: N802
+            if self.path.startswith("/v1/schedules/"):
+                from rbit.scheduler import Scheduler
+
+                target = self.path.rsplit("/", 1)[-1]
+                ok = Scheduler(workspace).remove(target)
+                self._send_json({"deleted": ok, "id": target}, 200 if ok else 404)
+                return
+            if self.path.startswith("/v1/artifacts/"):
+                from urllib.parse import unquote
+
+                name = Path(unquote(self.path.rsplit("/", 1)[-1])).name
+                path = storage.state_dir / "artifacts" / name
+                ok = path.is_file()
+                if ok:
+                    path.unlink()
+                self._send_json({"deleted": ok, "name": name}, 200 if ok else 404)
+                return
             if not self.path.startswith("/v1/sessions/"):
                 self.send_response(404)
                 self.end_headers()
