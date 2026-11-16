@@ -291,8 +291,9 @@ struct ChatView: View {
                 .foregroundStyle(Color.rbitDim)
                 .multilineTextAlignment(.center)
             if !app.connection.isOnline {
-                Button("Подключить ПК") {
-                    app.isAddServerPresented = true
+                Button("Открыть настройки") {
+                    dismiss()
+                    app.selectedTab = .settings
                 }
                 .buttonStyle(RbitGhostButtonStyle())
             }
@@ -374,8 +375,9 @@ struct ChatView: View {
                         .font(RbitFont.mono(10))
                         .foregroundStyle(Color.rbitDim)
                     Spacer()
-                    Button("Повторить") {
-                        app.reconnect()
+                    Button("Настройки") {
+                        dismiss()
+                        app.selectedTab = .settings
                     }
                     .font(RbitFont.mono(10, weight: .semibold))
                     .foregroundStyle(Color.rbitAccent)

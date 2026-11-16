@@ -27,7 +27,6 @@ final class AppState: ObservableObject {
     private var streamTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
     private var toastTask: Task<Void, Never>?
-    private var onboardingTask: Task<Void, Never>?
 
     init() {
         let loaded = AppSettings.load()
@@ -37,13 +36,7 @@ final class AppState: ObservableObject {
             KeychainStore.deleteToken()
         }
 
-        if loaded.serverURL.isEmpty {
-            onboardingTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 750_000_000)
-                guard let self, !Task.isCancelled, self.settings.serverURL.isEmpty else { return }
-                self.isAddServerPresented = true
-            }
-        } else {
+        if !loaded.serverURL.isEmpty {
             Task { [weak self] in
                 await self?.bootstrap()
             }
@@ -255,7 +248,8 @@ final class AppState: ObservableObject {
 
     func reconnect() {
         guard !settings.serverURL.isEmpty else {
-            isAddServerPresented = true
+            selectedTab = .settings
+            showToast("Подключите rbit CLI в Настройках.", .info)
             return
         }
         Task { [weak self] in
@@ -290,7 +284,6 @@ final class AppState: ObservableObject {
         settings.modelID = ""
         settings.hasConnectedOnce = false
         saveSettings()
-        isAddServerPresented = true
     }
 
     func setModel(_ id: String) {
@@ -322,7 +315,8 @@ final class AppState: ObservableObject {
     func handlePairingURL(_ url: URL) {
         guard let link = PairingLink(url: url) else { return }
         incomingPairing = link
-        isAddServerPresented = true
+        selectedTab = .settings
+        showToast("Ссылка подключения получена. Откройте Настройки → Подключение.", .info)
     }
 
     func openSession(_ summary: SessionSummary) {
@@ -371,7 +365,12 @@ final class AppState: ObservableObject {
         let prompt = rawPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return false }
         guard let client else {
-            isAddServerPresented = true
+            selectedTab = .settings
+            showToast("Подключите rbit CLI в Настройках.", .info)
+            return false
+        }
+        guard connection.isOnline else {
+            showToast("Нет связи с ПК. Проверьте подключение в Настройках.", .info)
             return false
         }
         if activeTurn != nil || isStartingTurn {

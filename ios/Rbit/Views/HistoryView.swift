@@ -177,19 +177,19 @@ struct HistoryView: View {
             emptyState(
                 icon: "desktopcomputer",
                 title: "ПК не подключён",
-                text: "Добавьте rbit CLI, чтобы видеть историю и продолжать чаты.",
-                actionTitle: "Подключить ПК"
+                text: "Подключите rbit CLI в Настройках, чтобы видеть историю и продолжать чаты.",
+                actionTitle: "Открыть настройки"
             ) {
-                app.isAddServerPresented = true
+                app.selectedTab = .settings
             }
         } else if !app.connection.isOnline && app.sessions.isEmpty {
             emptyState(
                 icon: "wifi.exclamationmark",
                 title: "Нет связи с rbit CLI",
-                text: "Проверьте, что на ПК запущен `rbit mobile`, и телефон в той же Wi-Fi сети.",
-                actionTitle: "Повторить"
+                text: "Проверьте подключение и запуск `rbit mobile` в Настройках.",
+                actionTitle: "Открыть настройки"
             ) {
-                app.reconnect()
+                app.selectedTab = .settings
             }
         } else if app.sessions.isEmpty {
             emptyState(
