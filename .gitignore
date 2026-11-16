@@ -21,3 +21,10 @@ venv/
 # OS junk
 Thumbs.db
 .DS_Store
+# iOS / Xcode
+ios/build/
+ios/Payload/
+ios/DerivedData/
+ios/rbit-unsigned.ipa
+*.xcuserstate
+**/xcuserdata/

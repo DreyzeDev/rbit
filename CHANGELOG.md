@@ -8,6 +8,12 @@ All notable changes to rbit are documented here. The format follows
 
 ### Added
 
+- Native SwiftUI iPhone client in `ios/` with liquid-glass tab bar, rbit theme,
+  streaming NDJSON chat, tool cards, model/effort/agent pickers, avatar, themes
+  and settings. Server side: `rbit mobile` LAN mode with a stable token,
+  `rbit://connect` pairing links, optional QR output (`rbit[mobile]`), richer
+  `/v1/status`, `/v1/agents`, `/v1/sessions/{id}` payloads, session abort,
+  bearer/pair token auth and CI build for an unsigned IPA.
 - Agent parity additions: `question` tool (TUI modal, clear non-interactive
   fallback), `artifact` storage/tool, `schedule` tool + `rbit schedule`
   (`list/add/remove/run-due`), auto-compaction for headless runs, model variants

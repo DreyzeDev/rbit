@@ -1446,7 +1446,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "schedule", "reload", "pair", "mini"}
+    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "schedule", "reload", "pair", "mini"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -1546,6 +1546,27 @@ def main(argv: list[str] | None = None) -> int:
                 Console().print(f"service started pid={state.pid} url={state.url}")
                 return 0
             return _run_serve(parsed, hostname=parsed.hostname, cors_origins=parsed.cors)
+
+        if sub == "mobile":
+            p = argparse.ArgumentParser(
+                prog="rbit mobile",
+                description="Start a token-protected rbit server for the rbit iPhone app on your local network",
+            )
+            p.add_argument("--port", type=int, default=8333)
+            p.add_argument("--hostname", default="0.0.0.0", help="Hostname to listen on")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            p.add_argument("--allow-outside", action="store_true")
+            p.add_argument(
+                "--no-approvals",
+                action="store_true",
+                help="Don't ask the iPhone app to approve bash commands",
+            )
+            parsed = p.parse_args(rest)
+            if parsed.no_approvals:
+                os.environ["RBIT_APPROVALS"] = "0"
+            else:
+                os.environ.setdefault("RBIT_APPROVALS", "1")
+            return _run_serve(parsed, hostname=parsed.hostname, mobile=True)
 
         if sub == "acp":
             p = argparse.ArgumentParser(prog="rbit acp", description="Agent Client Protocol server over stdio (for Zed)")
@@ -1950,6 +1971,7 @@ def main(argv: list[str] | None = None) -> int:
             "  rbit mini              Minimal interactive interface\n"
             "  rbit pair              Pair a browser/app with the running server\n"
             "  rbit serve             Local HTTP API (NDJSON turns, OpenAPI at /openapi.json)\n"
+            "  rbit mobile            LAN server for the native rbit iPhone app (prints rbit:// link)\n"
             "  rbit acp               Agent Client Protocol server over stdio (Zed integration)\n"
             "  rbit mcp list|test     List or test MCP servers; add/remove/auth manage config\n"
             "  rbit update|upgrade    Check PyPI for a newer release (--check to skip install)\n"
@@ -2139,12 +2161,15 @@ def _run_mcp(args: argparse.Namespace) -> int:
 
 API_OPERATIONS: dict[str, tuple[str, str]] = {
     "health": ("GET", "/health"),
+    "status.get": ("GET", "/v1/status"),
     "models.list": ("GET", "/v1/models"),
+    "agents.list": ("GET", "/v1/agents"),
     "sessions.list": ("GET", "/v1/sessions"),
     "sessions.create": ("POST", "/v1/sessions"),
     "sessions.get": ("GET", "/v1/sessions/{id}"),
     "sessions.delete": ("DELETE", "/v1/sessions/{id}"),
     "sessions.rename": ("POST", "/v1/sessions/{id}/rename"),
+    "sessions.abort": ("POST", "/v1/sessions/{id}/abort"),
     "turns.create": ("POST", "/v1/turns"),
     "approvals.create": ("POST", "/v1/approvals"),
     "config.reload": ("POST", "/v1/reload"),
@@ -2466,7 +2491,13 @@ def _run_pair(url: str | None, remote: bool, yes: bool) -> int:
     if state is None and not url:
         console.print("[red]No running service.[/] Start one with `rbit service start` or pass --url.")
         return 1
-    base = (url or state.url).rstrip("/")  # type: ignore[union-attr]
+    bases: list[str]
+    if url:
+        bases = [url.rstrip("/")]
+    elif state is not None and state.host in ("0.0.0.0", "::"):
+        bases = [f"http://{ip}:{state.port}" for ip in _lan_ips()] or [state.url]
+    else:
+        bases = [state.url]  # type: ignore[union-attr]
     if remote and not url and not os.environ.get("RBIT_PUBLIC_URL"):
         if not yes:
             console.print(
@@ -2474,12 +2505,26 @@ def _run_pair(url: str | None, remote: bool, yes: bool) -> int:
                 "Expose the server with your tunnel/provider, then rerun with the public URL."
             )
             return 1
-        base = os.environ.get("RBIT_PUBLIC_URL", base)
+        bases = [os.environ.get("RBIT_PUBLIC_URL", bases[0])]
     token = secrets.token_urlsafe(24)
     manager.set_setting("pair_token", token)
+    if state is not None and state.token:
+        try:
+            import httpx
+
+            httpx.post(
+                f"{state.url}/v1/reload",
+                headers={"Authorization": f"Bearer {state.token}"},
+                timeout=3.0,
+            )
+        except Exception:  # noqa: BLE001 - reload is best effort
+            pass
     query = urllib.parse.urlencode({"pair": token})
-    console.print(f"[bold #7fd88f]Pairing link:[/] {base}/?{query}")
-    console.print(f"[dim]App link:[/] rbit://connect?{query}&url={urllib.parse.quote(base, safe='')}")
+    for base in bases:
+        console.print(f"[bold #7fd88f]Pairing link:[/] {base}/?{query}")
+        console.print(
+            f"[dim]App link:[/] rbit://connect?{query}&url={urllib.parse.quote(base, safe='')}"
+        )
     return 0
 
 
@@ -2646,6 +2691,20 @@ def build_openapi_spec() -> dict:
         "security": [{"bearerAuth": []}],
         "paths": {
             "/health": {"get": {"operationId": "health", "summary": "Health probe", "responses": {"200": {"description": "OK"}}}},
+            "/v1/status": {
+                "get": {
+                    "operationId": "status.get",
+                    "summary": "Server, workspace and agent status",
+                    "responses": {"200": {"description": "Status"}},
+                }
+            },
+            "/v1/agents": {
+                "get": {
+                    "operationId": "agents.list",
+                    "summary": "List primary agents (build, plan)",
+                    "responses": {"200": {"description": "Agents"}},
+                }
+            },
             "/v1/models": {
                 "get": {
                     "operationId": "models.list",
@@ -2669,8 +2728,13 @@ def build_openapi_spec() -> dict:
             "/v1/sessions/{id}": {
                 "get": {
                     "operationId": "sessions.get",
-                    "summary": "Read a session",
+                    "summary": "Read a session with messages, tool calls and todos",
                     "responses": {"200": {"description": "Session"}},
+                },
+                "delete": {
+                    "operationId": "sessions.delete",
+                    "summary": "Delete a session",
+                    "responses": {"200": {"description": "Deleted"}},
                 },
                 "parameters": [
                     {"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}
@@ -2685,6 +2749,16 @@ def build_openapi_spec() -> dict:
                     ],
                     "requestBody": {"content": {"application/json": {}}},
                     "responses": {"200": {"description": "Renamed"}},
+                }
+            },
+            "/v1/sessions/{id}/abort": {
+                "post": {
+                    "operationId": "sessions.abort",
+                    "summary": "Abort a running turn",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}
+                    ],
+                    "responses": {"200": {"description": "Abort requested"}},
                 }
             },
             "/v1/reload": {
@@ -2708,7 +2782,9 @@ def build_openapi_spec() -> dict:
                                         "prompt": {"type": "string"},
                                         "session_id": {"type": "string"},
                                         "model": {"type": "string"},
+                                        "agent": {"type": "string", "enum": ["build", "plan"]},
                                         "mode": {"type": "string", "enum": ["build", "plan"]},
+                                        "effort": {"type": "string", "enum": ["auto", "low", "medium", "high"]},
                                     },
                                     "required": ["prompt"],
                                 }
@@ -2766,11 +2842,59 @@ def build_openapi_spec() -> dict:
     }
 
 
+def _lan_ips() -> list[str]:
+    """Best-effort list of LAN IPv4 addresses, most likely first."""
+    import socket as _socket
+
+    ips: set[str] = set()
+    try:
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            ips.add(str(sock.getsockname()[0]))
+    except OSError:
+        pass
+    try:
+        for info in _socket.getaddrinfo(_socket.gethostname(), None, _socket.AF_INET):
+            ip = str(info[4][0])
+            if not ip.startswith("127."):
+                ips.add(ip)
+    except OSError:
+        pass
+
+    def _score(ip: str) -> int:
+        if ip.startswith("192.168."):
+            return 0
+        if ip.startswith("10."):
+            return 1
+        if ip.startswith("172."):
+            return 2
+        return 3
+
+    return sorted(ips, key=lambda value: (_score(value), value))
+
+
+def _mobile_links(port: int, token: str) -> list[tuple[str, str]]:
+    """Returns (server URL, rbit:// connect URL) pairs for the LAN."""
+    from urllib.parse import quote
+
+    links: list[tuple[str, str]] = []
+    for ip in _lan_ips():
+        url = f"http://{ip}:{port}"
+        app_link = (
+            "rbit://connect"
+            f"?url={quote(url, safe='')}"
+            f"&token={quote(token, safe='')}"
+        )
+        links.append((url, app_link))
+    return links
+
+
 def _run_serve(
     args: argparse.Namespace,
     hostname: str = "127.0.0.1",
     open_browser: bool = False,
     cors_origins: list[str] | None = None,
+    mobile: bool = False,
 ) -> int:
     """Local HTTP endpoint: POST /v1/turns streams a full agent turn as NDJSON."""
     import json as _json
@@ -2783,28 +2907,102 @@ def _run_serve(
     from rbit.models import AVAILABLE_MODELS, ChatMessage, ModelInfo, Session, short_id
     from rbit.tools import ToolExecutor
 
+    import time as _time
+    from datetime import datetime as _datetime
+
     workspace = _resolve_workspace(args.dir)
     storage = StorageManager(workspace)
     cfg = storage.load_config()
     model_id = str(cfg.get("model", "rbit/smart-local"))
     server_token = os.environ.get("RBIT_SERVER_TOKEN") or str(cfg.get("server_token") or "")
+    pair_token = ""
+    service_manager = None
     try:
         from rbit.service import ServiceManager
 
-        pair_token = str(ServiceManager().get_setting("pair_token") or "")
+        service_manager = ServiceManager()
+        pair_token = str(service_manager.get_setting("pair_token") or "")
     except Exception:  # noqa: BLE001 - pairing is optional
-        pair_token = ""
+        service_manager = None
+    if mobile and os.environ.get("RBIT_APPROVALS") is None:
+        os.environ["RBIT_APPROVALS"] = "1"
+    if mobile and not server_token:
+        import secrets as _secrets
+
+        try:
+            if service_manager is not None:
+                server_token = str(service_manager.get_setting("mobile_token") or "")
+                if not server_token:
+                    server_token = _secrets.token_urlsafe(24)
+                    service_manager.set_setting("mobile_token", server_token)
+            else:
+                server_token = _secrets.token_urlsafe(24)
+        except Exception:  # noqa: BLE001 - token persistence is optional
+            server_token = _secrets.token_urlsafe(24)
     sessions: dict[str, Session] = {}
     # Interactive tool approvals: with RBIT_APPROVALS=1 the desktop client gets
     # a `tool_approval` event for every non-read-only bash command and answers
     # via POST /v1/approvals. Without it everything runs unattended.
     approvals: dict[str, dict] = {}
+    active_turns: dict[str, dict] = {}
+    active_lock = _threading.Lock()
+    session_lock = _threading.Lock()
     caution_re = _re.compile(
         r"\brm\s+-[a-z]*r[a-z]*f|-\w+f\w*r\b(?=\s)|\bgit\s+reset\s+--hard\b|"
         r"\bgit\s+push\b[^;\n]*--force|\bdrop\s+(table|database)\b|\bmkfs\b|\bformat\s+[a-z]:|"
         r"^\s*(del|rd|erase|remove-item)\s+\S",
         _re.IGNORECASE | _re.MULTILINE,
     )
+
+    def _updated_at(session_id: str) -> str:
+        try:
+            stamp = (storage.sessions_dir / f"{session_id}.json").stat().st_mtime
+        except OSError:
+            stamp = _time.time()
+        return _datetime.fromtimestamp(stamp).isoformat(timespec="seconds")
+
+    def _session_summary(sess: Session) -> dict[str, Any]:
+        last_assistant = next((m for m in reversed(sess.messages) if m.role == "assistant"), None)
+        last_user = next((m for m in reversed(sess.messages) if m.role == "user"), None)
+        preview_source = (last_assistant.content if last_assistant else "") or (last_user.content if last_user else "")
+        preview = " ".join(preview_source.strip().split())[:180]
+        return {
+            "id": sess.id,
+            "title": sess.title,
+            "created_at": sess.created_at,
+            "updated_at": _updated_at(sess.id),
+            "messages": len(sess.messages),
+            "finished": sess.finished,
+            "archived": sess.archived,
+            "tokens": sess.total_tokens,
+            "preview": preview,
+            "model": (last_assistant.model if last_assistant and last_assistant.model else model_id),
+            "agent": (last_assistant.agent if last_assistant and last_assistant.agent else "build"),
+        }
+
+    def _session_payload(sess: Session, tool_limit: int = 20000) -> dict[str, Any]:
+        messages: list[dict[str, Any]] = []
+        for message in sess.messages:
+            data = message.to_dict()
+            for call in data.get("tool_calls") or []:
+                for key in ("output", "diff"):
+                    value = call.get(key)
+                    if isinstance(value, str) and len(value) > tool_limit:
+                        call[key] = value[:tool_limit] + "\n… [truncated]"
+            messages.append(data)
+        payload = _session_summary(sess)
+        payload.update(
+            {
+                "workspace": str(workspace),
+                "total_tokens": sess.total_tokens,
+                "messages": messages,
+                "todos": [todo.to_dict() for todo in sess.todos],
+                "modified_files": {name: stat.to_dict() for name, stat in sess.modified_files.items()},
+            }
+        )
+        payload["message_count"] = len(messages)
+        payload["messages_count"] = len(messages)
+        return payload
 
     def _settle_future(fut, value: bool) -> None:
         if not fut.done():
@@ -2861,10 +3059,28 @@ def _run_serve(
                     sink.put({"type": "status", "text": text})
 
             async def on_tool_start(rec: ToolCallRecord) -> None:
-                sink.put({"type": "tool_call", "name": rec.name, "arguments": rec.arguments})
+                sink.put(
+                    {
+                        "type": "tool_call",
+                        "id": rec.id,
+                        "name": rec.name,
+                        "arguments": rec.arguments,
+                    }
+                )
 
             async def on_tool_end(rec: ToolCallRecord) -> None:
-                sink.put({"type": "tool_result", "name": rec.name, "summary": rec.summary, "output": rec.output})
+                sink.put(
+                    {
+                        "type": "tool_result",
+                        "id": rec.id,
+                        "name": rec.name,
+                        "status": rec.status,
+                        "summary": rec.summary,
+                        "output": rec.output,
+                        "diff": rec.diff,
+                        "duration_ms": rec.duration_ms,
+                    }
+                )
 
             async def on_stream_chunk(partial: str) -> None:
                 sink.put({"type": "delta", "text": partial})
@@ -2876,11 +3092,22 @@ def _run_serve(
                 sink.put({"type": "reasoning", "text": piece})
 
             async def _turn() -> None:
+                if len(session.messages) == 0 and session.title in ("", "Новая сессия", "New Session"):
+                    session.title = " ".join(prompt_text.split())[:44] or "Новая сессия"
                 user = ChatMessage(id=short_id(), role="user", content=prompt_text)
                 session.messages.append(user)
+                session.finished = False
                 # Persist the user message immediately: a turn may take minutes
                 # (tool approvals), and closing the app must not lose it.
                 storage.save_session(session)
+                sink.put(
+                    {
+                        "type": "session",
+                        "session_id": session.id,
+                        "title": session.title,
+                        "created_at": session.created_at,
+                    }
+                )
                 if effort_override in EFFORT_LEVELS:
                     cfg["effort"] = effort_override
                 agent_mode = agent_override if agent_override in ("build", "plan") else "build"
@@ -2899,13 +3126,46 @@ def _run_serve(
                 # run_turn returns the assistant reply without appending it to
                 # the session — persist it, or history keeps only user messages.
                 session.messages.append(reply)
+                session.finished = True
                 storage.save_session(session)
-                sink.put({"type": "message", "content": reply.content, "session_id": session.id})
+                sink.put(
+                    {
+                        "type": "message",
+                        "content": reply.content,
+                        "session_id": session.id,
+                        "message": reply.to_dict(),
+                    }
+                )
 
-            loop.run_until_complete(_turn())
+            task = loop.create_task(_turn())
+            with active_lock:
+                active_turns[session.id] = {
+                    "loop": loop,
+                    "task": task,
+                    "started": _time.time(),
+                }
+            try:
+                loop.run_until_complete(task)
+            except asyncio.CancelledError:
+                session.finished = True
+                storage.save_session(session)
+                sink.put({"type": "aborted", "session_id": session.id})
+            except Exception as exc:  # noqa: BLE001 - surfaced to the HTTP client
+                session.finished = True
+                storage.save_session(session)
+                sink.put({"type": "error", "text": str(exc)})
         except Exception as exc:  # noqa: BLE001 - surfaced to the HTTP client
             sink.put({"type": "error", "text": str(exc)})
         finally:
+            if not session.finished:
+                session.finished = True
+                try:
+                    storage.save_session(session)
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+            with active_lock:
+                active_turns.pop(session.id, None)
+            sink.put({"type": "done", "session_id": session.id})
             sink.put(None)
             loop.close()
 
@@ -2914,26 +3174,31 @@ def _run_serve(
             return
 
         def _authorized(self) -> bool:
-            if not server_token:
+            tokens = {token for token in (server_token, pair_token) if token}
+            if not tokens:
                 return True
-            if self.path in ("/health", "/openapi.json", "/v1/openapi.json"):
+            if self.path.split("?", 1)[0] in ("/health", "/openapi.json", "/v1/openapi.json"):
                 return True
-            expected = f"Bearer {server_token}"
-            if self.headers.get("Authorization", "") == expected:
+            authorization = self.headers.get("Authorization", "")
+            if authorization.startswith("Bearer ") and authorization[7:] in tokens:
                 return True
-            if self.path.startswith("/v1/"):
-                return False
-            if not pair_token:
-                return False
+            explicit = self.headers.get("X-RBit-Token", "") or self.headers.get("X-RBit-Pair", "")
+            if explicit and explicit in tokens:
+                return True
             from urllib.parse import parse_qs, urlparse
 
             query = parse_qs(urlparse(self.path).query)
+            for key in ("pair", "token"):
+                value = (query.get(key) or [""])[0]
+                if value and value in tokens:
+                    return True
             cookie = self.headers.get("Cookie", "")
-            pair_cookie = ""
             for part in cookie.split(";"):
                 if part.strip().startswith("rbit_pair="):
-                    pair_cookie = part.strip().split("=", 1)[1]
-            return pair_token in (query.get("pair", [""])[0], pair_cookie)
+                    value = part.strip().split("=", 1)[1]
+                    if value in tokens:
+                        return True
+            return False
 
         def _deny(self) -> None:
             self.send_response(401)
@@ -2955,8 +3220,8 @@ def _run_serve(
             origin = self.headers.get("Origin", "")
             allowed = origin if origin and cors_origins and origin in cors_origins else "*"
             self.send_header("Access-Control-Allow-Origin", allowed)
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS, DELETE")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-RBit-Token, X-RBit-Pair")
 
         def do_OPTIONS(self) -> None:  # noqa: N802
             self.send_response(204)
@@ -2969,13 +3234,17 @@ def _run_serve(
                 self._deny()
                 return
             if self.path == "/health":
-                body = _json.dumps({"status": "ok", "workspace": str(workspace)}).encode()
-                self.send_response(200)
-                self._cors()
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._send_json(
+                    {
+                        "status": "ok",
+                        "ok": True,
+                        "app": "rbit",
+                        "version": __version__,
+                        "api": 2,
+                        "workspace": str(workspace),
+                        "name": workspace.name,
+                    }
+                )
             elif self.path in ("/openapi.json", "/v1/openapi.json"):
                 body = _json.dumps(build_openapi_spec(), ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
@@ -2984,6 +3253,48 @@ def _run_serve(
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif self.path.split("?", 1)[0] == "/v1/status":
+                with active_lock:
+                    busy = sorted(active_turns.keys())
+                self._send_json(
+                    {
+                        "ok": True,
+                        "app": "rbit",
+                        "version": __version__,
+                        "api": 2,
+                        "workspace": {
+                            "path": str(workspace),
+                            "name": workspace.name,
+                        },
+                        "model": model_id,
+                        "effort": str(cfg.get("effort") or "auto"),
+                        "efforts": ["auto", "low", "medium", "high"],
+                        "agents": [
+                            {"name": "build", "title": "Build", "description": "Пишет код и запускает инструменты"},
+                            {"name": "plan", "title": "Plan", "description": "Только читает и планирует"},
+                        ],
+                        "approvals": os.environ.get("RBIT_APPROVALS") == "1",
+                        "auth": bool(server_token or pair_token),
+                        "busy": busy,
+                    }
+                )
+            elif self.path.split("?", 1)[0] == "/v1/agents":
+                self._send_json(
+                    {
+                        "agents": [
+                            {
+                                "name": "build",
+                                "title": "Build",
+                                "description": "Пишет код и запускает инструменты",
+                            },
+                            {
+                                "name": "plan",
+                                "title": "Plan",
+                                "description": "Только читает и планирует",
+                            },
+                        ]
+                    }
+                )
             elif self.path.startswith("/v1/artifacts"):
                 from urllib.parse import unquote
 
@@ -3129,45 +3440,13 @@ def _run_serve(
                                 }
                             )
                             seen.add(m.id)
-                body = _json.dumps({"models": listed, "current": model_id}, ensure_ascii=False).encode("utf-8")
-                self.send_response(200)
-                self._cors()
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            elif self.path == "/v1/sessions":
-                listed = [
-                    {
-                        "id": s.id,
-                        "title": s.title,
-                        "messages": len(s.messages),
-                        "finished": s.finished,
-                    }
-                    for s in storage.list_sessions()
-                ]
-                body = _json.dumps({"sessions": listed}, ensure_ascii=False).encode("utf-8")
-                self.send_response(200)
-                self._cors()
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            elif self.path.startswith("/v1/sessions/"):
-                sid = self.path.rsplit("/", 1)[-1]
-                sess = storage.find_session(sid)
-                if not sess:
-                    self.send_response(404)
-                    self.end_headers()
-                    return
                 body = _json.dumps(
                     {
-                        "id": sess.id,
-                        "title": sess.title,
-                        "messages": [
-                            {"role": m.role, "content": m.content}
-                            for m in sess.messages
-                        ],
+                        "models": listed,
+                        "current": model_id,
+                        "effort": str(cfg.get("effort") or "auto"),
+                        "efforts": ["auto", "low", "medium", "high"],
+                        "workspace": str(workspace),
                     },
                     ensure_ascii=False,
                 ).encode("utf-8")
@@ -3177,6 +3456,20 @@ def _run_serve(
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif self.path.split("?", 1)[0] == "/v1/sessions":
+                with session_lock:
+                    stored = storage.list_sessions()
+                self._send_json({"sessions": [_session_summary(s) for s in stored]})
+            elif self.path.startswith("/v1/sessions/"):
+                from urllib.parse import unquote, urlparse
+
+                sid = unquote(urlparse(self.path).path.rsplit("/", 1)[-1])
+                with session_lock:
+                    sess = storage.find_session(sid)
+                if not sess:
+                    self._send_json({"error": "session not found", "id": sid}, 404)
+                    return
+                self._send_json(_session_payload(sess))
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -3186,10 +3479,15 @@ def _run_serve(
                 self._deny()
                 return
             if self.path == "/v1/reload":
-                nonlocal cfg, model_id
+                nonlocal cfg, model_id, pair_token
                 cfg = storage.load_config()
                 model_id = str(cfg.get("model", "rbit/smart-local"))
-                body = _json.dumps({"ok": True, "model": model_id}, ensure_ascii=False).encode("utf-8")
+                try:
+                    if service_manager is not None:
+                        pair_token = str(service_manager.get_setting("pair_token") or pair_token)
+                except Exception:  # noqa: BLE001 - pairing is optional
+                    pass
+                body = _json.dumps({"ok": True, "model": model_id, "pairing": bool(pair_token)}).encode("utf-8")
                 self.send_response(200)
                 self._cors()
                 self.send_header("Content-Type", "application/json")
@@ -3243,14 +3541,11 @@ def _run_serve(
                     req = {}
                 s = Session()
                 s.title = (str(req.get("title") or "").strip()[:80] or "Новая сессия")
-                storage.save_session(s)
-                body = _json.dumps({"id": s.id, "title": s.title}, ensure_ascii=False).encode("utf-8")
-                self.send_response(200)
-                self._cors()
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                s.archived = bool(req.get("archived"))
+                with session_lock:
+                    sessions[s.id] = s
+                    storage.save_session(s)
+                self._send_json(_session_payload(s), 201)
                 return
             if self.path.startswith("/v1/sessions/") and self.path.endswith("/rename"):
                 sid = self.path[len("/v1/sessions/") : -len("/rename")]
@@ -3268,14 +3563,24 @@ def _run_serve(
                     self.end_headers()
                     return
                 sess.title = title
-                storage.save_session(sess)
-                body = _json.dumps({"ok": True, "id": sess.id, "title": title}, ensure_ascii=False).encode("utf-8")
-                self.send_response(200)
-                self._cors()
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                with session_lock:
+                    storage.save_session(sess)
+                self._send_json({"ok": True, "id": sess.id, "title": title})
+                return
+            if self.path.startswith("/v1/sessions/") and self.path.split("?", 1)[0].endswith("/abort"):
+                from urllib.parse import unquote, urlparse
+
+                sid = unquote(urlparse(self.path).path[len("/v1/sessions/") : -len("/abort")])
+                with active_lock:
+                    entry = active_turns.get(sid)
+                aborted = False
+                if entry is not None:
+                    try:
+                        entry["loop"].call_soon_threadsafe(entry["task"].cancel)
+                        aborted = True
+                    except RuntimeError:
+                        aborted = False
+                self._send_json({"ok": True, "aborted": aborted, "id": sid})
                 return
             if self.path == "/v1/approvals":
                 length = int(self.headers.get("Content-Length") or 0)
@@ -3325,26 +3630,54 @@ def _run_serve(
                 self.wfile.write(b'{"error": "prompt is required"}')
                 return
             sid = str(req.get("session_id") or "")
-            session = sessions.get(sid) or (storage.find_session(sid) if sid else None) or Session()
-            sessions[session.id] = session
+            with session_lock:
+                session = sessions.get(sid) or (storage.find_session(sid) if sid else None) or Session()
+                sessions[session.id] = session
+            with active_lock:
+                busy = session.id in active_turns
+            if busy:
+                self._send_json(
+                    {
+                        "error": "session is busy",
+                        "session_id": session.id,
+                        "hint": "abort the current turn first",
+                    },
+                    409,
+                )
+                return
+            requested_title = str(req.get("title") or "").strip()
+            if requested_title and not session.messages:
+                session.title = requested_title[:80]
             model_req = str(req.get("model") or "").strip()
-            agent_req = str(req.get("agent") or "").strip()
+            agent_req = str(req.get("agent") or req.get("mode") or "").strip()
             effort_req = str(req.get("effort") or "").strip().lower()
 
             self.send_response(200)
             self._cors()
             self.send_header("Content-Type", "application/x-ndjson")
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             events: _queue.Queue = _queue.Queue()
-            worker = _threading.Thread(target=run_turn_events, args=(prompt_text, session, events, model_req, agent_req, effort_req), daemon=True)
+            worker = _threading.Thread(
+                target=run_turn_events,
+                args=(prompt_text, session, events, model_req, agent_req, effort_req),
+                daemon=True,
+                name=f"rbit-turn-{session.id}",
+            )
             worker.start()
+            disconnected = False
             while True:
                 item = events.get()
                 if item is None:
                     break
-                self.wfile.write((_json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
-                self.wfile.flush()
+                if disconnected:
+                    continue
+                try:
+                    self.wfile.write((_json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    disconnected = True
 
         def do_DELETE(self) -> None:  # noqa: N802
             if not self._authorized():
@@ -3387,7 +3720,54 @@ def _run_serve(
         import threading as _threading2
 
         _threading2.Timer(1.2, lambda: webbrowser.open(f"http://{hostname}:{args.port}/")).start()
-    Console().print(f"rbit serve on http://{hostname}:{args.port}  (POST /v1/turns, GET /health, GET /v1/models, GET /v1/sessions)")
+    console = Console()
+    if mobile:
+        from urllib.parse import quote
+
+        show_host = hostname not in ("0.0.0.0", "::", "")
+        if show_host:
+            base = f"http://{hostname}:{args.port}"
+            app_link = (
+                "rbit://connect"
+                f"?url={quote(base, safe='')}"
+                f"&token={quote(server_token or '', safe='')}"
+            )
+            links = [(base, app_link)]
+        else:
+            links = _mobile_links(args.port, server_token or "")
+        console.print()
+        console.print("[bold #fab283]rbit mobile[/]  [dim]сервер для iPhone[/]")
+        console.print(f"[#808080]Проект:[/] {workspace}")
+        console.print(f"[#808080]Адрес:[/]  http://{hostname}:{args.port}")
+        console.print(f"[#808080]Токен:[/]  {server_token or '(без токена)'}")
+        if links:
+            console.print()
+            console.print("[#808080]Ссылки для iPhone:[/]")
+            for url, app_link in links:
+                console.print(f"  [#5c9cf5]{url}[/]", soft_wrap=True)
+                console.print(f"  [dim]{app_link}[/]", soft_wrap=True)
+            console.print()
+            console.print("[#808080]В приложении: Настройки → Добавить ПК → вставьте rbit:// ссылку.[/]")
+            console.print("[#808080]Или введите адрес и токен вручную. Телефон и ПК — в одной Wi-Fi сети.[/]")
+            try:
+                import qrcode
+
+                qr = qrcode.QRCode(border=1)
+                qr.add_data(links[0][1])
+                qr.make(fit=True)
+                console.print("[#808080]QR для сканирования в приложении:[/]")
+                qr.print_ascii(invert=True)
+            except Exception:  # noqa: BLE001 - QR is optional
+                console.print('[dim]QR-код: pip install "rbit[mobile]"[/]')
+        else:
+            console.print("[#e06c75]Не найдены LAN-адреса.[/] Укажите --hostname с IP этого ПК.")
+        console.print("[#808080]Остановить: Ctrl+C[/]")
+        console.print()
+    else:
+        console.print(
+            f"rbit serve on http://{hostname}:{args.port}  "
+            "(POST /v1/turns, GET /health, GET /v1/models, GET /v1/sessions)"
+        )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

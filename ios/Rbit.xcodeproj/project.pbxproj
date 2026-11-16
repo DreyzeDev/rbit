@@ -1,0 +1,391 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		4B5A3CD10E13619DF88C2ED4 /* RbitModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE270D584B80AD566638EBC3 /* RbitModels.swift */; };
+		E0EDF2503292D9893C3263A2 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF672E93B7D887EBCEACD528 /* KeychainStore.swift */; };
+		70E1C1A7AE1EEF121445B594 /* RbitClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79320E13B92544F06DEA1D2F /* RbitClient.swift */; };
+		BCB3607028FF9383F2F363EC /* RbitApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E1E2AAE350369907CE39041 /* RbitApp.swift */; };
+		9B40E792D8BA53A7A0FBE210 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10C8A97A217E76FB884B5AA /* AppSettings.swift */; };
+		285A4D48ACC568564319088D /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2F79DB0444A86D12C2BBBEC /* AppState.swift */; };
+		6883D09BA3A04FB4D38CFACA /* Formatting.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B1A68AB3F22F7F7528C4A5E /* Formatting.swift */; };
+		A9263677FBC56837DC3AC939 /* Haptics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6BCD3F6163F9588E092F73C0 /* Haptics.swift */; };
+		003F0F828613A8BD5F8B4A51 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C98F06BDA0F37BC0DBE1C22 /* Theme.swift */; };
+		F05814498409D6CDD03C18C9 /* AddServerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F29D0879D0741E981ECF6C17 /* AddServerView.swift */; };
+		4144E5DEB15EBF91353F7F04 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D20C5325921D4EEB7E95B3D /* ChatView.swift */; };
+		C1E4FD6A1C33DFA0CAAC5501 /* Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F9A4AC51F713056EB8FF110 /* Components.swift */; };
+		40300A491A701C9BEC714163 /* HistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFAB23C6A2175621F3300F6E /* HistoryView.swift */; };
+		F561F4AC40E7AB1B191ABC79 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4A35EEBB48575413F754CDF /* HomeView.swift */; };
+		3A8AF58223EF15D389311361 /* MarkdownView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93FB86B48B57392AB50B9E28 /* MarkdownView.swift */; };
+		3857ACADB21417653100A311 /* Pickers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51FDA20B0BF03ECF730F2664 /* Pickers.swift */; };
+		350E2966C557D961DE960C32 /* QRScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6BF8049762E047A55C14378 /* QRScannerView.swift */; };
+		162D836C7C50E6AD190F4643 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31C9EF36D5E561B4500076AF /* RootView.swift */; };
+		0366047E1EAD5CC5EA2D8838 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8A190201E6D76FCFD340ACF /* SettingsView.swift */; };
+		D6AF9D0F304AD6642BC816CB /* ToolCallCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 344634D7D6EA3B88970BE743 /* ToolCallCard.swift */; };
+		A6070B9CF28E71610AA267AE /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A790BB479B2477E3A634A1EB /* Assets.xcassets */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		CE270D584B80AD566638EBC3 /* RbitModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RbitModels.swift; sourceTree = "<group>"; };
+		FF672E93B7D887EBCEACD528 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
+		79320E13B92544F06DEA1D2F /* RbitClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RbitClient.swift; sourceTree = "<group>"; };
+		4E1E2AAE350369907CE39041 /* RbitApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RbitApp.swift; sourceTree = "<group>"; };
+		A10C8A97A217E76FB884B5AA /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
+		F2F79DB0444A86D12C2BBBEC /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
+		3B1A68AB3F22F7F7528C4A5E /* Formatting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Formatting.swift; sourceTree = "<group>"; };
+		6BCD3F6163F9588E092F73C0 /* Haptics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Haptics.swift; sourceTree = "<group>"; };
+		8C98F06BDA0F37BC0DBE1C22 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		F29D0879D0741E981ECF6C17 /* AddServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddServerView.swift; sourceTree = "<group>"; };
+		2D20C5325921D4EEB7E95B3D /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
+		8F9A4AC51F713056EB8FF110 /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
+		FFAB23C6A2175621F3300F6E /* HistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HistoryView.swift; sourceTree = "<group>"; };
+		F4A35EEBB48575413F754CDF /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
+		93FB86B48B57392AB50B9E28 /* MarkdownView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownView.swift; sourceTree = "<group>"; };
+		51FDA20B0BF03ECF730F2664 /* Pickers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pickers.swift; sourceTree = "<group>"; };
+		D6BF8049762E047A55C14378 /* QRScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRScannerView.swift; sourceTree = "<group>"; };
+		31C9EF36D5E561B4500076AF /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		D8A190201E6D76FCFD340ACF /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		344634D7D6EA3B88970BE743 /* ToolCallCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolCallCard.swift; sourceTree = "<group>"; };
+		F5BF48AA40CAD7891EB709FC /* Rbit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Rbit.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A790BB479B2477E3A634A1EB /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		B15A13ACECE86FF5B996CE6C /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		424153ED3CD079DB4DB459AF /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		518DA81DB9B99529C0C0AEBE = {
+			isa = PBXGroup;
+			children = (
+				AD8A4CD9C705730C861D9E1E /* Rbit */,
+				547D009064F7C3F13BEF3460 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		AD8A4CD9C705730C861D9E1E /* Rbit */ = {
+			isa = PBXGroup;
+			children = (
+				4E1E2AAE350369907CE39041 /* RbitApp.swift */,
+				A790BB479B2477E3A634A1EB /* Assets.xcassets */,
+				B15A13ACECE86FF5B996CE6C /* Info.plist */,
+				A1C86A29E589D48EC70B6A32 /* Models */,
+				8777FF69244FA5CB4CC30D2B /* Networking */,
+				EE2E685605CC6567789FCEB4 /* State */,
+				9021D2FAC036FC5D483E9E11 /* Utilities */,
+				38DF21AEF4612506D6BE5CBE /* Views */,
+			);
+			path = Rbit;
+			sourceTree = "<group>";
+		};
+		A1C86A29E589D48EC70B6A32 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				CE270D584B80AD566638EBC3 /* RbitModels.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		8777FF69244FA5CB4CC30D2B /* Networking */ = {
+			isa = PBXGroup;
+			children = (
+				FF672E93B7D887EBCEACD528 /* KeychainStore.swift */,
+				79320E13B92544F06DEA1D2F /* RbitClient.swift */,
+			);
+			path = Networking;
+			sourceTree = "<group>";
+		};
+		EE2E685605CC6567789FCEB4 /* State */ = {
+			isa = PBXGroup;
+			children = (
+				A10C8A97A217E76FB884B5AA /* AppSettings.swift */,
+				F2F79DB0444A86D12C2BBBEC /* AppState.swift */,
+			);
+			path = State;
+			sourceTree = "<group>";
+		};
+		9021D2FAC036FC5D483E9E11 /* Utilities */ = {
+			isa = PBXGroup;
+			children = (
+				3B1A68AB3F22F7F7528C4A5E /* Formatting.swift */,
+				6BCD3F6163F9588E092F73C0 /* Haptics.swift */,
+				8C98F06BDA0F37BC0DBE1C22 /* Theme.swift */,
+			);
+			path = Utilities;
+			sourceTree = "<group>";
+		};
+		38DF21AEF4612506D6BE5CBE /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				F29D0879D0741E981ECF6C17 /* AddServerView.swift */,
+				2D20C5325921D4EEB7E95B3D /* ChatView.swift */,
+				8F9A4AC51F713056EB8FF110 /* Components.swift */,
+				FFAB23C6A2175621F3300F6E /* HistoryView.swift */,
+				F4A35EEBB48575413F754CDF /* HomeView.swift */,
+				93FB86B48B57392AB50B9E28 /* MarkdownView.swift */,
+				51FDA20B0BF03ECF730F2664 /* Pickers.swift */,
+				D6BF8049762E047A55C14378 /* QRScannerView.swift */,
+				31C9EF36D5E561B4500076AF /* RootView.swift */,
+				D8A190201E6D76FCFD340ACF /* SettingsView.swift */,
+				344634D7D6EA3B88970BE743 /* ToolCallCard.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		547D009064F7C3F13BEF3460 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F5BF48AA40CAD7891EB709FC /* Rbit.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		42AEFBAE01D2DFD981F7DA7D /* Rbit */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A5D73C5DACAC38436AAE3DEE /* Build configuration list for PBXNativeTarget "Rbit" */;
+			buildPhases = (
+				7A70D71C385290AF96BF1031 /* Sources */,
+				424153ED3CD079DB4DB459AF /* Frameworks */,
+				285BB1C1430063331E9F5DD0 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Rbit;
+			productName = Rbit;
+			productReference = F5BF48AA40CAD7891EB709FC /* Rbit.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		46F86FAA6BBF9AC94A7E4595 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					42AEFBAE01D2DFD981F7DA7D = {
+						CreatedOnToolsVersion = 16.0;
+					};
+				};
+			};
+			buildConfigurationList = 4765040085937F8E6B05CD30 /* Build configuration list for PBXProject "Rbit" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = ru;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+				ru,
+			);
+			mainGroup = 518DA81DB9B99529C0C0AEBE;
+			productRefGroup = 547D009064F7C3F13BEF3460 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				42AEFBAE01D2DFD981F7DA7D /* Rbit */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		285BB1C1430063331E9F5DD0 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A6070B9CF28E71610AA267AE /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		7A70D71C385290AF96BF1031 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4B5A3CD10E13619DF88C2ED4 /* RbitModels.swift in Sources */,
+				E0EDF2503292D9893C3263A2 /* KeychainStore.swift in Sources */,
+				70E1C1A7AE1EEF121445B594 /* RbitClient.swift in Sources */,
+				BCB3607028FF9383F2F363EC /* RbitApp.swift in Sources */,
+				9B40E792D8BA53A7A0FBE210 /* AppSettings.swift in Sources */,
+				285A4D48ACC568564319088D /* AppState.swift in Sources */,
+				6883D09BA3A04FB4D38CFACA /* Formatting.swift in Sources */,
+				A9263677FBC56837DC3AC939 /* Haptics.swift in Sources */,
+				003F0F828613A8BD5F8B4A51 /* Theme.swift in Sources */,
+				F05814498409D6CDD03C18C9 /* AddServerView.swift in Sources */,
+				4144E5DEB15EBF91353F7F04 /* ChatView.swift in Sources */,
+				C1E4FD6A1C33DFA0CAAC5501 /* Components.swift in Sources */,
+				40300A491A701C9BEC714163 /* HistoryView.swift in Sources */,
+				F561F4AC40E7AB1B191ABC79 /* HomeView.swift in Sources */,
+				3A8AF58223EF15D389311361 /* MarkdownView.swift in Sources */,
+				3857ACADB21417653100A311 /* Pickers.swift in Sources */,
+				350E2966C557D961DE960C32 /* QRScannerView.swift in Sources */,
+				162D836C7C50E6AD190F4643 /* RootView.swift in Sources */,
+				0366047E1EAD5CC5EA2D8838 /* SettingsView.swift in Sources */,
+				D6AF9D0F304AD6642BC816CB /* ToolCallCard.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		92E165A9035A603BE73D2E62 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = minimal;
+			};
+			name = Debug;
+		};
+		E1D3BBA94590957B0374D6E9 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		F22D2FFCC45240A8FF5EBE4A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Rbit/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.dreyze.rbit.mobile;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		FE4F802C632EAD717BA35062 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Rbit/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.dreyze.rbit.mobile;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		4765040085937F8E6B05CD30 /* Build configuration list for PBXProject "Rbit" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				92E165A9035A603BE73D2E62 /* Debug */,
+				E1D3BBA94590957B0374D6E9 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A5D73C5DACAC38436AAE3DEE /* Build configuration list for PBXNativeTarget "Rbit" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F22D2FFCC45240A8FF5EBE4A /* Debug */,
+				FE4F802C632EAD717BA35062 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 46F86FAA6BBF9AC94A7E4595 /* Project object */;
+}

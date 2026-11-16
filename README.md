@@ -162,6 +162,33 @@ rbit lint                                     # ruff (или встроенны�
 rbit lint --json                              # JSON-отчёт для CI
 ```
 
+## iPhone-приложение (нативное)
+
+В `ios/` лежит **нативный SwiftUI-клиент rbit** (iOS 17+), не PWA. Он
+подключается к вашему ПК через новый LAN-сервер rbit CLI:
+
+```bash
+rbit mobile -d C:\path\to\project
+```
+
+Команда поднимает `http://<LAN-IP>:8333`, печатает токен, ссылку
+`rbit://connect?...` и QR-код (если установлен `pip install "rbit[mobile]"`).
+По умолчанию `rbit mobile` включает подтверждение bash-команд из iPhone;
+отключить: `--no-approvals`.
+
+В приложении:
+
+- нижний liquid-glass таб-бар: **Новый / История / Настройки**;
+- аватар и профиль, темы **rbit Dark / rbit Light**;
+- выбор модели, effort (`auto/low/medium/high`) и агента (`Build/Plan`);
+- потоковый ответ, reasoning, tool-карточки с diff и выводом;
+- история сессий `.rbit/sessions`, продолжение по нажатию, поиск и переименование;
+- разрешения на опасные команды и стоп текущего хода.
+
+Подробная инструкция: [`ios/README.md`](ios/README.md). Xcode-проект можно
+открыть на Mac; для Windows в репозитории есть GitHub Actions workflow, который
+собирает неподписанный IPA для Sideloadly/AltStore.
+
 ## Тесты
 
 ```bash
