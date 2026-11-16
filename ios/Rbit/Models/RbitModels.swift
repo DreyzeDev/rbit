@@ -534,6 +534,11 @@ struct PairingLink: Equatable {
     let url: String
     let token: String?
 
+    private init(url: String, token: String?) {
+        self.url = url
+        self.token = token
+    }
+
     init?(url: URL) {
         guard url.scheme?.lowercased() == "rbit" else { return nil }
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
@@ -542,8 +547,7 @@ struct PairingLink: Equatable {
             items.first(where: { $0.name.lowercased() == name })?.value
         }
         guard let rawURL = value("url"), !rawURL.isEmpty else { return nil }
-        self.url = rawURL
-        self.token = value("token") ?? value("pair")
+        self.init(url: rawURL, token: value("token") ?? value("pair"))
     }
 
     init?(raw: String) {
@@ -559,7 +563,6 @@ struct PairingLink: Equatable {
             items.first(where: { $0.name.lowercased() == name })?.value
         }
         guard let url = value("url"), !url.isEmpty else { return nil }
-        self.url = url
-        self.token = value("token") ?? value("pair")
+        self.init(url: url, token: value("token") ?? value("pair"))
     }
 }

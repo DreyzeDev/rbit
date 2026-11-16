@@ -324,7 +324,7 @@ struct ChatView: View {
 
     private var bottomDock: some View {
         VStack(spacing: 8) {
-            if let active, let approval = app.pendingApproval {
+            if active != nil, let approval = app.pendingApproval {
                 ApprovalCard(approval: approval) { approved, always in
                     app.respondToApproval(approved: approved, always: always)
                 }
