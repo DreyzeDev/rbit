@@ -576,7 +576,11 @@ final class AppState: ObservableObject {
             let response = try await client.models()
             models = response.models
             updateEfforts(from: response.efforts)
-            if settings.modelID.isEmpty, let current = response.current, !current.isEmpty {
+            let available = Set(response.models.map(\.id))
+            if !settings.modelID.isEmpty, !available.contains(settings.modelID) {
+                settings.modelID = response.current ?? ""
+                saveSettings()
+            } else if settings.modelID.isEmpty, let current = response.current, !current.isEmpty {
                 settings.modelID = current
                 saveSettings()
             }
