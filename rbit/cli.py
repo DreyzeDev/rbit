@@ -1445,6 +1445,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         logging.getLogger().setLevel(log_level)
 
+    if "--no-color" in args_list:
+        os.environ["NO_COLOR"] = "1"
+        args_list = [item for item in args_list if item != "--no-color"]
+
     if "--log-file" in args_list:
         idx = args_list.index("--log-file")
         if idx + 1 >= len(args_list) or args_list[idx + 1].startswith("-"):

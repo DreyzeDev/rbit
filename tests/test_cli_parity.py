@@ -391,3 +391,9 @@ def test_logs_reads_workspace_log(tmp_path: Path, capsys: pytest.CaptureFixture[
     log.write_text("line1\nline2\n", encoding="utf-8")
     assert _run_logs(tmp_path, lines=10) == 0
     assert "line2" in capsys.readouterr().out
+
+def test_fast_version_entrypoint(capsys: pytest.CaptureFixture[str]) -> None:
+    from rbit.__main__ import main as entry_main
+
+    assert entry_main(["--version"]) == 0
+    assert "rbit v" in capsys.readouterr().out

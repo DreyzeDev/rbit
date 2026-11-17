@@ -46,7 +46,7 @@ include = ["rbit*"]
 rbit = ["builtin_skills/**/*.md", "builtin_skills/**/*.js", "builtin_skills/**/*.css"]
 
 [project.scripts]
-rbit = "rbit.cli:main"
+rbit = "rbit.__main__:main"
 
 [tool.pytest.ini_options]
 asyncio_default_fixture_loop_scope = "function"
