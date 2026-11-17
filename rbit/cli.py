@@ -316,7 +316,7 @@ async def _run_doctor(workspace: Path) -> int:
     return 0
 
 
-def _run_models(workspace: Path, provider: str | None, verbose: bool, refresh: bool) -> int:
+def _run_models(workspace: Path, provider: str | None, verbose: bool, refresh: bool, as_json: bool = False) -> int:
     from rbit.models import ModelInfo, get_model_info
     from rbit.agent import discover_ollama_models
 
@@ -352,6 +352,9 @@ def _run_models(workspace: Path, provider: str | None, verbose: bool, refresh: b
     if not rows:
         console.print("No models found. Configure /connect or run with --refresh.")
         return 1
+    if as_json:
+        print(json.dumps([r.to_dict() for r in rows], ensure_ascii=False, indent=2))
+        return 0
     for r in sorted(rows, key=lambda x: x.id):
         meta = f"  | {r.context_window:,} ctx | ${r.cost_per_1k}/1k" if verbose else ""
         console.print(f"{r.id} [dim]({r.provider})[/]{meta}")
@@ -619,6 +622,46 @@ def _run_agent(workspace: Path, cmd: str, name: str | None) -> int:
         console.print(f"OK Skill agent created: {target}  -> run via /skill {name}")
         return 0
     return 1
+
+
+def _run_status(workspace: Path, as_json: bool = False) -> int:
+    from rbit.risk import analyze_risk
+    from rbit.service import ServiceManager
+
+    console = Console()
+    storage = StorageManager(workspace)
+    cfg = storage.load_config()
+    sessions = storage.list_sessions(include_archived=True)
+    service = ServiceManager().status()
+    risk = analyze_risk(workspace)
+    mcp = cfg.get("mcp") if isinstance(cfg.get("mcp"), dict) else {}
+    data = {
+        "workspace": str(workspace),
+        "git_branch": detect_git_branch(workspace),
+        "model": cfg.get("model"),
+        "api_base": cfg.get("api_base"),
+        "api_key": bool(cfg.get("api_key")),
+        "sessions": len(sessions),
+        "checkpoints": len(storage.list_checkpoints()),
+        "mcp_servers": len(mcp),
+        "service": service,
+        "risk": {"level": risk.level, "score": risk.score},
+    }
+    if as_json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    body = (
+        f"[bold #eeeeee]Workspace:[/]   {workspace}\n"
+        f"[bold #eeeeee]Git:[/]         {data['git_branch'] or 'not a repo'}\n"
+        f"[bold #eeeeee]Model:[/]       {data['model']}\n"
+        f"[bold #eeeeee]API:[/]         {data['api_base']} ({'key set' if data['api_key'] else 'NO KEY'})\n"
+        f"[bold #eeeeee]Sessions:[/]    {data['sessions']} ({data['checkpoints']} checkpoints)\n"
+        f"[bold #eeeeee]MCP:[/]         {data['mcp_servers']} server(s)\n"
+        f"[bold #eeeeee]Service:[/]     {'running ' + service['url'] if service.get('running') else 'stopped'}\n"
+        f"[bold #eeeeee]Change risk:[/] {risk.level} ({risk.score}/100)"
+    )
+    console.print(Panel(body, title="[bold #fab283]rbit status[/]", border_style="#282828"))
+    return 0
 
 
 def _run_risk(workspace: Path, as_json: bool = False) -> int:
@@ -1470,7 +1513,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "schedule", "risk", "replay", "reload", "pair", "mini"}
+    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "status", "schedule", "risk", "replay", "reload", "pair", "mini"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -1619,7 +1662,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if sub == "config":
             p = argparse.ArgumentParser(prog="rbit config", description="Inspect and edit configuration")
-            p.add_argument("action", nargs="?", default="list", choices=["list", "show", "get", "set", "unset", "validate", "edit"])
+            p.add_argument("action", nargs="?", default="list", choices=["list", "show", "get", "set", "unset", "validate", "edit", "schema"])
             p.add_argument("key", nargs="?", help="Dotted key, e.g. permissions or websearch.provider")
             p.add_argument("value", nargs="?", help="Value (JSON or string)")
             p.add_argument("-d", "--dir", help="Workspace directory")
@@ -1771,9 +1814,10 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("provider", nargs="?", help="Filter by provider prefix (e.g. glm, am)")
             p.add_argument("--verbose", action="store_true", help="Include cost and context metadata")
             p.add_argument("--refresh", action="store_true", help="Refresh the provider model cache")
+            p.add_argument("--json", action="store_true", help="Output JSON")
             p.add_argument("-d", "--dir", help="Workspace directory")
             parsed = p.parse_args(rest)
-            return _run_models(_resolve_workspace(parsed.dir), parsed.provider, parsed.verbose, parsed.refresh)
+            return _run_models(_resolve_workspace(parsed.dir), parsed.provider, parsed.verbose, parsed.refresh, parsed.json)
 
         if sub == "auth":
             p = argparse.ArgumentParser(prog="rbit auth", description="Manage provider credentials")
@@ -1919,6 +1963,13 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print("No README found.")
             return 0
+
+        if sub == "status":
+            p = argparse.ArgumentParser(prog="rbit status", description="One-screen workspace/runtime status")
+            p.add_argument("dir", nargs="?", help="Workspace directory")
+            p.add_argument("--json", action="store_true")
+            parsed = p.parse_args(rest)
+            return _run_status(_resolve_workspace(parsed.dir), parsed.json)
 
         if sub == "risk":
             p = argparse.ArgumentParser(prog="rbit risk", description="Score the risk of the current git diff")
@@ -2879,7 +2930,27 @@ def _run_config(
         if not errors:
             console.print("[#7fd88f]✓ config is valid[/]")
         return 1 if errors else 0
-    if action == "edit":
+    if action == "schema":
+        schema = {
+            "type": "object",
+            "properties": {
+                "model": {"type": "string"},
+                "api_base": {"type": "string"},
+                "api_key": {"type": "string"},
+                "effort": {"type": "string", "enum": ["auto", "low", "medium", "high"]},
+                "theme": {"type": "string"},
+                "auto_compact": {"type": "boolean"},
+                "auto_design_skill": {"type": "boolean"},
+                "formatter": {"type": ["boolean", "object"]},
+                "lsp": {"type": ["boolean", "object"]},
+                "websearch": {"type": ["boolean", "object"]},
+                "permissions": {"type": "array", "items": {"type": "object", "required": ["action", "resource", "effect"]}},
+                "plugins": {"type": "array", "items": {"type": "string"}},
+                "instructions": {"type": "array", "items": {"type": "string"}},
+            },
+        }
+        print(json.dumps(schema, ensure_ascii=False, indent=2))
+        return 0
         editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or ("notepad" if os.name == "nt" else "vi")
         storage.state_dir.mkdir(parents=True, exist_ok=True)
         if not storage.config_path.exists():

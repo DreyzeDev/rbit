@@ -20,6 +20,7 @@ from rbit.cli import (
     _run_logs,
     _run_permissions,
     _run_stats,
+    _run_status,
 )
 from rbit.mcp import MCPManager
 from rbit.models import ChatMessage, Session, ToolCallRecord, short_id
@@ -397,3 +398,10 @@ def test_fast_version_entrypoint(capsys: pytest.CaptureFixture[str]) -> None:
 
     assert entry_main(["--version"]) == 0
     assert "rbit v" in capsys.readouterr().out
+
+def test_status_config_schema_and_models_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert _run_status(tmp_path, as_json=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["workspace"] == str(tmp_path)
+    assert _run_config(tmp_path, "schema") == 0
+    assert "properties" in capsys.readouterr().out
