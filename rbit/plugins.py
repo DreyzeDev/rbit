@@ -33,6 +33,13 @@ HookFn = Callable[[dict[str, Any]], Any | Awaitable[Any]]
 HOOK_ALIASES = {
     "on_tool_before": "tool.execute.before",
     "on_tool_after": "tool.execute.after",
+    "on_before_edit": "before_edit",
+    "on_after_edit": "after_edit",
+    "on_before_command": "before_command",
+    "on_after_command": "after_command",
+    "on_error": "on_error",
+    "on_stop": "on_stop",
+    "on_session_start": "session_start",
     "on_chat_params": "chat.params",
     "on_chat_message": "chat.message",
     "on_event": "event",

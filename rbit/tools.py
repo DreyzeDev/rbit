@@ -1032,6 +1032,14 @@ class ToolExecutor:
             permission_block.duration_ms = int((time.perf_counter() - t0) * 1000)
             return permission_block
 
+        edit_tools = ("write", "edit", "multi_edit", "apply_patch")
+        if self.plugins is not None and name in edit_tools:
+            ctx = await self.plugins.trigger("before_edit", {"tool": name, "args": args, "agent_mode": agent_mode})
+            if ctx.get("deny"):
+                return ToolResult(False, f"{name} blocked by hook", str(ctx.get("reason") or "before_edit hook denied"))
+        if self.plugins is not None and name in ("bash", "terminal"):
+            await self.plugins.trigger("before_command", {"tool": name, "args": args, "agent_mode": agent_mode})
+
         try:
             if name in ("write", "edit", "multi_edit", "apply_patch"):
                 self._maybe_auto_checkpoint()
@@ -1104,6 +1112,10 @@ class ToolExecutor:
             )
         except Exception as exc:
             res = ToolResult(False, f"Error in {name}", f"{type(exc).__name__}: {exc}")
+            if self.plugins is not None:
+                await self.plugins.trigger(
+                    "on_error", {"tool": name, "args": args, "error": str(exc), "agent_mode": agent_mode}
+                )
 
         res.output = redact_secrets(res.output)
         if res.diff:
@@ -1112,6 +1124,16 @@ class ToolExecutor:
             formatted = await asyncio.to_thread(self._format_mutated_files, name, args)
             if formatted:
                 res.output = f"{res.output}\n\n{formatted}".strip()
+        if self.plugins is not None and name in edit_tools:
+            await self.plugins.trigger(
+                "after_edit",
+                {"tool": name, "args": args, "result": res, "agent_mode": agent_mode},
+            )
+        if self.plugins is not None and name in ("bash", "terminal"):
+            await self.plugins.trigger(
+                "after_command",
+                {"tool": name, "args": args, "result": res, "agent_mode": agent_mode},
+            )
         if self.plugins is not None:
             hook_ctx = await self.plugins.trigger(
                 "tool.execute.after",
@@ -1795,6 +1817,8 @@ class ToolExecutor:
             cmd = ["log", "--oneline", f"-{limit}"] + path_args
         elif action == "show":
             cmd = ["show", "--stat", "HEAD"] + path_args
+        elif action == "branch":
+            cmd = ["rev-parse", "--abbrev-ref", "HEAD"]
         elif action == "blame":
             if not raw_path:
                 return ToolResult(False, "blame needs path", "`path` is required for git blame.")
@@ -1803,7 +1827,7 @@ class ToolExecutor:
             return ToolResult(
                 False,
                 f"unsupported git action: {action}",
-                "Allowed read-only actions: status, diff, log, show, blame.",
+                "Allowed read-only actions: status, diff, log, show, branch, blame.",
             )
 
         try:
