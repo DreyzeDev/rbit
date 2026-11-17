@@ -22,7 +22,7 @@ All notable changes to rbit are documented here. The format follows
 - Tools for terminal sessions (`terminal`), image generation (`image_generate`) and artifacts/schedules, plus model variants and multi-provider websearch.
 - Cron-style schedules, schedule runner lock, MCP resource list/read tool, ACP session replay, terminal/image tools.
 - Built-in `rbit-design` skill (with theme.css/liquid-nav.js/sheet.js/stickers.js references) (bundled, project/global overrides) with automatic activation when a UI request has no visual direction, plus opt-out `auto_design_skill`.
-- Fast `rbit --version` path (~50ms), global `--no-color`, Windows/macOS smoke CI.
+- Fast `rbit --version` and `--generate-completion` paths (~50ms), global `--no-color`, Windows/macOS smoke CI.
 - CLI quality: `rbit config get/set/list/validate/edit`, `rbit permissions list/explain`, `rbit completion install/print`, `rbit logs`, global `--log-file`, mypy + CLI smoke in CI, pyproject metadata/keyring extra.
 - Change-risk analyzer (`rbit risk`, `risk_review` tool) and session replay (`rbit replay`) with deterministic git-diff scoring.
 - Server API bearer-token auth (`RBIT_SERVER_TOKEN`/service-generated token), pair-cookie flow for the web UI, 0600 service state, and keyring-backed multi-credentials.
