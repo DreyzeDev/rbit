@@ -169,6 +169,27 @@ def is_reasoning_model(model_id: str) -> bool:
     lowered = (model_id or "").lower()
     return any(marker in lowered for marker in REASONING_MARKERS)
 
+DESIGN_INTENT_WORDS = (
+    "landing", "website", "web site", "dashboard", "frontend", "front-end", "ui", "ux",
+    "component", "page", "screen", "interface", "design", "app", "лендинг", "сайт",
+    "страниц", "интерфейс", "дизайн", "верстк", "вёрстк", "приложени", "компонент",
+    "дашборд", "экран",
+)
+DESIGN_SPECIFIC_WORDS = (
+    "minimal", "minimalist", "brutalist", "dark", "light", "palette", "color", "colour",
+    "font", "typography", "style", "brand", "theme", "hex", "#", "grunge", "retro",
+    "futuristic", "elegant", "playful", "corporate", "стил", "цвет", "шрифт", "палитр",
+    "тёмн", "темн", "светл", "минимал", "бренд", "тема", "как у",
+)
+
+
+def _needs_design_direction(text: str) -> bool:
+    lowered = (text or "").lower()
+    if not any(word in lowered for word in DESIGN_INTENT_WORDS):
+        return False
+    return not any(word in lowered for word in DESIGN_SPECIFIC_WORDS)
+
+
 ToolStartHook = Callable[[ToolCallRecord], Awaitable[None]]
 ToolEndHook = Callable[[ToolCallRecord], Awaitable[None]]
 StatusHook = Callable[[str], Awaitable[None]]
@@ -241,6 +262,25 @@ class AgentEngine:
         self._active_profile_tools: set[str] | None = None
         self._active_profile_readonly: bool = False
         self._active_variant: str | None = None
+        self._auto_design_section = ""
+
+    def _auto_design_prompt(self, user_msg: ChatMessage) -> str:
+        if not self.get_config().get("auto_design_skill", True):
+            return ""
+        if not _needs_design_direction(user_msg.content):
+            return ""
+        skill = load_skills(self.workspace).get("rbit-design") or load_skills(self.workspace).get("frontend-design")
+        if not skill:
+            return ""
+        skill_dir = Path(str(skill.get("path") or "")).parent
+        return (
+            "\n\nAUTO-ACTIVATED SKILL `"
+            + str(skill.get("name") or "rbit-design")
+            + "` — the user asked for UI work without describing a visual direction. "
+            "Follow these instructions, and read the reference files from "
+            f"`{skill_dir}` when useful (theme.css, liquid-nav.js, sheet.js, stickers.js).\n\n"
+            + str(skill.get("body") or "")
+        )
 
     def _tools_for_payload(self) -> list[dict[str, Any]]:
         schemas = list(OPENAI_TOOLS_SCHEMA) + self.executor.mcp_tool_schemas()
@@ -511,6 +551,7 @@ class AgentEngine:
         cfg = self.get_config()
         model_id, variant = self._split_model_variant(model_id)
         self._active_variant = variant
+        self._auto_design_section = self._auto_design_prompt(user_msg)
         routing = cfg.get("model_routing")
         if isinstance(routing, dict) and routing.get("enabled"):
             routed = route_model_for_task(model_id, user_msg, routing)
@@ -577,8 +618,23 @@ class AgentEngine:
         native_anthropic = use_remote and (
             protocol in ("anthropic", "claude") or "api.anthropic.com" in effective_base
         )
+        native_gemini = use_remote and (
+            protocol in ("gemini", "google") or "generativelanguage.googleapis.com" in effective_base
+        )
 
-        if native_anthropic:
+        if native_gemini:
+            content = await self._run_gemini_compatible(
+                session=session,
+                user_msg=user_msg,
+                agent_mode=agent_mode,
+                model_id=remote_model_id,
+                api_base=effective_base,
+                api_key=api_key,
+                invoke_tool=invoke_tool,
+                on_status=on_status,
+                on_stream_chunk=on_stream_chunk,
+            )
+        elif native_anthropic:
             content = await self._run_anthropic_compatible(
                 session=session,
                 user_msg=user_msg,
@@ -728,6 +784,8 @@ class AgentEngine:
         custom_agent_prompt = str(cfg_prompt.get("agent_prompt") or "").strip()
         if custom_agent_prompt:
             system_text += f"\n\n{custom_agent_prompt}"
+        if self._auto_design_section:
+            system_text += self._auto_design_section
         api_messages[0]["content"] = system_text
 
         units: list[list[dict[str, Any]]] = []
@@ -1053,6 +1111,124 @@ class AgentEngine:
         updated = context.get("payload")
         return updated if isinstance(updated, dict) else payload
 
+    async def _run_gemini_compatible(
+        self,
+        session: Session,
+        user_msg: ChatMessage,
+        agent_mode: str,
+        model_id: str,
+        api_base: str,
+        api_key: str,
+        invoke_tool: Callable[[str, dict[str, Any]], Awaitable[ToolResult]],
+        on_status: StatusHook,
+        on_stream_chunk: StreamHook | None = None,
+    ) -> str:
+        """Native Google Gemini generateContent path (`protocol: gemini`)."""
+        cfg = self.get_config()
+        base = api_base.rstrip("/").removesuffix("/chat/completions")
+        model = model_id.split("/", 1)[1] if "/" in model_id else model_id
+        system_text = SYSTEM_PROMPT_TEMPLATE.format(
+            workspace=self.workspace,
+            agent_mode=agent_mode.upper(),
+            shell_note="Shell: Windows PowerShell 5.1." if os.name == "nt" else "Shell: POSIX sh/bash.",
+            mode_note="PLAN MODE ACTIVE: read-only." if agent_mode == "plan" else "BUILD MODE ACTIVE: full access.",
+            memory_section="",
+            rules_section="",
+            skills_section="",
+        )
+        if self._auto_design_section:
+            system_text += self._auto_design_section
+        contents: list[dict[str, Any]] = []
+        for message in session.messages:
+            if message.role == "user":
+                contents.append({"role": "user", "parts": [{"text": message.content}]})
+            elif message.role == "assistant":
+                parts: list[dict[str, Any]] = []
+                if message.content:
+                    parts.append({"text": message.content})
+                for call in message.tool_calls:
+                    parts.append({"functionCall": {"name": call.name, "args": call.arguments}})
+                if parts:
+                    contents.append({"role": "model", "parts": parts})
+                for call in message.tool_calls:
+                    if call.output:
+                        contents.append(
+                            {
+                                "role": "user",
+                                "parts": [
+                                    {
+                                        "functionResponse": {
+                                            "name": call.name,
+                                            "response": {"content": call.output[:8000]},
+                                        }
+                                    }
+                                ],
+                            }
+                        )
+        tools = []
+        for schema in self._tools_for_payload():
+            function = schema.get("function") or {}
+            tools.append(
+                {
+                    "name": function.get("name"),
+                    "description": function.get("description", ""),
+                    "parameters": function.get("parameters") or {"type": "object", "properties": {}},
+                }
+            )
+        endpoint = f"{base}/models/{model}:generateContent"
+        client_ctx = self.http_client or httpx.AsyncClient(timeout=120.0, limits=HTTP_LIMITS)
+        try:
+            for _ in range(10):
+                payload: dict[str, Any] = {
+                    "contents": contents,
+                    "systemInstruction": {"parts": [{"text": system_text}]},
+                    "generationConfig": {"maxOutputTokens": int(cfg.get("max_tokens") or 4096)},
+                }
+                if tools and agent_mode != "plan":
+                    payload["tools"] = [{"functionDeclarations": tools}]
+                try:
+                    response = await client_ctx.post(
+                        endpoint,
+                        params={"key": api_key},
+                        headers={"Content-Type": "application/json"},
+                        json=payload,
+                    )
+                except httpx.HTTPError as exc:
+                    return f"Gemini network error: {exc}"
+                if response.status_code >= 400:
+                    return f"Gemini API error ({response.status_code}): {response.text[:300]}"
+                try:
+                    candidate = response.json()["candidates"][0]["content"]
+                except (ValueError, KeyError, IndexError, TypeError):
+                    return "Gemini error: malformed response"
+                parts = candidate.get("parts") or []
+                text = "".join(str(part.get("text", "")) for part in parts if "text" in part)
+                calls = [part["functionCall"] for part in parts if "functionCall" in part]
+                if not calls:
+                    if on_stream_chunk is not None and text:
+                        await on_stream_chunk(text)
+                    return text
+                contents.append({"role": "model", "parts": parts})
+                responses = []
+                for call in calls:
+                    name = str(call.get("name") or "")
+                    if on_status is not None:
+                        await on_status(f"tool: {name}")
+                    result = await invoke_tool(name, dict(call.get("args") or {}))
+                    responses.append(
+                        {
+                            "functionResponse": {
+                                "name": name,
+                                "response": {"content": (result.output or result.summary)[:8000]},
+                            }
+                        }
+                    )
+                contents.append({"role": "user", "parts": responses})
+            return "Gemini turn stopped: too many tool iterations."
+        finally:
+            if self.http_client is None:
+                await client_ctx.aclose()
+
     async def _run_anthropic_compatible(
         self,
         session: Session,
@@ -1087,6 +1263,8 @@ class AgentEngine:
             rules_section=rules_section,
             skills_section=skills_section,
         )
+        if self._auto_design_section:
+            system_text += self._auto_design_section
         messages: list[dict[str, Any]] = []
         for message in session.messages:
             if message.role == "user":

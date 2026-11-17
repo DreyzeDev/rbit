@@ -260,3 +260,9 @@ async def test_question_tool_callback_and_noninteractive(tmp_path: Path) -> None
     result = await executor.execute("question", {"question": "Pick one", "options": ["a", "b"]})
     assert result.ok is True
     assert result.output == "b"
+
+def test_builtin_rbit_design_skill_is_loaded(tmp_path: Path) -> None:
+    skills = load_skills(tmp_path)
+    assert "rbit-design" in skills
+    assert "liquid glass" in skills["rbit-design"]["description"].lower()
+    assert "rbit design" in skills["rbit-design"]["body"].lower()

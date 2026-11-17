@@ -73,7 +73,7 @@ READONLY_BASH_PREFIXES = (
 )
 
 READONLY_TOOLS: frozenset[str] = frozenset(
-    {"read", "glob", "grep", "webfetch", "websearch", "diagnostics", "lint", "symbols", "git", "list_changes", "skill"}
+    {"read", "glob", "grep", "webfetch", "websearch", "diagnostics", "lint", "symbols", "git", "list_changes", "skill", "risk_review"}
 )
 
 MUTATING_TOOLS: frozenset[str] = frozenset({"write", "edit", "multi_edit", "apply_patch"})
@@ -1070,6 +1070,8 @@ class ToolExecutor:
                 res = await self._tool_image_generate(args)
             elif name == "mcp_resource":
                 res = await self._tool_mcp_resource(args)
+            elif name == "risk_review":
+                res = await asyncio.to_thread(self._tool_risk_review, args)
             elif name == "lint":
                 res = await self._tool_lint(args)
             elif name == "notebook":
@@ -1927,6 +1929,16 @@ class ToolExecutor:
             "\n".join(f"- {item}" for item in all_issues),
         )
 
+    def _tool_risk_review(self, args: dict[str, Any]) -> ToolResult:
+        from .risk import analyze_risk, render_markdown
+
+        report = analyze_risk(self.workspace)
+        return ToolResult(
+            report.level in ("low", "medium"),
+            f"risk: {report.level} ({report.score}/100)",
+            render_markdown(report),
+        )
+
     def _tool_skill(self, args: dict[str, Any]) -> ToolResult:
         skills = load_skills(self.workspace)
         if not skills:
@@ -1954,7 +1966,8 @@ class ToolExecutor:
         body = body.replace("{args}", extra).replace("$ARGUMENTS", extra)
         description = skill.get("description") or ""
         header = f"Skill: {name}" + (f" — {description}" if description else "")
-        return ToolResult(True, f"skill {name} loaded", f"{header}\n\n{body}")
+        skill_path = Path(str(skill.get("path") or "")).parent
+        return ToolResult(True, f"skill {name} loaded", f"{header}\nReference files: {skill_path}\n\n{body}")
 
     def skill_tool_schema(self) -> dict[str, Any] | None:
         return skill_tool_schema(load_skills(self.workspace))
@@ -2991,6 +3004,14 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 },
                 "required": ["action"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "risk_review",
+            "description": "Score the current git diff for risky patterns (secrets, destructive changes, auth/CI, migrations).",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {

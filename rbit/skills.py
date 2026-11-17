@@ -88,6 +88,12 @@ def load_skills(workspace: Path, *, include_global: bool = True) -> dict[str, di
         for directory in global_skill_dirs():
             _collect(directory, skills)
     _collect(workspace / ".rbit" / "skills", skills)
+    builtin_dir = Path(__file__).resolve().parent / "builtin_skills"
+    if builtin_dir.is_dir():
+        builtin: dict[str, dict[str, str]] = {}
+        _collect(builtin_dir, builtin)
+        for name, skill in builtin.items():
+            skills.setdefault(name, skill)
     return skills
 
 

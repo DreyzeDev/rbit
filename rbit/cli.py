@@ -621,6 +621,38 @@ def _run_agent(workspace: Path, cmd: str, name: str | None) -> int:
     return 1
 
 
+def _run_risk(workspace: Path, as_json: bool = False) -> int:
+    from rbit.risk import analyze_risk, render_markdown
+
+    report = analyze_risk(workspace)
+    if as_json:
+        print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        Console().print(RichMarkdown(render_markdown(report)))
+    return 0 if report.level in ("low", "medium") else 1
+
+
+def _run_replay(workspace: Path, session_id: str | None = None, as_json: bool = False) -> int:
+    console = Console()
+    storage = StorageManager(workspace)
+    session = storage.find_session(session_id) if session_id else next(iter(storage.list_sessions()), None)
+    if session is None:
+        console.print("[red]Session not found.[/]")
+        return 1
+    if as_json:
+        print(json.dumps(session.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    console.print(f"[bold #fab283]{session.title}[/] [dim]{session.id}[/]")
+    for message in session.messages:
+        role = message.role.upper()
+        console.print(f"\n[bold]{role}[/]: {message.content[:2000]}")
+        for call in message.tool_calls:
+            console.print(f"  [cyan]→ {call.name}[/] {call.summary} [dim]({call.duration_ms} ms)[/]")
+            if call.output:
+                console.print(f"[dim]{call.output[:400]}[/]")
+    return 0
+
+
 def _run_stats(
     workspace: Path,
     days: int | None = None,
@@ -1314,7 +1346,7 @@ def _run_init(workspace: Path, force: bool = False, as_json: bool = False) -> in
 
 COMMANDS = (
     "run mini doctor stats sessions session export import map lint init commit update upgrade uninstall "
-    "mcp acp serve service api debug plugin auth models agent pr web watch voice backup describe schedule reload pair"
+    "mcp acp serve service api debug plugin auth models agent pr web watch voice backup describe schedule risk replay reload pair"
 )
 
 COMPLETION_SCRIPTS: dict[str, str] = {
@@ -1446,7 +1478,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "schedule", "reload", "pair", "mini"}
+    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "schedule", "risk", "replay", "reload", "pair", "mini"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -1859,6 +1891,21 @@ def main(argv: list[str] | None = None) -> int:
                 print("No README found.")
             return 0
 
+        if sub == "risk":
+            p = argparse.ArgumentParser(prog="rbit risk", description="Score the risk of the current git diff")
+            p.add_argument("dir", nargs="?", help="Workspace directory")
+            p.add_argument("--json", action="store_true", help="Output JSON")
+            parsed = p.parse_args(rest)
+            return _run_risk(_resolve_workspace(parsed.dir), parsed.json)
+
+        if sub == "replay":
+            p = argparse.ArgumentParser(prog="rbit replay", description="Replay a saved session timeline")
+            p.add_argument("session_id", nargs="?", help="Session id or prefix")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            p.add_argument("--json", action="store_true")
+            parsed = p.parse_args(rest)
+            return _run_replay(_resolve_workspace(parsed.dir), parsed.session_id, parsed.json)
+
         if sub == "stats":
             p = argparse.ArgumentParser(prog="rbit stats")
             p.add_argument("dir", nargs="?", help="Workspace directory")
@@ -1967,6 +2014,8 @@ def main(argv: list[str] | None = None) -> int:
             "  rbit plugin add|list|check|update|remove   Manage package plugins\n"
             "  rbit debug agents|config|paths|heap-dump   Debugging tools\n"
             "  rbit schedule list|add|remove|run-due   Manage scheduled prompts\n"
+            "  rbit risk [dir]       Score risky patterns in the current git diff\n"
+            "  rbit replay [id]      Replay a session timeline\n"
             "  rbit auth login|list|switch|export|import   Multi-credential management\n"
             "  rbit mini              Minimal interactive interface\n"
             "  rbit pair              Pair a browser/app with the running server\n"

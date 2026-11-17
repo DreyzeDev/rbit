@@ -21,7 +21,10 @@ All notable changes to rbit are documented here. The format follows
   (Exa/Tavily/Firecrawl with DuckDuckGo fallback).
 - Tools for terminal sessions (`terminal`), image generation (`image_generate`) and artifacts/schedules, plus model variants and multi-provider websearch.
 - Cron-style schedules, schedule runner lock, MCP resource list/read tool, ACP session replay, terminal/image tools.
+- Built-in `rbit-design` skill (with theme.css/liquid-nav.js/sheet.js/stickers.js references) (bundled, project/global overrides) with automatic activation when a UI request has no visual direction, plus opt-out `auto_design_skill`.
+- Change-risk analyzer (`rbit risk`, `risk_review` tool) and session replay (`rbit replay`) with deterministic git-diff scoring.
 - Server API bearer-token auth (`RBIT_SERVER_TOKEN`/service-generated token), pair-cookie flow for the web UI, 0600 service state, and keyring-backed multi-credentials.
+- Native Google Gemini generateContent support (`protocol: gemini`) with functionCall/functionResponse loops.
 - Native Anthropic Messages API support (`protocol: anthropic`) with tool_use/tool_result loop.
 - Server API additions: `/v1/artifacts`, `/v1/schedules`, `/v1/fs`, `/v1/usage`,
   `/v1/config`, `/v1/skills`, `/v1/vcs/status`, `/v1/reload`, plus OpenAPI IDs.

@@ -302,3 +302,60 @@ async def test_model_variant_suffix_sets_effort_and_strips_model(tmp_path: Path)
         )
     assert captured[0]["model"] == "deepseek/deepseek-reasoner"
     assert captured[0]["reasoning_effort"] == "high"
+
+def test_risk_analysis_and_cli(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    import subprocess as sp
+    from rbit.cli import _run_risk
+    from rbit.risk import analyze_risk
+
+    sp.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    sp.run(["git", "config", "user.email", "t@example.com"], cwd=tmp_path, check=True, capture_output=True)
+    sp.run(["git", "config", "user.name", "T"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    sp.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "app.py").write_text("API_KEY = 'AKIA1234567890ABCDEF'\n", encoding="utf-8")
+    report = analyze_risk(tmp_path)
+    assert report.findings
+    assert report.level in ("medium", "high", "critical")
+    assert _run_risk(tmp_path, as_json=True) in (0, 1)
+    assert "score" in capsys.readouterr().out
+
+@pytest.mark.asyncio
+async def test_auto_design_skill_triggers_without_visual_direction(tmp_path: Path) -> None:
+    captured: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    async def run(prompt: str) -> str:
+        cfg = {"api_key": "test", "api_base": "https://mock.local/v1"}
+        session = Session()
+        executor = ToolExecutor(workspace=tmp_path, session=session, get_config=lambda: cfg)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg, http_client=client)
+            user = ChatMessage(id=short_id(), role="user", content=prompt)
+            session.messages.append(user)
+
+            async def _noop(_rec: ToolCallRecord) -> None:
+                return None
+
+            async def _status(_text: str) -> None:
+                return None
+
+            await engine.run_turn(
+                session=session,
+                user_msg=user,
+                agent_mode="build",
+                model_id="openai/gpt-4.1",
+                on_tool_start=_noop,
+                on_tool_end=_noop,
+                on_status=_status,
+            )
+        return captured[-1]["messages"][0]["content"]
+
+    system = await run("make a landing page for a coffee shop")
+    assert "AUTO-ACTIVATED SKILL `rbit-design`" in system
+    system = await run("make a landing page with dark minimalist style")
+    assert "AUTO-ACTIVATED SKILL" not in system
