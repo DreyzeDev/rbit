@@ -22,6 +22,7 @@ All notable changes to rbit are documented here. The format follows
 - Tools for terminal sessions (`terminal`), image generation (`image_generate`) and artifacts/schedules, plus model variants and multi-provider websearch.
 - Cron-style schedules, schedule runner lock, MCP resource list/read tool, ACP session replay, terminal/image tools.
 - Built-in `rbit-design` skill (with theme.css/liquid-nav.js/sheet.js/stickers.js references) (bundled, project/global overrides) with automatic activation when a UI request has no visual direction, plus opt-out `auto_design_skill`.
+- Blueprint batch: `read_many_files`, LSP definition/references/hover tool, `budget_usd` guard, `/cost`, `/usage`, `/status`, `/permissions`, `/agents`, `/provider`, `/hooks`.
 - `rbit status` dashboard, `rbit config schema`, `rbit models --json`.
 - Fast `rbit --version` and `--generate-completion` paths (~50ms), global `--no-color`, Windows/macOS smoke CI.
 - CLI quality: `rbit config get/set/list/validate/edit`, `rbit permissions list/explain`, `rbit completion install/print`, `rbit logs`, global `--log-file`, mypy + CLI smoke in CI, pyproject metadata/keyring extra.

@@ -1585,6 +1585,66 @@ class RbitApp(App[None]):
         self.notify(f"Undone {n} change(s) from this turn." if n else "Nothing to undo.", timeout=2.0)
         self._sync_ui()
 
+    def _cmd_info(self, kind: str) -> None:
+        from rbit.models import get_model_info
+        from rbit.skills import load_skills
+        from rbit.subagents import load_subagents
+
+        if kind == "/cost":
+            spent = sum(
+                (message.tokens / 1000.0) * get_model_info(message.model or self.config_data.get("model", "")).cost_per_1k
+                for message in self.session.messages
+                if message.role == "assistant"
+            )
+            budget = float(self.config_data.get("budget_usd") or 0)
+            suffix = f" / ${budget:.2f} budget" if budget else ""
+            self._post_notice(f"Estimated session cost: **${spent:.4f}**{suffix}")
+            return
+        if kind == "/usage":
+            tools = sum(len(message.tool_calls) for message in self.session.messages)
+            self._post_notice(
+                f"Session usage: **{len(self.session.messages)}** messages, "
+                f"**{self.session.total_tokens:,}** tokens, **{tools}** tool calls."
+            )
+            return
+        if kind == "/status":
+            branch = detect_git_branch(self.workspace) or "not a repo"
+            self._post_notice(
+                f"Workspace: `{self.workspace}`\nBranch: `{branch}`\nModel: `{self.config_data.get('model')}`\n"
+                f"Mode: **{self.agent_mode}**, sessions: {len(self.storage.list_sessions())}, "
+                f"checkpoints: {len(self.storage.list_checkpoints())}."
+            )
+            return
+        if kind == "/permissions":
+            rules = self.config_data.get("permissions")
+            if not rules:
+                self._post_notice("No explicit permission rules; default is allow unless a tool asks/denies.")
+            else:
+                lines = [
+                    f"- `{rule.get('action')}` `{rule.get('resource')}` → **{rule.get('effect')}**"
+                    for rule in rules
+                    if isinstance(rule, dict)
+                ]
+                self._post_notice("Permissions:\n" + "\n".join(lines))
+            return
+        if kind == "/agents":
+            agents = load_subagents(self.workspace, self.config_data)
+            skills = load_skills(self.workspace)
+            lines = [f"- subagent `{name}`: {item.description or 'no description'}" for name, item in sorted(agents.items())]
+            lines += [f"- skill `{name}`: {item.get('description') or 'no description'}" for name, item in sorted(skills.items())]
+            self._post_notice("Agents & skills:\n" + ("\n".join(lines) if lines else "(none)"))
+            return
+        if kind == "/provider":
+            key = bool(self.storage.resolve_api_key(self.config_data))
+            self._post_notice(
+                f"Provider: `{self.config_data.get('api_base')}` | model `{self.config_data.get('model')}` | "
+                f"key **{'set' if key else 'missing'}**"
+            )
+            return
+        if kind == "/hooks":
+            count = sum(self.plugins.count(hook) for hook in ("tool.execute.before", "tool.execute.after", "chat.params", "event"))
+            self._post_notice(f"Plugin hooks registered: **{count}** across 4 hook types.")
+
     async def _cmd_test(self, path: str) -> None:
         cmd = path.strip() or detect_test_command(self.workspace)
         if not cmd:
@@ -1972,6 +2032,9 @@ class RbitApp(App[None]):
             return True
         if cmd == "/test":
             self._run_coro(self._cmd_test(arg))
+            return True
+        if cmd in ("/cost", "/usage", "/status", "/permissions", "/agents", "/provider", "/hooks"):
+            self._cmd_info(cmd)
             return True
         if cmd == "/review":
             self._cmd_review()

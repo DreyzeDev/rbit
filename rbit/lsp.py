@@ -456,6 +456,39 @@ class LSPClient:
             return "\n".join(str(item.get("value") if isinstance(item, dict) else item) for item in contents)
         return str(contents or "")
 
+    async def locations(self, method: str, path: Path, line: int, column: int) -> list[dict[str, Any]]:
+        if self.process is None and not await self.start():
+            return []
+        uri = path.resolve().as_uri()
+        params = {
+            "textDocument": {"uri": uri},
+            "position": {"line": max(0, line - 1), "character": max(0, column - 1)},
+        }
+        if method == "textDocument/references":
+            params["context"] = {"includeDeclaration": True}
+        try:
+            result = await asyncio.wait_for(self._request(method, params), 8.0)
+        except (asyncio.TimeoutError, RuntimeError, OSError):
+            return []
+        items = result if isinstance(result, list) else [result] if isinstance(result, dict) else []
+        locations = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            target = item.get("targetUri") if "targetUri" in item else item.get("uri")
+            range_info = item.get("targetSelectionRange") if "targetSelectionRange" in item else item.get("range")
+            if not target or not isinstance(range_info, dict):
+                continue
+            position = range_info.get("start") or {}
+            locations.append(
+                {
+                    "path": str(self._uri_to_path(str(target))),
+                    "line": int(position.get("line", 0)) + 1,
+                    "column": int(position.get("character", 0)) + 1,
+                }
+            )
+        return locations
+
     async def close(self) -> None:
         if self.process is None:
             return
@@ -536,6 +569,18 @@ class LSPManager:
         if client is None:
             return ""
         return await client.hover(path, line, column)
+
+    async def definition(self, path: Path, line: int, column: int) -> list[dict[str, Any]]:
+        client = self.client_for(path)
+        if client is None:
+            return []
+        return await client.locations("textDocument/definition", path, line, column)
+
+    async def references(self, path: Path, line: int, column: int) -> list[dict[str, Any]]:
+        client = self.client_for(path)
+        if client is None:
+            return []
+        return await client.locations("textDocument/references", path, line, column)
 
     def status_lines(self) -> list[str]:
         lines = []

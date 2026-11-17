@@ -549,6 +549,24 @@ class AgentEngine:
     ) -> ChatMessage:
         t0 = time.perf_counter()
         cfg = self.get_config()
+        budget = float(cfg.get("budget_usd") or 0)
+        if budget > 0:
+            spent = sum(
+                (message.tokens / 1000.0) * get_model_info(message.model or model_id).cost_per_1k
+                for message in session.messages
+                if message.role == "assistant"
+            )
+            if spent >= budget:
+                return ChatMessage(
+                    id=short_id(),
+                    role="assistant",
+                    content=(
+                        f"**Budget guard:** estimated session spend ${spent:.4f} reached "
+                        f"the `${budget:.2f}` limit. Increase `budget_usd` or start a new session."
+                    ),
+                    agent=agent_mode,
+                    model=model_id,
+                )
         model_id, variant = self._split_model_variant(model_id)
         self._active_variant = variant
         self._auto_design_section = self._auto_design_prompt(user_msg)

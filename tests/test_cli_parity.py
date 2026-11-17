@@ -405,3 +405,55 @@ def test_status_config_schema_and_models_json(tmp_path: Path, capsys: pytest.Cap
     assert payload["workspace"] == str(tmp_path)
     assert _run_config(tmp_path, "schema") == 0
     assert "properties" in capsys.readouterr().out
+
+@pytest.mark.asyncio
+async def test_read_many_files_tool(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("alpha\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("beta\n", encoding="utf-8")
+    executor = ToolExecutor(workspace=tmp_path, session=Session(), get_config=dict)
+    result = await executor.execute("read_many_files", {"paths": ["a.txt", "b.txt", "missing.txt"]})
+    assert result.ok is True
+    assert "alpha" in result.output and "beta" in result.output
+    assert "missing.txt" in result.output
+
+
+@pytest.mark.asyncio
+async def test_budget_guard_stops_turn(tmp_path: Path) -> None:
+    session = Session()
+    session.messages.append(
+        ChatMessage(id=short_id(), role="assistant", content="x", model="openai/gpt-4.1", tokens=1_000_000)
+    )
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"choices": [{"message": {"content": "no"}}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        executor = ToolExecutor(workspace=tmp_path, session=session, get_config=lambda: {"budget_usd": 0.01})
+        engine = AgentEngine(
+            workspace=tmp_path,
+            executor=executor,
+            get_config=lambda: {"api_key": "k", "api_base": "https://mock.local/v1", "budget_usd": 0.01},
+            http_client=client,
+        )
+        user = ChatMessage(id=short_id(), role="user", content="hi")
+        session.messages.append(user)
+
+        async def _noop(_rec: ToolCallRecord) -> None:
+            return None
+
+        async def _status(_text: str) -> None:
+            return None
+
+        reply = await engine.run_turn(
+            session=session,
+            user_msg=user,
+            agent_mode="build",
+            model_id="openai/gpt-4.1",
+            on_tool_start=_noop,
+            on_tool_end=_noop,
+            on_status=_status,
+        )
+    assert "Budget guard" in reply.content
+    assert calls["n"] == 0

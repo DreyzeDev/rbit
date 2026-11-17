@@ -73,7 +73,7 @@ READONLY_BASH_PREFIXES = (
 )
 
 READONLY_TOOLS: frozenset[str] = frozenset(
-    {"read", "glob", "grep", "webfetch", "websearch", "diagnostics", "lint", "symbols", "git", "list_changes", "skill", "risk_review"}
+    {"read", "glob", "grep", "webfetch", "websearch", "diagnostics", "lint", "symbols", "git", "list_changes", "skill", "risk_review", "read_many_files", "lsp"}
 )
 
 MUTATING_TOOLS: frozenset[str] = frozenset({"write", "edit", "multi_edit", "apply_patch"})
@@ -1072,6 +1072,10 @@ class ToolExecutor:
                 res = await self._tool_mcp_resource(args)
             elif name == "risk_review":
                 res = await asyncio.to_thread(self._tool_risk_review, args)
+            elif name == "read_many_files":
+                res = await self._tool_read_many(args)
+            elif name == "lsp":
+                res = await self._tool_lsp(args)
             elif name == "lint":
                 res = await self._tool_lint(args)
             elif name == "notebook":
@@ -1938,6 +1942,63 @@ class ToolExecutor:
             f"risk: {report.level} ({report.score}/100)",
             render_markdown(report),
         )
+
+    async def _tool_read_many(self, args: dict[str, Any]) -> ToolResult:
+        paths = args.get("paths") or args.get("files")
+        if isinstance(paths, str):
+            paths = [item.strip() for item in paths.split(",") if item.strip()]
+        if not isinstance(paths, list) or not paths:
+            return ToolResult(False, "missing paths", "`paths` must be a non-empty list.")
+        limit = max(1, min(200, int(args.get("limit") or 160)))
+        blocks: list[str] = []
+        missing: list[str] = []
+        for raw in paths[:50]:
+            raw = str(raw).strip()
+            if not raw:
+                continue
+            try:
+                target = self.resolve_path(raw)
+            except PathOutsideWorkspace:
+                missing.append(raw)
+                continue
+            if not target.is_file():
+                missing.append(raw)
+                continue
+            res = await asyncio.to_thread(self._tool_read, {"filePath": raw, "limit": limit})
+            if res.ok:
+                blocks.append(f'<file path="{raw}">\n{res.output}\n</file>')
+            else:
+                missing.append(raw)
+        if not blocks:
+            return ToolResult(False, "no files read", "Could not read: " + ", ".join(missing[:20]))
+        note = f"\n\nMissing: {', '.join(missing[:20])}" if missing else ""
+        return ToolResult(True, f"read {len(blocks)} file(s)", "\n\n".join(blocks) + note)
+
+    async def _tool_lsp(self, args: dict[str, Any]) -> ToolResult:
+        if self.lsp is None or int(getattr(self.lsp, "configured_count", 0) or 0) <= 0:
+            return ToolResult(False, "LSP is not configured", "Enable `lsp` in `.rbit/config.json`.")
+        action = str(args.get("action") or "definition").lower()
+        raw = str(args.get("filePath") or args.get("path") or "")
+        if not raw:
+            return ToolResult(False, "missing filePath", "`filePath` is required.")
+        path = self.resolve_path(raw)
+        line = max(1, int(args.get("line") or 1))
+        column = max(1, int(args.get("column") or 1))
+        try:
+            if action == "definition":
+                locations = await self.lsp.definition(path, line, column)
+                text = "\n".join(f"- {loc['path']}:{loc['line']}:{loc['column']}" for loc in locations)
+                return ToolResult(True, f"{len(locations)} definition(s)", text or "No definition found.")
+            if action == "references":
+                locations = await self.lsp.references(path, line, column)
+                text = "\n".join(f"- {loc['path']}:{loc['line']}:{loc['column']}" for loc in locations)
+                return ToolResult(True, f"{len(locations)} reference(s)", text or "No references found.")
+            if action == "hover":
+                text = await self.lsp.hover(path, line, column)
+                return ToolResult(True, "LSP hover", text or "No hover information.")
+        except Exception as exc:  # noqa: BLE001 - language server errors are user-facing
+            return ToolResult(False, "LSP request failed", str(exc))
+        return ToolResult(False, f"unknown lsp action: {action}", "Use action=definition|references|hover.")
 
     def _tool_skill(self, args: dict[str, Any]) -> ToolResult:
         skills = load_skills(self.workspace)
@@ -3004,6 +3065,38 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                     "agent": {"type": "string"},
                 },
                 "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_many_files",
+            "description": "Read several files in one tool call (batch context loading).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {"type": "array", "items": {"type": "string"}},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["paths"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lsp",
+            "description": "Ask LSP for a definition, references, or hover at a position.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["definition", "references", "hover"]},
+                    "filePath": {"type": "string"},
+                    "line": {"type": "integer"},
+                    "column": {"type": "integer"},
+                },
+                "required": ["action", "filePath"],
             },
         },
     },
