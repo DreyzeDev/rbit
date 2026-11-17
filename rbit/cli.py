@@ -1346,7 +1346,7 @@ def _run_init(workspace: Path, force: bool = False, as_json: bool = False) -> in
 
 COMMANDS = (
     "run mini doctor stats sessions session export import map lint init commit update upgrade uninstall "
-    "mcp acp serve service api debug plugin auth models agent pr web watch voice backup describe schedule risk replay reload pair"
+    "mcp acp serve service api debug plugin auth config permissions completion logs models agent pr web watch voice backup describe schedule risk replay reload pair"
 )
 
 COMPLETION_SCRIPTS: dict[str, str] = {
@@ -1445,6 +1445,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         logging.getLogger().setLevel(log_level)
 
+    if "--log-file" in args_list:
+        idx = args_list.index("--log-file")
+        if idx + 1 >= len(args_list) or args_list[idx + 1].startswith("-"):
+            Console(stderr=True).print("--log-file requires a path")
+            return 2
+        log_path = Path(args_list[idx + 1]).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.getLogger().addHandler(handler)
+        if log_level is None:
+            logging.getLogger().setLevel(logging.INFO)
+        args_list = args_list[:idx] + args_list[idx + 2:]
+
     if "--profile" in args_list:
         idx = args_list.index("--profile")
         if idx + 1 >= len(args_list) or args_list[idx + 1].startswith("-"):
@@ -1478,7 +1492,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "schedule", "risk", "replay", "reload", "pair", "mini"}
+    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "schedule", "risk", "replay", "reload", "pair", "mini"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -1624,6 +1638,43 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("-d", "--dir", help="Workspace directory")
             parsed = p.parse_args(rest)
             return _run_schedule(parsed)
+
+        if sub == "config":
+            p = argparse.ArgumentParser(prog="rbit config", description="Inspect and edit configuration")
+            p.add_argument("action", nargs="?", default="list", choices=["list", "show", "get", "set", "unset", "validate", "edit"])
+            p.add_argument("key", nargs="?", help="Dotted key, e.g. permissions or websearch.provider")
+            p.add_argument("value", nargs="?", help="Value (JSON or string)")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            p.add_argument("--json", action="store_true", help="JSON output where supported")
+            parsed = p.parse_args(rest)
+            return _run_config(_resolve_workspace(parsed.dir), parsed.action, parsed.key, parsed.value, parsed.json)
+
+        if sub == "permissions":
+            p = argparse.ArgumentParser(prog="rbit permissions", description="Inspect permission rules")
+            p.add_argument("action", nargs="?", default="list", choices=["list", "show", "explain", "check"])
+            p.add_argument("resource", nargs="*", help="For explain: <action> <resource>")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            resource = " ".join(parsed.resource).strip() or None
+            return _run_permissions(_resolve_workspace(parsed.dir), parsed.action, resource)
+
+        if sub == "completion":
+            p = argparse.ArgumentParser(prog="rbit completion", description="Install shell completion")
+            p.add_argument("action", nargs="?", default="install", choices=["install", "print"])
+            p.add_argument("shell", nargs="?", default="bash", choices=["bash", "zsh", "powershell"])
+            parsed = p.parse_args(rest)
+            if parsed.action == "print":
+                print(_completion_script(parsed.shell), end="")
+                return 0
+            return _run_completion_install(parsed.shell)
+
+        if sub == "logs":
+            p = argparse.ArgumentParser(prog="rbit logs", description="Show the service log")
+            p.add_argument("-n", "--lines", type=int, default=200)
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            p.add_argument("--json", action="store_true")
+            parsed = p.parse_args(rest)
+            return _run_logs(_resolve_workspace(parsed.dir), parsed.lines, parsed.json)
 
         if sub == "service":
             p = argparse.ArgumentParser(prog="rbit service", description="Manage the background rbit server")
@@ -2728,6 +2779,223 @@ async def _run_schedule_due(workspace: Path) -> int:
             lock_path.unlink()
         except OSError:
             pass
+
+
+def _config_redacted(cfg: dict[str, Any]) -> dict[str, Any]:
+    def scrub(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: ("***" if key in ("api_key", "token", "server_token") and value[key] else scrub(item))
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return value
+
+    return scrub(dict(cfg))
+
+
+def _config_get(cfg: dict[str, Any], dotted: str) -> tuple[bool, Any]:
+    current: Any = cfg
+    for part in dotted.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return False, None
+        current = current[part]
+    return True, current
+
+
+def _config_set(cfg: dict[str, Any], dotted: str, value: Any) -> None:
+    parts = dotted.split(".")
+    current = cfg
+    for part in parts[:-1]:
+        child = current.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            current[part] = child
+        current = child
+    current[parts[-1]] = value
+
+
+CONFIG_TYPES: dict[str, type | tuple[type, ...]] = {
+    "model": str,
+    "api_base": str,
+    "api_key": str,
+    "theme": str,
+    "effort": str,
+    "auto_compact": bool,
+    "auto_design_skill": bool,
+    "formatter": (bool, dict),
+    "lsp": (bool, dict),
+    "websearch": (bool, dict),
+    "permissions": list,
+    "plugins": list,
+    "instructions": list,
+}
+
+
+def _run_config(
+    workspace: Path,
+    action: str,
+    key: str | None = None,
+    value: str | None = None,
+    as_json: bool = False,
+) -> int:
+    console = Console()
+    storage = StorageManager(workspace)
+    cfg = storage.load_config()
+    if action in ("list", "show"):
+        print(json.dumps(_config_redacted(cfg), ensure_ascii=False, indent=2))
+        return 0
+    if action == "get":
+        if not key:
+            console.print("[red]config get requires KEY[/]")
+            return 2
+        found, item = _config_get(cfg, key)
+        if not found:
+            console.print(f"[red]Unknown key:[/] {key}")
+            return 1
+        if key in ("api_key", "token", "server_token"):
+            item = "***" if item else ""
+        print(json.dumps(item, ensure_ascii=False, indent=2))
+        return 0
+    if action == "set":
+        if not key or value is None:
+            console.print("[red]config set requires KEY VALUE[/]")
+            return 2
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            parsed = value
+        _config_set(cfg, key, parsed)
+        storage.save_config(cfg)
+        console.print(f"config updated: {key}")
+        return 0
+    if action == "unset":
+        if not key:
+            console.print("[red]config unset requires KEY[/]")
+            return 2
+        parts = key.split(".")
+        current: Any = cfg
+        for part in parts[:-1]:
+            current = current.get(part) if isinstance(current, dict) else None
+        if not isinstance(current, dict) or parts[-1] not in current:
+            console.print(f"[red]Unknown key:[/] {key}")
+            return 1
+        del current[parts[-1]]
+        storage.save_config(cfg)
+        console.print(f"config removed: {key}")
+        return 0
+    if action == "validate":
+        errors: list[str] = []
+        for key_name, expected in CONFIG_TYPES.items():
+            if key_name not in cfg:
+                continue
+            if not isinstance(cfg[key_name], expected):
+                errors.append(f"{key_name}: expected {getattr(expected, '__name__', expected)}")
+        if isinstance(cfg.get("permissions"), list):
+            for index, rule in enumerate(cfg["permissions"]):
+                if not isinstance(rule, dict) or not {"action", "resource", "effect"} <= set(rule):
+                    errors.append(f"permissions[{index}]: action/resource/effect required")
+        for message in errors:
+            console.print(f"[red]✗[/] {message}")
+        if not errors:
+            console.print("[#7fd88f]✓ config is valid[/]")
+        return 1 if errors else 0
+    if action == "edit":
+        editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or ("notepad" if os.name == "nt" else "vi")
+        storage.state_dir.mkdir(parents=True, exist_ok=True)
+        if not storage.config_path.exists():
+            storage.save_config(cfg)
+        return subprocess.run([editor, str(storage.config_path)], check=False).returncode
+    console.print(f"[red]Unknown config action:[/] {action}")
+    return 2
+
+
+def _run_permissions(workspace: Path, action: str, resource: str | None = None) -> int:
+    from rbit.models import Session
+    from rbit.tools import ToolExecutor
+
+    console = Console()
+    storage = StorageManager(workspace)
+    cfg = storage.load_config()
+    executor = ToolExecutor(workspace=workspace, session=Session(), storage=storage, get_config=lambda: cfg)
+    if action in ("list", "show"):
+        rules = cfg.get("permissions")
+        if not rules:
+            console.print("No explicit permissions. Default: allow unless a tool asks or denies.")
+            return 0
+        table = Table(title="rbit permissions", border_style="#282828")
+        table.add_column("Action")
+        table.add_column("Resource")
+        table.add_column("Effect")
+        for rule in rules if isinstance(rules, list) else []:
+            if isinstance(rule, dict):
+                table.add_row(str(rule.get("action")), str(rule.get("resource")), str(rule.get("effect")))
+        console.print(table)
+        return 0
+    if action in ("explain", "check"):
+        if not resource:
+            console.print("[red]permissions explain requires ACTION RESOURCE[/]")
+            return 2
+        parts = resource.split(maxsplit=1)
+        if len(parts) != 2:
+            console.print("[red]Use: rbit permissions explain <action> <resource>[/]")
+            return 2
+        action_name, resource_name = parts
+        effect = executor.resolve_permission_effect(action_name, resource_name, "build")
+        console.print(f"{action_name} {resource_name} -> {effect or 'no-rule (allow)'}")
+        return 0
+    console.print(f"[red]Unknown permissions action:[/] {action}")
+    return 2
+
+
+def _run_completion_install(shell: str) -> int:
+    console = Console()
+    script = _completion_script(shell)
+    if shell == "powershell":
+        target = Path.home() / "Documents" / "PowerShell" / "Microsoft.PowerShell_profile.ps1"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        existing = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
+        if "Register-ArgumentCompleter -Native -CommandName rbit" in existing:
+            console.print("completion already installed")
+            return 0
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write("\n" + script)
+        console.print(f"completion installed: {target}")
+        return 0
+    if shell == "zsh":
+        target = Path.home() / ".zshrc"
+    else:
+        target = Path.home() / ".bashrc"
+    existing = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
+    marker = "_rbit_completion"
+    if marker in existing:
+        console.print("completion already installed")
+        return 0
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write("\n" + script)
+    console.print(f"completion installed: {target}")
+    return 0
+
+
+def _run_logs(workspace: Path, lines: int = 200, as_json: bool = False) -> int:
+    from rbit.service import ServiceManager
+
+    console = Console()
+    manager = ServiceManager()
+    state = manager.read()
+    path = Path(state.log) if state and state.log else (workspace / ".rbit" / "service.log")
+    if not path.exists():
+        console.print(f"[yellow]No log file:[/] {path}")
+        return 1
+    content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    tail = content[-max(1, lines) :]
+    if as_json:
+        print(json.dumps({"path": str(path), "lines": tail}, ensure_ascii=False, indent=2))
+    else:
+        console.print(f"[dim]{path}[/]")
+        console.print("\n".join(tail))
+    return 0
 
 
 def build_openapi_spec() -> dict:

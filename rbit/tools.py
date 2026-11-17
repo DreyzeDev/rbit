@@ -447,7 +447,7 @@ class ToolExecutor:
         self.plugins = plugins
         self.http_client = http_client
         self.question_cb = question_cb
-        self._terminal_shell = None
+        self._terminal_shell: Any = None
         self.undo_stack: list[FileSnapshot] = []
         self.redo_stack: list[FileSnapshot] = []
         self.always_allow_bash: bool = False
@@ -1873,7 +1873,7 @@ class ToolExecutor:
         else:
             targets = [self.workspace / rel for rel in self.list_workspace_files(limit=300)]
 
-        if self.lsp is not None and getattr(self.lsp, "configured_count", 0):
+        if self.lsp is not None and int(getattr(self.lsp, "configured_count", 0) or 0) > 0:
             supported = [path for path in targets if self.lsp.definition_for(path) is not None]
             if supported:
                 results = await self.lsp.diagnostics_for_many(supported)
@@ -2105,7 +2105,8 @@ class ToolExecutor:
         if not prompt:
             return ToolResult(False, "missing prompt", "`prompt` is required.")
         config = self.get_config() if self.get_config is not None else {}
-        image_cfg = config.get("image") if isinstance(config.get("image"), dict) else {}
+        raw_image = config.get("image")
+        image_cfg: dict[str, Any] = raw_image if isinstance(raw_image, dict) else {}
         api_base = str(image_cfg.get("api_base") or config.get("api_base") or "https://api.openai.com/v1").rstrip("/")
         api_base = api_base.removesuffix("/chat/completions")
         api_key = str(image_cfg.get("api_key") or "").strip() or (

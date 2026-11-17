@@ -28,5 +28,13 @@ jobs:
       - name: Lint (fatal rules only)
         run: ruff check rbit tests --select E9,F63,F7,F82
 
+      - name: Mypy
+        run: python -m mypy
+
+      - name: CLI smoke
+        run: |
+          python -m rbit --version
+          python -m rbit --generate-completion bash > /dev/null
+
       - name: Tests
         run: pytest -q

@@ -14,8 +14,11 @@ from rbit.cli import (
     API_OPERATIONS,
     _create_worktree,
     _run_auth,
+    _run_config,
     _run_debug,
     _run_import,
+    _run_logs,
+    _run_permissions,
     _run_stats,
 )
 from rbit.mcp import MCPManager
@@ -359,3 +362,32 @@ async def test_auto_design_skill_triggers_without_visual_direction(tmp_path: Pat
     assert "AUTO-ACTIVATED SKILL `rbit-design`" in system
     system = await run("make a landing page with dark minimalist style")
     assert "AUTO-ACTIVATED SKILL" not in system
+
+def test_config_get_set_list_validate(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert _run_config(tmp_path, "set", "websearch.provider", "tavily") == 0
+    assert _run_config(tmp_path, "get", "websearch.provider") == 0
+    assert "tavily" in capsys.readouterr().out
+    assert _run_config(tmp_path, "list") == 0
+    assert "websearch" in capsys.readouterr().out
+    assert _run_config(tmp_path, "validate") == 0
+    StorageManager(tmp_path).save_config({**StorageManager(tmp_path).load_config(), "permissions": [{"action": "read"}]})
+    assert _run_config(tmp_path, "validate") == 1
+
+
+def test_permissions_list_and_explain(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    storage = StorageManager(tmp_path)
+    cfg = storage.load_config()
+    cfg["permissions"] = [{"action": "edit", "resource": "*.md", "effect": "deny"}]
+    storage.save_config(cfg)
+    assert _run_permissions(tmp_path, "list") == 0
+    assert "edit" in capsys.readouterr().out
+    assert _run_permissions(tmp_path, "explain", "edit README.md") == 0
+    assert "deny" in capsys.readouterr().out
+
+
+def test_logs_reads_workspace_log(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    log = tmp_path / ".rbit" / "service.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("line1\nline2\n", encoding="utf-8")
+    assert _run_logs(tmp_path, lines=10) == 0
+    assert "line2" in capsys.readouterr().out

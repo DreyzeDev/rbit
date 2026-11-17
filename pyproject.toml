@@ -6,17 +6,38 @@ build-backend = "setuptools.build_meta"
 name = "rbit"
 version = "1.3.1"
 description = "rbit — Next-Gen Full-Screen Terminal AI Coding Agent & CLI"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "DreyzeDev" }]
 requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Tools",
+]
 dependencies = [
     "textual>=8.0.0",
     "rich>=14.0.0",
     "httpx>=0.27.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/DreyzeDev/rbit"
+Repository = "https://github.com/DreyzeDev/rbit"
+Issues = "https://github.com/DreyzeDev/rbit/issues"
+Changelog = "https://github.com/DreyzeDev/rbit/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
 tokens = ["tiktoken>=0.7.0"]
 mobile = ["qrcode>=7.4"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.6"]
+keyring = ["keyring>=24.0.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.10"]
 
 [tool.setuptools.packages.find]
 include = ["rbit*"]
@@ -41,5 +62,5 @@ no_implicit_optional = true
 exclude = ["build", "dist", ".venv"]
 
 [[tool.mypy.overrides]]
-module = ["tiktoken", "keyring", "keyring.*"]
+module = ["tiktoken", "keyring", "keyring.*", "cryptography", "cryptography.*"]
 ignore_missing_imports = true

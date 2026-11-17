@@ -78,7 +78,7 @@ class StorageManager:
                     # Windows: check the process exists via tasklist-free heuristic
                     import ctypes
 
-                    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+                    kernel32 = ctypes.windll.kernel32
                     handle = kernel32.OpenProcess(0x100000, False, other)  # PROCESS_QUERY_LIMITED_INFORMATION
                     if handle:
                         kernel32.CloseHandle(handle)
