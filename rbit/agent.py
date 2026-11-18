@@ -263,6 +263,7 @@ class AgentEngine:
         self._active_profile_readonly: bool = False
         self._active_variant: str | None = None
         self._auto_design_section = ""
+        self._opencode_session = ""
 
     def _auto_design_prompt(self, user_msg: ChatMessage) -> str:
         if not self.get_config().get("auto_design_skill", True):
@@ -290,6 +291,9 @@ class AgentEngine:
         mcp_resource_schema = self.executor.mcp_resource_schema()
         if mcp_resource_schema is not None:
             schemas.append(mcp_resource_schema)
+        browser_schema = self.executor.browser_tool_schema()
+        if browser_schema is not None:
+            schemas.append(browser_schema)
         allowed = self._active_profile_tools
         if allowed is None:
             return schemas
@@ -529,7 +533,13 @@ class AgentEngine:
             "HTTP-Referer": "https://rbit.cli",
             "X-Title": "rbit",
         }
-        extra = (self.get_config() or {}).get("extra_headers")
+        cfg = self.get_config() or {}
+        base = str(cfg.get("api_base") or "")
+        if "opencode.ai" in base and ("/go" in base or "inference/go" in base):
+            if not self._opencode_session:
+                self._opencode_session = f"rbit-{short_id()}-{os.getpid()}"
+            headers["x-opencode-session"] = str(cfg.get("opencode_session") or self._opencode_session)
+        extra = cfg.get("extra_headers")
         if isinstance(extra, dict):
             headers.update({str(k): str(v) for k, v in extra.items()})
         return headers
@@ -550,24 +560,36 @@ class AgentEngine:
         t0 = time.perf_counter()
         cfg = self.get_config()
         budget = float(cfg.get("budget_usd") or 0)
+        budget_mode = str(cfg.get("budget_mode") or "strict").lower()
+        spent_before = 0.0
         if budget > 0:
-            spent = sum(
+            spent_before = sum(
                 (message.tokens / 1000.0) * get_model_info(message.model or model_id).cost_per_1k
                 for message in session.messages
                 if message.role == "assistant"
             )
-            if spent >= budget:
+            if spent_before >= budget and budget_mode not in ("warn", "off"):
                 return ChatMessage(
                     id=short_id(),
                     role="assistant",
                     content=(
-                        f"**Budget guard:** estimated session spend ${spent:.4f} reached "
+                        f"**Budget guard:** estimated session spend ${spent_before:.4f} reached "
                         f"the `${budget:.2f}` limit. Increase `budget_usd` or start a new session."
                     ),
                     agent=agent_mode,
                     model=model_id,
                 )
+            if budget_mode != "off" and on_status is not None:
+                pct = spent_before / budget * 100
+                if pct >= 90:
+                    await on_status(f"budget: {pct:.0f}% used")
+                elif pct >= 75:
+                    await on_status(f"budget: {pct:.0f}% used")
+                elif pct >= 50:
+                    await on_status(f"budget: {pct:.0f}% used")
         model_id, variant = self._split_model_variant(model_id)
+        if model_id.startswith("opencode-go/"):
+            model_id = model_id.split("/", 1)[1]
         self._active_variant = variant
         self._auto_design_section = self._auto_design_prompt(user_msg)
         routing = cfg.get("model_routing")
@@ -723,6 +745,19 @@ class AgentEngine:
         tokens_est = max(
             12, count_tokens(content) + sum(count_tokens(tc.output) for tc in tool_records)
         )
+        if budget > 0 and budget_mode != "off":
+            spent_after = spent_before + (tokens_est / 1000.0) * get_model_info(model_id).cost_per_1k
+            old_pct = spent_before / budget
+            new_pct = spent_after / budget
+            crossed = max(
+                (threshold for threshold in (0.5, 0.75, 0.9, 1.0) if old_pct < threshold <= new_pct),
+                default=None,
+            )
+            if crossed is not None:
+                content += (
+                    f"\n\n**Budget:** ${spent_after:.4f} / ${budget:.2f} "
+                    f"({new_pct * 100:.0f}% used)"
+                )
         return ChatMessage(
             id=short_id(),
             role="assistant",

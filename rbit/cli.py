@@ -29,7 +29,7 @@ from .models import _migrate_session_dict
 from .app import RbitApp
 from .models import ChatMessage, Session, ToolCallRecord, get_model_info, short_id
 from .storage import StorageManager
-from .tools import ToolExecutor
+from .tools import ToolExecutor, detect_test_command
 from .widgets import detect_git_branch
 
 
@@ -622,6 +622,146 @@ def _run_agent(workspace: Path, cmd: str, name: str | None) -> int:
         console.print(f"OK Skill agent created: {target}  -> run via /skill {name}")
         return 0
     return 1
+
+
+def _changed_files(workspace: Path) -> list[str]:
+    proc = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD"], cwd=str(workspace), capture_output=True, text=True, check=False
+    )
+    if proc.returncode != 0:
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _impacted_tests(workspace: Path, changed: list[str]) -> list[str]:
+    selected: list[str] = []
+    seen: set[str] = set()
+    for item in changed:
+        path = Path(item)
+        if "test" in path.stem.lower() or path.parts and path.parts[0] in ("tests", "test"):
+            if item not in seen:
+                selected.append(item)
+                seen.add(item)
+            continue
+        stem = path.stem
+        candidates = [
+            workspace / "tests" / f"test_{stem}.py",
+            workspace / "tests" / f"{stem}_test.py",
+            workspace / "test" / f"test_{stem}.py",
+        ]
+        found = [str(path_item) for path_item in candidates if path_item.exists()]
+        if not found:
+            test_dirs = [workspace / "tests", workspace / "test"]
+            for directory in test_dirs:
+                if not directory.exists():
+                    continue
+                for test_file in directory.rglob("*.py"):
+                    if test_file.stat().st_size > 500_000:
+                        continue
+                    try:
+                        if stem in test_file.read_text(encoding="utf-8", errors="replace"):
+                            found.append(str(test_file))
+                            break
+                    except OSError:
+                        continue
+        for item_found in found:
+            normalized = (
+                Path(item_found).relative_to(workspace).as_posix()
+                if item_found.startswith(str(workspace))
+                else Path(item_found).as_posix()
+            )
+            if normalized not in seen:
+                selected.append(normalized)
+                seen.add(normalized)
+    return sorted(selected)
+
+
+def _run_test(workspace: Path, changed_only: bool, run: bool, as_json: bool) -> int:
+    console = Console()
+    changed = _changed_files(workspace)
+    tests = _impacted_tests(workspace, changed) if changed_only else []
+    command = detect_test_command(workspace)
+    if changed_only and tests:
+        if command and command.lower().startswith("pytest"):
+            command = f"{command} " + " ".join(f'"{item}"' for item in tests)
+        elif shutil.which("pytest"):
+            command = f'"{sys.executable}" -m pytest ' + " ".join(f'"{item}"' for item in tests)
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "changed_files": changed,
+                    "impacted_tests": tests,
+                    "command": command if run or not changed_only else (command if tests else None),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if changed_only:
+        console.print("[bold]Changed files[/]")
+        console.print("\n".join(changed) or "(none)")
+        console.print("\n[bold]Impacted tests[/]")
+        console.print("\n".join(tests) or "(none detected)")
+    if not run:
+        return 0
+    if not command:
+        console.print("[red]No test command detected.[/]")
+        return 1
+    console.print(f"[bold]Running:[/] {command}")
+    proc = subprocess.run(command, cwd=str(workspace), shell=True, check=False)
+    return proc.returncode
+
+
+def _run_github(workspace: Path, kind: str, number: int, as_json: bool) -> int:
+    console = Console()
+    if shutil.which("gh") is None:
+        console.print("[red]GitHub CLI (`gh`) is not installed.[/] Install it or use the web URL.")
+        return 1
+    fields = (
+        "number,title,body,author,state,comments,files"
+        if kind == "pr"
+        else "number,title,body,author,state,comments"
+    )
+    proc = subprocess.run(
+        ["gh", f"{kind}", "view", str(number), "--json", fields],
+        cwd=str(workspace),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        console.print(f"[red]gh {kind} view failed:[/] {(proc.stderr or proc.stdout).strip()[:400]}")
+        return 1
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        console.print("[red]gh returned malformed JSON.[/]")
+        return 1
+    if as_json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    comments = data.pop("comments", [])
+    files = data.pop("files", [])
+    body = str(data.pop("body", "") or "")
+    lines = [
+        f"# {kind.upper()} #{data.get('number')}: {data.get('title')}",
+        f"- state: {data.get('state')}",
+        f"- author: {(data.get('author') or {}).get('login', '')}",
+        "",
+        body,
+    ]
+    if files:
+        lines += ["", "## Files"] + [f"- {item.get('path')}" for item in files if isinstance(item, dict)]
+    if comments:
+        lines += ["", "## Comments"]
+        for comment in comments:
+            if isinstance(comment, dict):
+                author = (comment.get("author") or {}).get("login", "")
+                lines += [f"**{author}**", str(comment.get("body") or ""), ""]
+    console.print(RichMarkdown("\n".join(lines)))
+    return 0
 
 
 def _run_status(workspace: Path, as_json: bool = False) -> int:
@@ -1513,7 +1653,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "status", "schedule", "risk", "replay", "reload", "pair", "mini"}
+    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "status", "test", "gh", "schedule", "risk", "replay", "reload", "pair", "mini"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -1809,6 +1949,24 @@ def main(argv: list[str] | None = None) -> int:
             parsed = p.parse_args(rest)
             return _run_import(_resolve_workspace(parsed.dir), parsed.file)
 
+        if sub == "test":
+            p = argparse.ArgumentParser(prog="rbit test", description="Detect and optionally run tests")
+            p.add_argument("dir", nargs="?", help="Workspace directory")
+            p.add_argument("--changed", action="store_true", help="Select tests impacted by the current diff")
+            p.add_argument("--run", action="store_true", help="Run the selected tests")
+            p.add_argument("--json", action="store_true", help="Output JSON")
+            parsed = p.parse_args(rest)
+            return _run_test(_resolve_workspace(parsed.dir), parsed.changed, parsed.run, parsed.json)
+
+        if sub == "gh":
+            p = argparse.ArgumentParser(prog="rbit gh", description="Fetch GitHub issue/PR context via gh")
+            p.add_argument("kind", choices=["issue", "pr"])
+            p.add_argument("number", type=int)
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            p.add_argument("--json", action="store_true")
+            parsed = p.parse_args(rest)
+            return _run_github(_resolve_workspace(parsed.dir), parsed.kind, parsed.number, parsed.json)
+
         if sub == "models":
             p = argparse.ArgumentParser(prog="rbit models", description="List available models")
             p.add_argument("provider", nargs="?", help="Filter by provider prefix (e.g. glm, am)")
@@ -2097,6 +2255,8 @@ def main(argv: list[str] | None = None) -> int:
             "  rbit risk [dir]       Score risky patterns in the current git diff\n"
             "  rbit replay [id]      Replay a session timeline\n"
             "  rbit auth login|list|switch|export|import   Multi-credential management\n"
+            "  rbit test --changed --run    Select and run tests impacted by the current diff\n"
+            "  rbit gh issue|pr <number>   Fetch GitHub issue/PR context via gh\n"
             "  rbit mini              Minimal interactive interface\n"
             "  rbit pair              Pair a browser/app with the running server\n"
             "  rbit serve             Local HTTP API (NDJSON turns, OpenAPI at /openapi.json)\n"

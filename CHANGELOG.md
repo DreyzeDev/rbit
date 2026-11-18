@@ -22,6 +22,8 @@ All notable changes to rbit are documented here. The format follows
 - Tools for terminal sessions (`terminal`), image generation (`image_generate`) and artifacts/schedules, plus model variants and multi-provider websearch.
 - Cron-style schedules, schedule runner lock, MCP resource list/read tool, ACP session replay, terminal/image tools.
 - Built-in `rbit-design` skill (with theme.css/liquid-nav.js/sheet.js/stickers.js references) (bundled, project/global overrides) with automatic activation when a UI request has no visual direction, plus opt-out `auto_design_skill`.
+- LSP rename + document symbols, budget warnings/strict mode, `/editor` alias, PDF reads (extra `pdf`), `rbit test --changed`, `rbit gh issue|pr`, optional Playwright `browser` tool.
+- OpenCode Go provider: `opencode-go/` model prefix, `x-opencode-session`, Go model catalog, verified live with Go subscription.
 - Hook lifecycle (`before_edit`, `after_edit`, `before_command`, `after_command`, `on_error`, `on_stop`, `session_start`) and `git branch` action.\n- Blueprint batch: `read_many_files`, LSP definition/references/hover tool, `budget_usd` guard, `/cost`, `/usage`, `/status`, `/permissions`, `/agents`, `/provider`, `/hooks`.
 - `rbit status` dashboard, `rbit config schema`, `rbit models --json`.
 - Fast `rbit --version` and `--generate-completion` paths (~50ms), global `--no-color`, Windows/macOS smoke CI.

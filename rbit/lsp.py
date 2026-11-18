@@ -433,6 +433,153 @@ class LSPClient:
     def diagnostics(self, path: Path) -> list[LSPDiagnostic]:
         return self._diagnostics.get(path.resolve().as_uri(), [])
 
+    async def document_symbols(self, path: Path) -> list[dict[str, Any]]:
+        if self.process is None and not await self.start():
+            return []
+        uri = path.resolve().as_uri()
+        try:
+            result = await asyncio.wait_for(
+                self._request("textDocument/documentSymbol", {"textDocument": {"uri": uri}}), 8.0
+            )
+        except (asyncio.TimeoutError, RuntimeError, OSError):
+            return []
+        items = result if isinstance(result, list) else []
+        symbols: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            range_info = item.get("range") or item.get("location", {}).get("range") or {}
+            start = range_info.get("start", {}) if isinstance(range_info, dict) else {}
+            symbols.append(
+                {
+                    "name": str(item.get("name") or ""),
+                    "kind": int(item.get("kind") or 0),
+                    "line": int(start.get("line", 0)) + 1,
+                    "column": int(start.get("character", 0)) + 1,
+                }
+            )
+        return symbols
+
+    async def rename(
+        self, path: Path, line: int, column: int, new_name: str
+    ) -> list[tuple[Path, dict[str, int], str]]:
+        if self.process is None and not await self.start():
+            return []
+        uri = path.resolve().as_uri()
+        params = {
+            "textDocument": {"uri": uri},
+            "position": {"line": max(0, line - 1), "character": max(0, column - 1)},
+            "newName": new_name,
+        }
+        try:
+            result = await asyncio.wait_for(self._request("textDocument/rename", params), 10.0)
+        except (asyncio.TimeoutError, RuntimeError, OSError):
+            return []
+        return self._parse_workspace_edit(result if isinstance(result, dict) else {})
+
+    def _parse_workspace_edit(self, edit: dict[str, Any]) -> list[tuple[Path, dict[str, int], str]]:
+        edits: list[tuple[Path, dict[str, int], str]] = []
+        changes = edit.get("changes")
+        if isinstance(changes, dict):
+            for uri, text_edits in changes.items():
+                target = self._uri_to_path(str(uri))
+                if not self._inside_workspace(target):
+                    continue
+                for item in text_edits if isinstance(text_edits, list) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    range_info = item.get("range") or {}
+                    start = range_info.get("start", {}) if isinstance(range_info, dict) else {}
+                    end = range_info.get("end", {}) if isinstance(range_info, dict) else {}
+                    edits.append(
+                        (
+                            target,
+                            {
+                                "start_line": int(start.get("line", 0)),
+                                "start_column": int(start.get("character", 0)),
+                                "end_line": int(end.get("line", 0)),
+                                "end_column": int(end.get("character", 0)),
+                            },
+                            str(item.get("newText") or ""),
+                        )
+                    )
+        document_changes = edit.get("documentChanges")
+        if isinstance(document_changes, list):
+            for change in document_changes:
+                if not isinstance(change, dict):
+                    continue
+                text_document = change.get("textDocument")
+                uri = text_document.get("uri") if isinstance(text_document, dict) else ""
+                target = self._uri_to_path(str(uri)) if uri else None
+                if target is None or not self._inside_workspace(target):
+                    continue
+                for item in change.get("edits") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    range_info = item.get("range") or {}
+                    start = range_info.get("start", {}) if isinstance(range_info, dict) else {}
+                    end = range_info.get("end", {}) if isinstance(range_info, dict) else {}
+                    edits.append(
+                        (
+                            target,
+                            {
+                                "start_line": int(start.get("line", 0)),
+                                "start_column": int(start.get("character", 0)),
+                                "end_line": int(end.get("line", 0)),
+                                "end_column": int(end.get("character", 0)),
+                            },
+                            str(item.get("newText") or ""),
+                        )
+                    )
+        return edits
+
+    def _inside_workspace(self, path: Path) -> bool:
+        try:
+            path.resolve().relative_to(self.workspace)
+        except (ValueError, OSError):
+            return False
+        return True
+
+    def apply_edits(self, edits: list[tuple[Path, dict[str, int], str]]) -> int:
+        by_file: dict[Path, list[tuple[dict[str, int], str]]] = {}
+        for path, range_info, new_text in edits:
+            by_file.setdefault(path, []).append((range_info, new_text))
+        applied = 0
+        for path, file_edits in by_file.items():
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+            except OSError:
+                continue
+            for range_info, new_text in sorted(
+                file_edits,
+                key=lambda item: (
+                    -item[0]["start_line"],
+                    -item[0]["start_column"],
+                    -item[0]["end_line"],
+                    -item[0]["end_column"],
+                ),
+            ):
+                try:
+                    start_line = int(range_info["start_line"])
+                    end_line = int(range_info["end_line"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if start_line < 0 or end_line >= len(lines):
+                    continue
+                start_text = lines[start_line]
+                start_column = min(int(range_info.get("start_column", 0)), len(start_text))
+                end_text = lines[end_line]
+                end_column = min(int(range_info.get("end_column", 0)), len(end_text))
+                prefix = start_text[:start_column]
+                suffix = end_text[end_column:]
+                lines[start_line : end_line + 1] = [prefix + new_text + suffix]
+                applied += 1
+            try:
+                path.write_text("".join(lines), encoding="utf-8")
+            except OSError:
+                continue
+        return applied
+
     async def hover(self, path: Path, line: int, column: int) -> str:
         if self.process is None and not await self.start():
             return ""
@@ -581,6 +728,20 @@ class LSPManager:
         if client is None:
             return []
         return await client.locations("textDocument/references", path, line, column)
+
+    async def symbols(self, path: Path) -> list[dict[str, Any]]:
+        client = self.client_for(path)
+        if client is None:
+            return []
+        return await client.document_symbols(path)
+
+    async def rename(self, path: Path, line: int, column: int, new_name: str) -> tuple[int, list[Path]]:
+        client = self.client_for(path)
+        if client is None:
+            return 0, []
+        edits = await client.rename(path, line, column, new_name)
+        applied = client.apply_edits(edits)
+        return applied, sorted({edit_path for edit_path, _range, _text in edits})
 
     def status_lines(self) -> list[str]:
         lines = []

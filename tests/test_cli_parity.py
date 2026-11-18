@@ -457,3 +457,97 @@ async def test_budget_guard_stops_turn(tmp_path: Path) -> None:
         )
     assert "Budget guard" in reply.content
     assert calls["n"] == 0
+
+def test_impacted_test_selection(tmp_path: Path) -> None:
+    import subprocess as sp
+    from rbit.cli import _changed_files, _impacted_tests
+
+    sp.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    sp.run(["git", "config", "user.email", "t@example.com"], cwd=tmp_path, check=True, capture_output=True)
+    sp.run(["git", "config", "user.name", "T"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_calc.py").write_text("from calc import add\n", encoding="utf-8")
+    sp.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "calc.py").write_text("def add(a, b):\n    return a + b + 0\n", encoding="utf-8")
+    changed = _changed_files(tmp_path)
+    assert changed == ["calc.py"]
+    assert _impacted_tests(tmp_path, changed) == [Path("tests/test_calc.py").as_posix()]
+
+
+def test_github_context_uses_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from rbit.cli import _run_github
+
+    monkeypatch.setattr("shutil.which", lambda _name: "gh")
+    payload = {"number": 7, "title": "Fix", "state": "OPEN", "body": "Body", "comments": []}
+
+    def fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr("rbit.cli.subprocess.run", fake_run)
+    assert _run_github(tmp_path, "issue", 7, as_json=True) == 0
+    assert json.loads(capsys.readouterr().out)["number"] == 7
+
+
+@pytest.mark.asyncio
+async def test_browser_tool_handles_missing_or_invalid_action(tmp_path: Path) -> None:
+    executor = ToolExecutor(workspace=tmp_path, session=Session(), get_config=dict)
+    result = await executor.execute("browser", {"action": "nonsense"})
+    assert result.ok is False
+    assert ("browser support not installed" in result.summary) or ("unknown browser action" in result.summary)
+
+
+def test_lsp_workspace_edit_apply(tmp_path: Path) -> None:
+    from rbit.lsp import LSPClient, LSPServerDef
+
+    target = tmp_path / "sample.txt"
+    target.write_text("alpha beta\n", encoding="utf-8")
+    client = LSPClient(LSPServerDef("fake", ["fake"], [".txt"]), tmp_path)
+    applied = client.apply_edits(
+        [
+            (
+                target,
+                {"start_line": 0, "start_column": 0, "end_line": 0, "end_column": 5},
+                "gamma",
+            )
+        ]
+    )
+    assert applied == 1
+    assert target.read_text(encoding="utf-8") == "gamma beta\n"
+
+@pytest.mark.asyncio
+async def test_opencode_go_session_header_and_prefix(tmp_path: Path) -> None:
+    captured: list[tuple[dict, httpx.Headers]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append((json.loads(request.content.decode("utf-8")), request.headers))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]})
+
+    cfg = {"api_key": "go-key", "api_base": "https://opencode.ai/inference/go/v1"}
+    session = Session()
+    executor = ToolExecutor(workspace=tmp_path, session=session, get_config=lambda: cfg)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg, http_client=client)
+        user = ChatMessage(id=short_id(), role="user", content="hi")
+        session.messages.append(user)
+
+        async def _noop(_rec: ToolCallRecord) -> None:
+            return None
+
+        async def _status(_text: str) -> None:
+            return None
+
+        await engine.run_turn(
+            session=session,
+            user_msg=user,
+            agent_mode="build",
+            model_id="opencode-go/deepseek-v4-pro",
+            on_tool_start=_noop,
+            on_tool_end=_noop,
+            on_status=_status,
+        )
+    body, headers = captured[0]
+    assert body["model"] == "deepseek-v4-pro"
+    assert headers["x-opencode-session"].startswith("rbit-")

@@ -2004,7 +2004,7 @@ class RbitApp(App[None]):
         if cmd == "/remember":
             self._cmd_remember(arg)
             return True
-        if cmd == "/edit":
+        if cmd in ("/edit", "/editor"):
             self._run_coro(self._cmd_edit(arg))
             return True
         if cmd == "/fix":

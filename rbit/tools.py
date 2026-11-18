@@ -448,6 +448,7 @@ class ToolExecutor:
         self.http_client = http_client
         self.question_cb = question_cb
         self._terminal_shell: Any = None
+        self._browser_session: Any = None
         self.undo_stack: list[FileSnapshot] = []
         self.redo_stack: list[FileSnapshot] = []
         self.always_allow_bash: bool = False
@@ -1083,7 +1084,9 @@ class ToolExecutor:
             elif name == "read_many_files":
                 res = await self._tool_read_many(args)
             elif name == "lsp":
-                res = await self._tool_lsp(args)
+                res = await self._tool_lsp(args, agent_mode=agent_mode)
+            elif name == "browser":
+                res = await self._tool_browser(args)
             elif name == "lint":
                 res = await self._tool_lint(args)
             elif name == "notebook":
@@ -1229,11 +1232,37 @@ class ToolExecutor:
                 "Use `grep`/`symbols` to locate what you need, or pass `offset` and `limit` to read a slice.",
             )
 
+        if target.suffix.lower() == ".pdf":
+            return self._read_pdf(target, rel, offset, limit)
+
         text = target.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
         sliced = lines[offset - 1 : offset - 1 + limit]
         numbered = "\n".join(f"{idx}: {line}" for idx, line in enumerate(sliced, start=offset))
         return ToolResult(True, f"{len(sliced)}/{len(lines)} lines", numbered or "(empty file)")
+
+    @staticmethod
+    def _read_pdf(target: Path, rel: str, offset: int, limit: int) -> ToolResult:
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            return ToolResult(
+                False,
+                f"{rel} (PDF support not installed)",
+                "Install the optional PDF dependency: `pip install rbit[pdf]`.",
+            )
+        try:
+            reader = PdfReader(str(target))
+            lines: list[str] = []
+            for index, page in enumerate(reader.pages, start=1):
+                lines.append(f"--- page {index} ---")
+                text = page.extract_text() or ""
+                lines.extend(text.splitlines())
+        except Exception as exc:  # noqa: BLE001 - pypdf raises many parser errors
+            return ToolResult(False, f"{rel} (PDF parse failed)", f"{type(exc).__name__}: {exc}")
+        sliced = lines[offset - 1 : offset - 1 + limit]
+        numbered = "\n".join(f"{idx}: {line}" for idx, line in enumerate(sliced, start=offset))
+        return ToolResult(True, f"{len(sliced)}/{len(lines)} PDF lines", numbered or "(empty PDF)")
 
     def _tool_write(self, args: dict[str, Any]) -> ToolResult:
         raw = args.get("filePath") or args.get("path")
@@ -1998,7 +2027,7 @@ class ToolExecutor:
         note = f"\n\nMissing: {', '.join(missing[:20])}" if missing else ""
         return ToolResult(True, f"read {len(blocks)} file(s)", "\n\n".join(blocks) + note)
 
-    async def _tool_lsp(self, args: dict[str, Any]) -> ToolResult:
+    async def _tool_lsp(self, args: dict[str, Any], agent_mode: str = "build") -> ToolResult:
         if self.lsp is None or int(getattr(self.lsp, "configured_count", 0) or 0) <= 0:
             return ToolResult(False, "LSP is not configured", "Enable `lsp` in `.rbit/config.json`.")
         action = str(args.get("action") or "definition").lower()
@@ -2008,6 +2037,8 @@ class ToolExecutor:
         path = self.resolve_path(raw)
         line = max(1, int(args.get("line") or 1))
         column = max(1, int(args.get("column") or 1))
+        if action == "rename" and (self.session_readonly or agent_mode == "plan"):
+            return ToolResult(False, "rename blocked", "LSP rename is disabled in read-only/Plan mode.")
         try:
             if action == "definition":
                 locations = await self.lsp.definition(path, line, column)
@@ -2020,9 +2051,97 @@ class ToolExecutor:
             if action == "hover":
                 text = await self.lsp.hover(path, line, column)
                 return ToolResult(True, "LSP hover", text or "No hover information.")
+            if action == "symbols":
+                symbols = await self.lsp.symbols(path)
+                text = "\n".join(
+                    f"- {item['name']} ({item['kind']}) at {path}:{item['line']}:{item['column']}"
+                    for item in symbols
+                )
+                return ToolResult(True, f"{len(symbols)} symbol(s)", text or "No symbols found.")
+            if action == "rename":
+                new_name = str(args.get("newName") or "").strip()
+                if not new_name:
+                    return ToolResult(False, "missing newName", "`newName` is required for LSP rename.")
+                applied, files = await self.lsp.rename(path, line, column, new_name)
+                file_list = ", ".join(str(item) for item in files) or "none"
+                return ToolResult(
+                    applied > 0,
+                    f"renamed in {applied} place(s)",
+                    f"Applied {applied} edit(s) in: {file_list}",
+                )
         except Exception as exc:  # noqa: BLE001 - language server errors are user-facing
             return ToolResult(False, "LSP request failed", str(exc))
-        return ToolResult(False, f"unknown lsp action: {action}", "Use action=definition|references|hover.")
+        return ToolResult(
+            False,
+            f"unknown lsp action: {action}",
+            "Use action=definition|references|hover|symbols|rename.",
+        )
+
+    async def _tool_browser(self, args: dict[str, Any]) -> ToolResult:
+        from .browser import BrowserSession
+
+        if not BrowserSession.available():
+            return ToolResult(
+                False,
+                "browser support not installed",
+                "Install the optional dependency: `pip install rbit[browser]`.",
+            )
+        action = str(args.get("action") or "open").strip().lower()
+        if self._browser_session is None:
+            self._browser_session = BrowserSession()
+        session: BrowserSession = self._browser_session
+        try:
+            if action == "open":
+                result = await asyncio.to_thread(session.open, str(args.get("url") or ""))
+            elif action == "click":
+                result = await asyncio.to_thread(session.click, str(args.get("selector") or ""))
+            elif action == "fill":
+                result = await asyncio.to_thread(
+                    session.fill, str(args.get("selector") or ""), str(args.get("value") or "")
+                )
+            elif action in ("content", "snapshot"):
+                result = await asyncio.to_thread(session.content)
+            elif action == "screenshot":
+                result = await asyncio.to_thread(session.screenshot, str(args.get("path") or "screenshot.png"))
+            elif action == "close":
+                result = await asyncio.to_thread(session.close)
+                self._browser_session = None
+            else:
+                return ToolResult(
+                    False,
+                    f"unknown browser action: {action}",
+                    "Use action=open|click|fill|content|screenshot|close.",
+                )
+        except Exception as exc:  # noqa: BLE001 - browser errors are user-facing
+            return ToolResult(False, "browser failed", f"{type(exc).__name__}: {exc}")
+        return ToolResult(result.ok, result.summary, result.output)
+
+    def browser_tool_schema(self) -> dict[str, Any] | None:
+        from .browser import BrowserSession
+
+        if not BrowserSession.available():
+            return None
+        return {
+            "type": "function",
+            "function": {
+                "name": "browser",
+                "description": "Automate a headless Chromium browser (open, click, fill, read content, screenshot).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["open", "click", "fill", "content", "screenshot", "close"],
+                        },
+                        "url": {"type": "string"},
+                        "selector": {"type": "string"},
+                        "value": {"type": "string"},
+                        "path": {"type": "string"},
+                    },
+                    "required": ["action"],
+                },
+            },
+        }
 
     def _tool_skill(self, args: dict[str, Any]) -> ToolResult:
         skills = load_skills(self.workspace)
@@ -3111,14 +3230,15 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "lsp",
-            "description": "Ask LSP for a definition, references, or hover at a position.",
+            "description": "Ask LSP for definitions, references, hover info, document symbols, or rename a symbol.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["definition", "references", "hover"]},
+                    "action": {"type": "string", "enum": ["definition", "references", "hover", "symbols", "rename"]},
                     "filePath": {"type": "string"},
                     "line": {"type": "integer"},
                     "column": {"type": "integer"},
+                    "newName": {"type": "string"},
                 },
                 "required": ["action", "filePath"],
             },

@@ -37,6 +37,8 @@ Changelog = "https://github.com/DreyzeDev/rbit/blob/main/CHANGELOG.md"
 tokens = ["tiktoken>=0.7.0"]
 mobile = ["qrcode>=7.4"]
 keyring = ["keyring>=24.0.0"]
+pdf = ["pypdf>=5.0.0"]
+browser = ["playwright>=1.45.0"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.10"]
 
 [tool.setuptools.packages.find]
@@ -62,5 +64,5 @@ no_implicit_optional = true
 exclude = ["build", "dist", ".venv"]
 
 [[tool.mypy.overrides]]
-module = ["tiktoken", "keyring", "keyring.*", "cryptography", "cryptography.*"]
+module = ["tiktoken", "keyring", "keyring.*", "cryptography", "cryptography.*", "pypdf", "pypdf.*", "playwright", "playwright.*"]
 ignore_missing_imports = true

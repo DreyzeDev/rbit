@@ -4,7 +4,7 @@ from __future__ import annotations
 
 COMMANDS = (
     "run mini doctor stats sessions session export import map lint init commit update upgrade uninstall "
-    "mcp acp serve service api debug plugin auth config permissions completion logs models agent pr web "
+    "mcp acp serve service api debug plugin auth config permissions completion logs status test gh models agent pr web "
     "watch voice backup describe schedule risk replay reload pair"
 )
 
