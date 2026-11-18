@@ -4,6 +4,20 @@ All notable changes to rbit are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.3] - 2026-11-18
+
+### Fixed
+
+- **A slash command needed two Enters.** Typing `/effort` and pressing Enter only
+  rewrote the input to `/effort ` and did nothing; the menu opened on the second
+  Enter. The completion handler treated a slash command like a file path — a
+  fragment to be spliced into a longer prompt — even though a slash command is a
+  complete action. Enter now resolves the command and runs it immediately; a
+  partial `/eff` picks the highlighted match and acts. A bare `/` stays inert so
+  it cannot launch whatever happens to sort first, arguments
+  (`/permissions auto`) survive, and `@file` completion still fills in without
+  submitting, because a path really is only part of a prompt.
+
 ## [1.4.2] - 2026-11-18
 
 ### Fixed

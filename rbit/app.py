@@ -2536,6 +2536,7 @@ class RbitApp(App[None]):
     @on(Input.Submitted, "#prompt-input")
     def _on_input_submitted(self, event: Input.Submitted) -> None:
         popup = self.query_one(AutocompletePopup)
+        raw = event.value.strip()
         if popup.display:
             accepted = popup.accept_highlighted()
             if accepted and accepted[0] == "file":
@@ -2543,15 +2544,26 @@ class RbitApp(App[None]):
                 if at_match and at_match.group(1) == accepted[1].replace("\\", "/"):
                     popup.display = False  # token already typed in full — submit as is
                 else:
+                    # A path is only part of a prompt, so filling it in (and
+                    # staying in the input) is exactly right here.
                     self._apply_completion(*accepted)
                     return
-            elif accepted and event.value.startswith("/") and event.value.strip() != accepted[1]:
-                self._apply_completion(*accepted)
-                return
+            elif (
+                accepted
+                and accepted[0] == "slash"
+                and len(raw) > 1
+                and accepted[1].startswith(raw)
+            ):
+                # A slash command is a complete action, not an argument: pressing
+                # Enter on `/eff` must open the effort menu right away instead of
+                # only rewriting the input to `/effort` and waiting for a second
+                # Enter. A bare `/` stays a no-op so it cannot fire the first
+                # match by accident.
+                popup.display = False
+                raw = accepted[1]
             else:
                 popup.display = False
 
-        raw = event.value.strip()
         if not raw:
             self._toggle_last_card()
             return
