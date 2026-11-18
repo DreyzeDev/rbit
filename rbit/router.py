@@ -15,6 +15,13 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from .policy import (
+    Candidate,
+    check_capabilities,
+    normalize_router_policy,
+    pick_candidate,
+)
+
 #: Task tiers, cheapest/fastest first.
 TIERS: tuple[str, ...] = ("fast", "balanced", "deep")
 
@@ -185,6 +192,64 @@ def route(
     if target == current_model:
         return RoutingDecision(model=target, tier=tier, reason=reason)
     return RoutingDecision(model=target, tier=tier, reason=reason)
+
+
+def route_with_policy(
+    text: str,
+    current_model: str,
+    config: dict[str, Any] | None = None,
+    available_models: list[str] | None = None,
+    candidates: list[Candidate] | None = None,
+    required_context: int = 0,
+) -> RoutingDecision:
+    """Routes using the configured policy (`cheapest` / `best_value` / `balanced`).
+
+    `route()` picks the model configured for a tier. When the user asks for a
+    policy instead — "the cheapest model that works", "the best quality within
+    budget" — the choice happens across the candidate list, so price and context
+    window are weighed rather than assumed.
+    """
+    config = config or {}
+    block = config.get("model_router")
+    block = block if isinstance(block, dict) else {}
+    policy = normalize_router_policy(block.get("policy"))
+
+    if policy == "balanced" or not candidates:
+        return route(text, current_model, config, available_models)
+
+    pin = block.get("pin") or config.get("model_pinned")
+    if isinstance(pin, str) and pin.strip():
+        return RoutingDecision(pin.strip(), "pinned", "pinned in config", pinned=True)
+
+    usable = [c for c in candidates if _model_available(c.model, available_models)]
+    max_cost = block.get("max_cost_per_1k")
+    max_cost = float(max_cost) if isinstance(max_cost, (int, float)) and max_cost > 0 else None
+    chosen, reason = pick_candidate(
+        usable, policy, required_context=required_context, max_cost_per_1k=max_cost
+    )
+    if chosen is None:
+        return RoutingDecision(
+            current_model,
+            "current",
+            f"{reason}; keeping the current model",
+            fallback=True,
+        )
+    caps = check_capabilities(
+        chosen.model,
+        context_window=chosen.context_window,
+        cost_per_1k=chosen.cost_per_1k,
+        supports_tools=chosen.tools,
+        required_context=required_context,
+    )
+    if not caps.usable:
+        return RoutingDecision(
+            current_model,
+            "current",
+            f"`{chosen.model}` is missing: {', '.join(caps.missing)}",
+            fallback=True,
+        )
+    tier, _ = classify_task(text)
+    return RoutingDecision(chosen.model, tier, f"{policy}: {reason}")
 
 
 def apply_live_route(

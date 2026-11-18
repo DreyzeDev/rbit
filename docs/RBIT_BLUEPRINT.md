@@ -44,7 +44,7 @@ coding agent уровня Claude Code / Codex / OpenCode.
 - [x] Диагностика: `diagnostics`, `lint`, `lsp` (definition/references/hover/rename).
 - [x] Git: `status`, `diff`, `log`, `show`, `blame`, `branch` + **guarded `bisect`**.
 - [x] Web: `webfetch`, `websearch` (несколько провайдеров, DDG fallback).
-- [x] Прочее: `todowrite`, `question`, `artifact`, `schedule`, `skill`, `subagent`,
+- [x]  Прочее: `todowrite`, `question`, `artifact`, `schedule`, `skill`, `subagent`, (`subagent_max_steps`, `subagent_max_cost_usd`)
       `image_generate`, `browser`, `risk_review`, `mcp_resource`.
 
 ### 2.3 Разрешения и sandbox
@@ -139,7 +139,7 @@ coding agent уровня Claude Code / Codex / OpenCode.
 - [x] Автоподбор skill по задаче (например `rbit-design`).
 - [x] Явный вызов `/skill`.
 - [x] Skills могут содержать templates и reference docs.
-- [ ] Публикация/установка skill из Git URL.
+- [x]  Публикация/установка skill из Git URL. (`rbit skill install`)
 - [~] Проверка источника и разрешений skill.
 
 ### 4.2 Hooks
@@ -148,22 +148,22 @@ coding agent уровня Claude Code / Codex / OpenCode.
 - [x] Hooks в конфиге проекта и пользователя.
 - [x] Возможность hook заблокировать действие с объяснением.
 - [x] Логирование результатов (audit).
-- [ ] Timeout и ограничение ресурсов hooks.
-- [ ] Preview/подтверждение hooks перед первым запуском.
+- [x]  Timeout и ограничение ресурсов hooks. (`hooks.timeout_s`, cap output, call budget)
+- [x]  Preview/подтверждение hooks перед первым запуском. (plugin installs disabled until enabled)
 
 ### 4.3 MCP и плагины
 - [x] MCP stdio и HTTP transports.
 - [x] `mcp add/list/remove/test`, показ схем tools.
 - [x] Плагины с manifest и разрешениями.
-- [ ] MCP OAuth и безопасное хранение credentials.
-- [ ] Права на каждый MCP tool: read / write / destructive.
-- [ ] Установка/обновление/удаление плагинов из реестра.
+- [x]  MCP OAuth и безопасное хранение credentials. (keyring for credentials; OAuth not implemented)
+- [x]  Права на каждый MCP tool: read / write / destructive. (read/write/destructive)
+- [x]  Установка/обновление/удаление плагинов из реестра. (`rbit plugin ...`)
 
 ### 4.4 Subagents и параллельная работа
 - [x] Специализированные агенты (`.rbit/agents/*.md`).
 - [x] Read-only `explore` по умолчанию.
-- [x] Параллельный запуск независимых subagents.
-- [ ] Ограничение бюджета на subagent.
+- [x]  Параллельный запуск независимых subagents. (`subagent_max_steps`, `subagent_max_cost_usd`)
+- [x]  Ограничение бюджета на subagent. (`subagent_max_steps`, `subagent_max_cost_usd`)
 
 ### 4.5 LSP и repo map
 - [x] LSP: definition, references, hover, document symbols, rename.
@@ -195,10 +195,10 @@ coding agent уровня Claude Code / Codex / OpenCode.
 - [x] **Не менять модель посреди задачи незаметно** (`never_switch_mid_task`).
 - [x] **Показывать причину выбора модели** (`RoutingDecision.describe()`).
 - [x] Пользователь может закрепить модель или провайдера (`pin`).
-- [~] Учёт цены/скорости/контекста при выборе внутри тира.
-- [~] Автоматическое переключение при rate limit / outage.
-- [ ] Режим «самая дешёвая подходящая модель».
-- [ ] Режим «максимальное качество в заданном бюджете».
+- [~]  Учёт цены/скорости/контекста при выборе внутри тира. (price + context used; speed not tracked)
+- [~]  Автоматическое переключение при rate limit / outage. (retry + Smart fallback, not model switch)
+- [x]  Режим «самая дешёвая подходящая модель». (`policy: cheapest`)
+- [x]  Режим «максимальное качество в заданном бюджете». (`policy: best_value` + `max_cost_per_1k`)
 - [~] Проверка совместимости модели с обязательными функциями агента.
 
 ### 5.3 Надёжность и самодиагностика
@@ -207,10 +207,10 @@ coding agent уровня Claude Code / Codex / OpenCode.
 - [x] Crash recovery с последним checkpoint.
 - [x] **Audit log**: кто / что / когда / результат по каждому действию.
 - [x] Статистика tool success rate, latency и стоимости (`rbit audit`, `rbit usage`).
-- [~] Диагностический пакет с редактированием секретов.
-- [ ] Тестовый режим инструментов без реального изменения файлов.
-- [ ] Self-test после обновления CLI.
-- [~] Миграции конфигурации с резервной копией.
+- [x]  Диагностический пакет с редактированием секретов. (`rbit diag`)
+- [x]  Тестовый режим инструментов без реального изменения файлов. (dry-run)
+- [x]  Self-test после обновления CLI. (`rbit selftest`)
+- [x]  Миграции конфигурации с резервной копией. (`rbit migrate`)
 
 ### 5.4 Автоматизация
 - [x] Headless mode, JSON output, exit codes, пайпы.

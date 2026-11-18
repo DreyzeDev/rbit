@@ -1997,8 +1997,17 @@ class AgentEngine:
         last_content = ""
         used: list[str] = []
         client_ctx = self.http_client or _http_client(75.0)
+        # A subagent is a nested agent loop: without its own ceiling it can burn
+        # the whole budget invisibly. `subagent_max_steps` / `subagent_max_cost_usd`
+        # bound it independently of the parent turn.
+        cfg = self.get_config() or {}
+        max_steps = max(1, int(cfg.get("subagent_max_steps", 5) or 5))
+        max_cost = cfg.get("subagent_max_cost_usd")
+        max_cost = float(max_cost) if isinstance(max_cost, (int, float)) and max_cost > 0 else None
+        spent = 0.0
+        cost_per_1k = get_model_info(model_id, self.extra_models).cost_per_1k
         try:
-            for _ in range(5):
+            for _ in range(max_steps):
                 steps += 1
                 try:
                     resp = await client_ctx.post(
@@ -2021,6 +2030,23 @@ class AgentEngine:
                     return f"Subagent error: provider returned a malformed response (`{resp.text[:150]}`)"
                 last_content = choice.get("content") or ""
                 tool_calls = choice.get("tool_calls") or []
+                try:
+                    usage = resp.json().get("usage") or {}
+                except (ValueError, AttributeError):
+                    usage = {}
+                if isinstance(usage, dict):
+                    tokens = int(usage.get("total_tokens") or 0)
+                    if not tokens:
+                        tokens = int(usage.get("prompt_tokens") or 0) + int(
+                            usage.get("completion_tokens") or 0
+                        )
+                    spent += (tokens / 1000.0) * cost_per_1k
+                if max_cost is not None and spent >= max_cost:
+                    last_content = (
+                        (last_content or "Subagent stopped.")
+                        + f"\n\n(subagent budget cap ${max_cost:.4f} reached after {steps} step(s))"
+                    )
+                    break
                 if not tool_calls:
                     break
                 messages.append(
@@ -2057,7 +2083,11 @@ class AgentEngine:
         finally:
             if self.http_client is None:
                 await client_ctx.aclose()
-        suffix = f"\n\n(subagent {definition.name} steps: {steps}, tools: {', '.join(sorted(set(used))) or 'none'})"
+        budget_note = f", cost ≈ ${spent:.4f}" if spent else ""
+        suffix = (
+            f"\n\n(subagent {definition.name} steps: {steps}, "
+            f"tools: {', '.join(sorted(set(used))) or 'none'}{budget_note})"
+        )
         return (last_content or "Subagent finished without findings.") + suffix
 
     async def _run_subagent(

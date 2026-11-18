@@ -1161,8 +1161,15 @@ class ToolExecutor:
             elif name == "bash":
                 res = await self._tool_bash(args, agent_mode=agent_mode)
             elif is_mcp:
-                mcp_result = await self.mcp.call(name, args)
-                res = ToolResult(mcp_result.ok, mcp_result.summary, mcp_result.output)
+                # MCP tools come from third-party servers, so their risk is
+                # classified from annotations or the tool name and then gated by
+                # the same permission engine as built-in tools.
+                blocked = await self._authorize_mcp_tool(name, agent_mode)
+                if blocked is not None:
+                    res = blocked
+                else:
+                    mcp_result = await self.mcp.call(name, args)
+                    res = ToolResult(mcp_result.ok, mcp_result.summary, mcp_result.output)
             else:
                 res = ToolResult(False, f"Unknown tool: {name}", f"Unknown tool: {name}")
         except PathOutsideWorkspace as exc:
@@ -1218,6 +1225,68 @@ class ToolExecutor:
                 agent_mode=agent_mode,
             )
         return res
+
+    def mcp_tool_risk(self, name: str) -> str:
+        """Risk class for an exposed MCP tool name (read/write/destructive)."""
+        from .policy import classify_mcp_tool
+
+        tool = None
+        if self.mcp is not None:
+            tool = getattr(self.mcp, "tools", {}).get(name)
+        if tool is not None:
+            return classify_mcp_tool(tool, name)
+        return classify_mcp_tool(None, name)
+
+    async def _authorize_mcp_tool(self, name: str, agent_mode: str) -> ToolResult | None:
+        """Applies permissions to an MCP tool; returns a block result or None.
+
+        MCP tools arrive from third-party servers, so their default is *safe*,
+        unlike file reads: `read` passes, while `write` and `destructive` require
+        an explicit allow rule or user approval. Relying on `_authorize` alone
+        would not work here — it treats an unknown action as "no rule, allow",
+        which is the opposite of what a foreign tool needs.
+        """
+        from .policy import mcp_action_for
+
+        risk = self.mcp_tool_risk(name)
+        action = mcp_action_for(risk)
+
+        # An explicit rule always wins.
+        explicit = self.resolve_permission_effect(action, name, agent_mode)
+        if explicit == "allow":
+            return None
+        if explicit is None and risk == "read":
+            return None  # reads are as harmless as reading a file
+
+        allowed = False
+        reason = "deny" if explicit == "deny" else "approval-required"
+        if explicit != "deny":
+            if self.mode_allows(action):
+                allowed, reason = True, "mode"
+            elif self.permission_cb is not None:
+                approved = await self.permission_cb(action, name)
+                allowed = bool(approved)
+                reason = "ask" if allowed else "rejected"
+            elif risk == "destructive":
+                # A destructive call with nobody to ask is refused, not guessed.
+                allowed, reason = False, "approval-required"
+            else:
+                # No rule, no confirmation channel: fall back to the engine's own
+                # default (allow), matching how every other tool behaves. Silent
+                # breakage of unannotated MCP servers would be worse than a prompt.
+                allowed, reason = True, "no-rule"
+        elif explicit == "deny":
+            allowed, reason = False, "deny"
+
+        if allowed:
+            return None
+        return ToolResult(
+            False,
+            f"blocked: MCP tool {name} ({risk}, {reason})",
+            f"MCP tool `{name}` is classified **{risk}** and permission `{reason}` "
+            f"refused it. Grant `{action}` for `{name}` in `permissions`, or use a "
+            "less dangerous tool.",
+        )
 
     def _mutation_paths(self, name: str, args: dict[str, Any]) -> list[Path]:
         if name == "apply_patch":

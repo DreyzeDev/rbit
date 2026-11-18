@@ -47,8 +47,10 @@ HOOK_ALIASES = {
 
 
 class PluginRegistry:
-    def __init__(self) -> None:
+    def __init__(self, policy: Any = None) -> None:
         self._hooks: dict[str, list[tuple[str, HookFn]]] = {}
+        #: Limits and approval state; see `rbit.policy.HookPolicy`.
+        self.policy = policy
 
     def on(self, hook: str, callback: HookFn, *, name: str = "") -> None:
         self._hooks.setdefault(hook, []).append((name or getattr(callback, "__name__", "hook"), callback))
@@ -70,16 +72,26 @@ class PluginRegistry:
     def count(self, hook: str) -> int:
         return len(self._hooks.get(hook, []))
 
+    def hook_names(self) -> list[str]:
+        """Every registered hook callback name, for the approval prompt."""
+        return sorted({name for entries in self._hooks.values() for name, _cb in entries})
+
     async def trigger(self, hook: str, context: dict[str, Any]) -> dict[str, Any]:
+        """Runs a hook chain under the policy's limits.
+
+        Hooks are third-party code executed on every tool call, so each one is
+        bounded by a timeout, its output is capped, and an unapproved hook never
+        runs at all — otherwise opening a cloned repo would silently execute it.
+        """
+        from .policy import HookPolicy, run_hook_safely
+
+        policy = self.policy if isinstance(self.policy, HookPolicy) else HookPolicy(require_approval=False)
+
+        def _note_failure(name: str, reason: str) -> None:
+            logger.debug("plugin hook %s (%s) failed: %s", hook, name, reason)
+
         for name, callback in list(self._hooks.get(hook, [])):
-            try:
-                result = callback(context)
-                if hasattr(result, "__await__"):
-                    result = await result  # type: ignore[assignment]
-                if isinstance(result, dict):
-                    context.update(result)
-            except Exception:
-                logger.debug("plugin hook %s (%s) failed", hook, name, exc_info=True)
+            context = await run_hook_safely(name, callback, context, policy, _note_failure)
         return context
 
     def trigger_soon(self, hook: str, context: dict[str, Any]) -> None:
@@ -117,8 +129,13 @@ def _load_module(name: str, app: Any) -> Any:
 
 def load_plugins(app: Any, config: dict[str, Any] | None = None, registry: PluginRegistry | None = None) -> list[str]:
     """Loads entry points and config `plugins`; returns plugin names."""
+    from .policy import HookPolicy
+
     loaded: list[str] = []
-    registry = registry if registry is not None else PluginRegistry()
+    if registry is None:
+        registry = PluginRegistry(policy=HookPolicy.from_config(config))
+    elif registry.policy is None:
+        registry.policy = HookPolicy.from_config(config)
     try:
         from importlib.metadata import entry_points
 

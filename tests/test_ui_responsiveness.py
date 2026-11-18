@@ -500,3 +500,88 @@ async def test_finalize_renders_when_compose_has_not_run_yet(app_workspace: Path
         rendered = getattr(md, "_markdown", "") or ""
         assert "финальный ответ" in rendered
         assert card.size.height > 0
+
+
+@pytest.mark.asyncio
+async def test_answer_stays_below_tool_cards_in_a_real_turn(app_workspace: Path) -> None:
+    """Regression: after tool activity the answer was rendered *above* them.
+
+    A model normally writes a sentence before calling a tool, so the live answer
+    card is mounted first. Tool cards used to be appended at the end of the log,
+    which put them *after* the answer: with a dozen reads the reply sat far above
+    them. Scrolling to the bottom then showed only tool cards and the end-of-turn
+    file recap, which the user reported as "the answer is missing".
+    """
+    from rbit.app import RbitApp
+    from rbit.models import ChatMessage, Session, ToolCallRecord, short_id
+    from rbit.widgets import AssistantMessageCard, ChatScroll, ToolCallCard
+
+    plan = "## ХОД_МЫСЛИ\n\nСейчас посмотрю файлы."
+    body = "\n".join(f"Итог {i}: подробности." for i in range(25))
+    final = f"{plan}\n\n{body}\n\nКОНЕЦ_ОТВЕТА"
+
+    sess = Session()
+    sess.messages = [ChatMessage(id=short_id(), role="user", content="сделай задачу")]
+    app = RbitApp(workspace=app_workspace, initial_session=sess)
+
+    async def fake_run_turn(session, user_msg, agent_mode, model_id, on_tool_start=None,
+                            on_tool_end=None, on_status=None, on_stream_chunk=None,
+                            on_thinking=None, on_reasoning_chunk=None, **_kw):
+        # 1) text first — this is what mounts the answer card before any tool
+        if on_stream_chunk:
+            await on_stream_chunk(plan)
+        await asyncio.sleep(0.03)
+        # 2) then the tools
+        for i in range(12):
+            rec = ToolCallRecord(
+                id=f"t{i}",
+                name="read",
+                arguments={"filePath": f"src/module_{i}.py"},
+                output="\n".join(f"line {n}" for n in range(8)),
+                status="success",
+                summary="Read",
+            )
+            if on_tool_start:
+                await on_tool_start(rec)
+            if on_tool_end:
+                await on_tool_end(rec)
+            await asyncio.sleep(0.01)
+        # 3) then the answer streams into the same card
+        if on_stream_chunk:
+            await on_stream_chunk(final)
+        return ChatMessage(
+            id=short_id(),
+            role="assistant",
+            content=final,
+            agent=agent_mode,
+            model=model_id,
+            duration_s=4.0,
+        )
+
+    app.engine.run_turn = fake_run_turn  # type: ignore[assignment]
+
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause(0.2)
+        app._submit_prompt("сделай задачу")
+        for _ in range(120):
+            await pilot.pause(0.1)
+            if not app.is_busy and app.session.finished:
+                break
+        await pilot.pause(1.2)
+
+        scroll = app.query_one("#chat-scroll", ChatScroll)
+        kids = list(scroll.children)
+        answer_idx = next(
+            (i for i, k in enumerate(kids) if isinstance(k, AssistantMessageCard)), -1
+        )
+        assert answer_idx >= 0, "the answer card was never mounted"
+        assert len([k for k in kids if isinstance(k, ToolCallCard)]) >= 10
+
+        tools_after = sum(1 for k in kids[answer_idx + 1:] if isinstance(k, ToolCallCard))
+        assert tools_after == 0, (
+            f"{tools_after} tool card(s) were mounted after the answer, so the reply "
+            "is buried above them"
+        )
+
+        # The end of the answer must be the visible tail of the log.
+        assert scroll.max_scroll_y - scroll.scroll_y <= 1

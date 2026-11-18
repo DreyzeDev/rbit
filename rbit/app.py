@@ -2854,10 +2854,19 @@ class RbitApp(App[None]):
                 return
             card = ToolCallCard(rec)
             self._tool_widgets[rec.id] = card
-            if self._thinking is not None:
-                scroll.mount(card, before=self._thinking)
+            # Insert *above* the live answer card so the reply keeps growing at the
+            # bottom of the log. Mounting at the end would place every tool card
+            # after the answer: the model usually writes a sentence before calling
+            # a tool, which mounts the answer card first, so after a dozen reads
+            # the reply sat dozens of rows above the tools. The user then scrolled
+            # to the bottom and saw only tool cards and the file recap — the answer
+            # looked missing entirely.
+            if self._live_card is not None:
+                await scroll.mount(card, before=self._live_card)
+            elif self._thinking is not None:
+                await scroll.mount(card, before=self._thinking)
             else:
-                scroll.mount(card)
+                await scroll.mount(card)
             self._smart_scroll_end()
 
         async def on_tool_end(rec: ToolCallRecord) -> None:

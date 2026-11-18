@@ -4,6 +4,60 @@ All notable changes to rbit are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] - 2026-11-18
+
+Closes every remaining actionable item in `docs/RBIT_BLUEPRINT.md`: 132 of 134
+done, 2 (desktop control, cloud/team) deliberately out of scope.
+
+### Fixed
+
+- **The answer appeared to be missing after tool activity.** A model normally
+  writes a sentence before calling a tool, which mounts the live answer card
+  first; tool cards were then appended at the *end* of the log, i.e. after the
+  answer. After a dozen reads the reply sat far above them, so scrolling to the
+  bottom showed only tool cards and the end-of-turn file recap. Tool cards are
+  now inserted above the live answer card, so the reply always grows at the
+  bottom of the log. Verified by removing the fix: the regression test fails, and
+  the on-screen check loses both the start and the end of the answer.
+
+### Added
+
+- **Hook limits** (`hooks.timeout_s`, output cap, per-session call budget). Hooks
+  are third-party code run on every tool call, so a hung one froze the turn.
+- **Plugin approval gate.** `rbit plugin install` leaves a plugin *disabled*;
+  `rbit plugin enable <name>` opts in. Code that arrives inside a cloned repo
+  therefore cannot run just because the repository was opened.
+- **MCP tool risk classes** (`read` / `write` / `destructive`) derived from server
+  annotations or the tool name, enforced through the permission engine. A
+  destructive tool with no rule and no confirmation channel is refused rather
+  than guessed at.
+- **Subagent budget caps** (`subagent_max_steps`, `subagent_max_cost_usd`). A
+  nested agent loop no longer spends invisibly.
+- **Router policies** `cheapest` and `best_value` with `max_cost_per_1k`, plus
+  `check_capabilities()` verifying tool calling and context size before a model
+  is switched to.
+- **`rbit selftest`** — post-upgrade verification against a throwaway workspace
+  (imports, tool schema, storage round-trip, permission engine, injection guard,
+  external tooling, config). `--json` for CI.
+- **Dry-run** (`rbit.selftest.simulate`) reporting what a tool call would do
+  without performing it.
+- **`rbit skill install/list/verify`** — install from a Git URL or local path,
+  record the origin and a content digest, refuse to clobber a locally modified
+  install without `--force`, and report drift.
+- **`rbit plugin list/install/enable/disable/remove`** with a validated manifest.
+- **`rbit migrate`** — config upgrades (`budget_usd` → `daily_budget_usd` +
+  `budget_mode`, `auto_approve` → `permission_mode`, explicit safety defaults)
+  with a timestamped backup and a `--dry-run`.
+- **`rbit diag`** — diagnostic bundle (environment, redacted config, instruction
+  sources, self-test, recent actions) for bug reports.
+
+### Notes
+
+- `hooks.require_approval` defaults to `false` because a config-listed plugin was
+  placed there by the user; set it to `true` to gate every hook by name.
+- MCP manifest and config reads accept a UTF-8 BOM, which Windows editors write by
+  default.
+
 ## [1.5.0] - 2026-11-18
 
 Implements the CLI Feature Blueprint (`docs/RBIT_BLUEPRINT.md`), renamed from

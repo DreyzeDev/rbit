@@ -1653,7 +1653,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "audit", "usage", "status", "test", "gh", "schedule", "risk", "replay", "reload", "pair", "mini"}
+    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "audit", "usage", "selftest", "skill", "migrate", "diag", "status", "test", "gh", "schedule", "risk", "replay", "reload", "pair", "mini"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -1841,6 +1841,87 @@ def main(argv: list[str] | None = None) -> int:
                 parsed.out,
                 parsed.json,
             )
+
+        if sub == "selftest":
+            p = argparse.ArgumentParser(
+                prog="rbit selftest", description="Verify the install after an upgrade"
+            )
+            p.add_argument("--json", action="store_true", help="Machine-readable output")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            return _run_selftest(_resolve_workspace(parsed.dir), parsed.json)
+
+        if sub == "skill":
+            p = argparse.ArgumentParser(
+                prog="rbit skill", description="Install and list skills"
+            )
+            p.add_argument(
+                "action",
+                nargs="?",
+                default="list",
+                choices=["list", "install", "verify"],
+            )
+            p.add_argument("source", nargs="?", help="Git URL or local path (for install)")
+            p.add_argument("--name", help="Override the installed skill name")
+            p.add_argument("--force", action="store_true", help="Replace a differing install")
+            p.add_argument("--json", action="store_true")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            return _run_skill(
+                _resolve_workspace(parsed.dir),
+                parsed.action,
+                parsed.source,
+                parsed.name,
+                parsed.force,
+                parsed.json,
+            )
+
+        if sub == "plugin":
+            p = argparse.ArgumentParser(
+                prog="rbit plugin", description="Install, enable and remove plugins"
+            )
+            p.add_argument(
+                "action",
+                nargs="?",
+                default="list",
+                choices=["list", "install", "enable", "disable", "remove"],
+            )
+            p.add_argument("name", nargs="?", help="Plugin name or install source")
+            p.add_argument("--force", action="store_true", help="Replace an existing install")
+            p.add_argument(
+                "--approve",
+                action="store_true",
+                help="Enable immediately (default: installed but disabled)",
+            )
+            p.add_argument("--json", action="store_true")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            return _run_plugin(
+                _resolve_workspace(parsed.dir),
+                parsed.action,
+                parsed.name,
+                parsed.force,
+                parsed.approve,
+                parsed.json,
+            )
+
+        if sub == "migrate":
+            p = argparse.ArgumentParser(
+                prog="rbit migrate", description="Upgrade the config with a backup"
+            )
+            p.add_argument("--dry-run", action="store_true", help="Show changes, write nothing")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            return _run_migrate(_resolve_workspace(parsed.dir), parsed.dry_run)
+
+        if sub == "diag":
+            p = argparse.ArgumentParser(
+                prog="rbit diag", description="Collect a redacted diagnostic bundle"
+            )
+            p.add_argument("--out", help="Write the bundle here (default: printed)")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            return _run_diag(_resolve_workspace(parsed.dir), parsed.out)
 
         if sub == "audit":
             p = argparse.ArgumentParser(prog="rbit audit", description="Inspect the agent action log")
@@ -3153,6 +3234,195 @@ def _run_config(
         return subprocess.run([editor, str(storage.config_path)], check=False).returncode
     console.print(f"[red]Unknown config action:[/] {action}")
     return 2
+
+
+def _run_selftest(workspace: Path, as_json: bool) -> int:
+    """Runs the post-upgrade self-test (see `rbit.selftest`)."""
+    from rbit.selftest import self_test
+
+    report = self_test(workspace)
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": report.ok,
+                    "checks": [
+                        {"name": c.name, "ok": c.ok, "detail": c.detail, "fatal": c.fatal}
+                        for c in report.checks
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        Console().print(report.text())
+    return 0 if report.ok else 1
+
+
+def _run_skill(
+    workspace: Path,
+    action: str,
+    source: str | None,
+    name: str | None,
+    force: bool,
+    as_json: bool,
+) -> int:
+    """Installs or lists skills, recording where each came from."""
+    from rbit.install import InstallError, install_skill, list_installed, verify_sources
+
+    console = Console()
+    if action == "install":
+        if not source:
+            console.print("[red]Usage:[/] rbit skill install <git-url|path> [--name NAME]")
+            return 2
+        try:
+            result = install_skill(source, workspace=workspace, name=name or "", force=force)
+        except InstallError as exc:
+            console.print(f"[red]Install failed:[/] {exc}")
+            return 1
+        console.print(result.describe())
+        console.print("The skill is available immediately via `/skill`.")
+        return 0
+
+    if action == "verify":
+        warnings = verify_sources(workspace)
+        if as_json:
+            print(json.dumps({"warnings": warnings}, ensure_ascii=False, indent=2))
+            return 0
+        if not warnings:
+            console.print("All installed skills match their recorded source.")
+            return 0
+        for warning in warnings:
+            console.print(f"[yellow]![/] {warning}")
+        return 0
+
+    rows = [r for r in list_installed(workspace) if r["kind"] == "skill"]
+    if as_json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        console.print("No skills installed. Add one: rbit skill install <git-url>")
+        return 0
+    table = Table(title="rbit skills", border_style="#282828")
+    table.add_column("Name")
+    table.add_column("Source")
+    table.add_column("Remote")
+    for row in rows:
+        table.add_row(row["name"], str(row["source"])[:60], "yes" if row["remote"] else "no")
+    console.print(table)
+    return 0
+
+
+def _run_plugin(
+    workspace: Path,
+    action: str,
+    name: str | None,
+    force: bool,
+    approve: bool,
+    as_json: bool,
+) -> int:
+    """Manages plugins; installed plugins stay disabled until approved."""
+    from rbit.install import (
+        InstallError,
+        install_plugin,
+        list_installed,
+        remove_plugin,
+        set_plugin_enabled,
+    )
+
+    console = Console()
+    if action == "install":
+        if not name:
+            console.print("[red]Usage:[/] rbit plugin install <git-url|path> [--approve]")
+            return 2
+        try:
+            result = install_plugin(name, workspace=workspace, force=force, approve=approve)
+        except InstallError as exc:
+            console.print(f"[red]Install failed:[/] {exc}")
+            return 1
+        console.print(result.describe())
+        if approve:
+            console.print("Enabled — its hooks will run on the next tool call.")
+        else:
+            console.print(
+                "Installed but [bold]disabled[/]. Review it, then run "
+                f"`rbit plugin enable {result.name}`."
+            )
+        return 0
+
+    if action in ("enable", "disable"):
+        if not name:
+            console.print(f"[red]Usage:[/] rbit plugin {action} <name>")
+            return 2
+        try:
+            set_plugin_enabled(workspace, name, action == "enable")
+        except InstallError as exc:
+            console.print(f"[red]{exc}[/]")
+            return 1
+        console.print(f"plugin `{name}` {action}d")
+        return 0
+
+    if action == "remove":
+        if not name:
+            console.print("[red]Usage:[/] rbit plugin remove <name>")
+            return 2
+        try:
+            remove_plugin(workspace, name)
+        except InstallError as exc:
+            console.print(f"[red]{exc}[/]")
+            return 1
+        console.print(f"plugin `{name}` removed")
+        return 0
+
+    rows = [r for r in list_installed(workspace) if r["kind"] == "plugin"]
+    if as_json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        console.print("No plugins installed. Add one: rbit plugin install <git-url>")
+        return 0
+    table = Table(title="rbit plugins", border_style="#282828")
+    table.add_column("Name")
+    table.add_column("Source")
+    table.add_column("Remote")
+    for row in rows:
+        table.add_row(row["name"], str(row["source"])[:60], "yes" if row["remote"] else "no")
+    console.print(table)
+    return 0
+
+
+def _run_migrate(workspace: Path, dry_run: bool) -> int:
+    """Upgrades `.rbit/config.json` to the current shape, keeping a backup."""
+    from rbit.migrate import migrate_config
+
+    console = Console()
+    result = migrate_config(workspace, dry_run=dry_run)
+    if not result.changes:
+        console.print(result.summary())
+        return 0
+    for change in result.changes:
+        console.print(f"  - {change}")
+    if result.backup is not None:
+        console.print(f"backup: {result.backup}")
+    console.print(result.summary())
+    return 0
+
+
+def _run_diag(workspace: Path, out: str | None) -> int:
+    """Collects environment details with secrets removed."""
+    from rbit.migrate import diagnostic_bundle
+
+    console = Console()
+    bundle = diagnostic_bundle(workspace)
+    if out:
+        path = Path(out)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(bundle, encoding="utf-8")
+        console.print(f"Wrote {path} ({len(bundle)} bytes, secrets redacted)")
+    else:
+        print(bundle)
+    return 0
 
 
 def _run_usage(
