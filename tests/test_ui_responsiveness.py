@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -186,3 +187,99 @@ def test_no_duplicate_client_construction_in_agent() -> None:
     # One definition inside `_http_client`; no ad-hoc constructions elsewhere.
     assert body.count("httpx.AsyncClient(") == 1
 
+
+# --- streaming: the answer must stay visible -----------------------------
+
+
+def _session_with_user_turn() -> Any:
+    """A session with one user message puts the TUI in session state.
+
+    In home state `#chat-scroll` is `display: none`, so it has zero height and
+    scroll assertions are meaningless.
+    """
+    from rbit.models import ChatMessage, Session, short_id
+
+    sess = Session()
+    sess.messages = [ChatMessage(id=short_id(), role="user", content="go")]
+    return sess
+
+
+@pytest.mark.asyncio
+async def test_streaming_reply_tail_stays_visible(app_workspace: Path) -> None:
+    """Regression: the end of a streamed answer ended up below the fold.
+
+    `scroll_end()` resolves against the *previous* maximum scroll offset, but
+    mounting a card (or growing a Markdown widget) only reflows on the next
+    frame. With a 20-chunk stream the visible area lagged by 16 rows, so the
+    user saw the start of the answer and the tail was cut off.
+    """
+    from rbit.app import RbitApp
+    from rbit.models import ChatMessage, short_id
+    from rbit.widgets import AssistantMessageCard, ChatScroll
+
+    app = RbitApp(workspace=app_workspace, initial_session=_session_with_user_turn())
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause(0.1)
+        scroll = app.query_one("#chat-scroll", ChatScroll)
+
+        app._live_card = None
+        acc: list[str] = []
+        for i in range(20):
+            acc.append("\n".join(f"line {i}-{j}" for j in range(6)))
+            partial = "\n\n".join(acc)
+            if app._live_card is None:
+                draft = ChatMessage(
+                    id=short_id(),
+                    role="assistant",
+                    content=partial,
+                    agent="build",
+                    model="m",
+                )
+                app._live_card = AssistantMessageCard(draft, [], live=True)
+                await scroll.mount(app._live_card)
+            else:
+                await app._live_card.update_stream(partial)
+            app._smart_scroll_end()
+            await pilot.pause(0.02)
+
+        await pilot.pause(0.35)
+
+        assert scroll.max_scroll_y > 10, "test needs a scrollable log to be meaningful"
+        gap = scroll.max_scroll_y - scroll.scroll_y
+        assert gap <= 1, f"answer tail hidden: {gap:.0f} rows below the fold"
+
+
+@pytest.mark.asyncio
+async def test_pinning_does_not_hijack_user_scroll_up(app_workspace: Path) -> None:
+    """Pinning must never fight the user: scrolling up must stick."""
+    from rbit.app import RbitApp
+    from rbit.models import ChatMessage, Session, short_id
+    from rbit.widgets import ChatScroll, UserMessageCard
+
+    sess = Session()
+    sess.messages = [
+        ChatMessage(id=short_id(), role="user", content=f"msg {i}\n" * 3) for i in range(20)
+    ]
+    app = RbitApp(workspace=app_workspace, initial_session=sess)
+    async with app.run_test(size=(120, 24)) as pilot:
+        await pilot.pause(0.15)
+        scroll = app.query_one("#chat-scroll", ChatScroll)
+        scroll.mount_all(
+            [
+                UserMessageCard(ChatMessage(id=short_id(), role="user", content=f"m{i}\n" * 3))
+                for i in range(20)
+            ]
+        )
+        await pilot.pause(0.1)
+        scroll.pin_to_end()
+        await pilot.pause(0.2)
+        assert scroll.stuck_to_bottom is True
+
+        scroll.scroll_home(animate=False)
+        await pilot.pause(0.2)
+        assert scroll.stuck_to_bottom is False
+
+        before = scroll.scroll_y
+        scroll.pin_to_end()
+        await pilot.pause(0.2)
+        assert scroll.scroll_y == before, "pin_to_end must not yank a user who scrolled up"

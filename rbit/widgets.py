@@ -775,6 +775,14 @@ class AssistantMessageCard(Vertical):
         except NoMatches:
             return
         await md.update(self.msg.content)
+        # Markdown.update reflows a frame later; re-pin only after it landed,
+        # otherwise the freshly grown card pushes the tail out of view.
+        try:
+            scroll = self.parent
+            if isinstance(scroll, ChatScroll):
+                scroll.call_after_refresh(scroll.pin_to_end)
+        except Exception:
+            pass
 
     async def finalize(self, final_msg: ChatMessage) -> None:
         self.msg = final_msg
@@ -789,6 +797,12 @@ class AssistantMessageCard(Vertical):
             return
         await md.update(final_msg.content)
         meta.update(self._build_meta_text())
+        try:
+            scroll = self.parent
+            if isinstance(scroll, ChatScroll):
+                scroll.call_after_refresh(scroll.pin_to_end)
+        except Exception:
+            pass
 
 
 class ChatScroll(VerticalScroll):
@@ -796,14 +810,46 @@ class ChatScroll(VerticalScroll):
 
     stuck_to_bottom: bool = True
 
+    #: How many extra frames to keep re-scrolling while Markdown reflows.
+    PIN_RETRIES: int = 6
+
+    def on_mount(self) -> None:
+        self._pin_attempts = 0
+
     def watch_scroll_y(self, old_value: float, new_value: float) -> None:
         super().watch_scroll_y(old_value, new_value)
         max_y = self.max_scroll_y
         self.stuck_to_bottom = new_value >= max(0.0, max_y - 4)
 
     def follow_end(self) -> None:
-        if self.stuck_to_bottom:
-            self.scroll_end(animate=False)
+        self.pin_to_end()
+
+    def pin_to_end(self) -> None:
+        """Keeps the tail of the newest message inside the viewport.
+
+        A single `scroll_end()` lands on the *previous* maximum scroll offset:
+        mounting a card or growing a `Markdown` widget only reflows on the next
+        frame, so the reply's last lines stayed below the fold (reproduced with
+        a 16-row gap on a 20-chunk stream). Re-issuing the scroll after each
+        refresh closes that gap; the retries absorb multi-frame Markdown
+        reflow while tokens keep arriving.
+        """
+        if not self.stuck_to_bottom:
+            return
+        self.scroll_end(animate=False)
+        self._pin_attempts = 0
+        self.call_after_refresh(self._apply_pin)
+
+    def _apply_pin(self) -> None:
+        if not self.stuck_to_bottom:
+            return
+        self.scroll_end(animate=False)
+        if self.scroll_y >= self.max_scroll_y - 1:
+            return
+        self._pin_attempts += 1
+        if self._pin_attempts < self.PIN_RETRIES:
+            self.call_after_refresh(self._apply_pin)
+
 
 
 class SidebarPanel(Vertical):

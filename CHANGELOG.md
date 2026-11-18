@@ -4,6 +4,20 @@ All notable changes to rbit are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.1] - 2026-11-18
+
+### Fixed
+
+- **Streamed answers were cut off below the fold.** `scroll_end()` resolves
+  against the *previous* maximum scroll offset, while mounting a card or growing
+  a `Markdown` widget only reflows on the following frame. With a 20-chunk
+  stream the viewport lagged 16 rows behind the content, so the beginning of a
+  reply was visible but its tail was hidden. `ChatScroll.pin_to_end()` re-issues
+  the scroll after each refresh and retries across the reflow frames; the live
+  card and `finalize()` now re-pin after `Markdown.update`. The four direct
+  `scroll_end()` call sites in the app were switched to the same path. Pinning
+  still yields to the user: scrolling up clears `stuck_to_bottom` and stops it.
+
 ## [1.4.0] - 2026-11-18
 
 ### Fixed

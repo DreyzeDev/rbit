@@ -320,9 +320,18 @@ class CommandPaletteModal(ModalScreen[str | None]):
 class ModelSelectorModal(ModalScreen[str | None]):
     BINDINGS = [Binding("escape", "cancel", "Close")]
 
-    def __init__(self, active_model: str, extra_models: list[ModelInfo] | None = None) -> None:
+    def __init__(
+        self,
+        active_model: str,
+        extra_models: list[ModelInfo] | None = None,
+        accepts_model_refresh: bool = False,
+    ) -> None:
         super().__init__()
         self.active_model = active_model
+        #: Whether a background discovery may inject models into an open modal.
+        #: Opt-in only: the startup worker used to race with the user opening
+        #: the picker, so the list changed under their cursor.
+        self.accepts_model_refresh = accepts_model_refresh
         self.all_models: list[ModelInfo] = list(AVAILABLE_MODELS)
         existing_ids = {m.id for m in self.all_models}
         for em in extra_models or []:

@@ -742,7 +742,7 @@ class RbitApp(App[None]):
         await self.engine.auto_discover_models(self.config_data, force=force)
         self._persist_provider_models()
         screen = self.screen
-        if isinstance(screen, ModelSelectorModal):
+        if isinstance(screen, ModelSelectorModal) and screen.accepts_model_refresh:
             screen.refresh_models(self.engine.extra_models)
         self._sync_ui()
 
@@ -1188,6 +1188,7 @@ class RbitApp(App[None]):
             ModelSelectorModal(
                 self.config_data.get("model", "rbit/smart-local"),
                 extra_models=self.engine.extra_models,
+                accepts_model_refresh=True,
             )
         )
         if chosen:
@@ -1448,7 +1449,7 @@ class RbitApp(App[None]):
                 widgets.append(AssistantMessageCard(m, self.engine.extra_models))
         if widgets:
             scroll.mount_all(widgets)
-        scroll.scroll_end(animate=False)
+        scroll.pin_to_end()
 
     def _load_older(self) -> None:
         self._history_window += 30
@@ -2545,7 +2546,7 @@ class RbitApp(App[None]):
         )
         card = ToolCallCard(rec)
         scroll.mount(card)
-        scroll.scroll_end(animate=False)
+        scroll.pin_to_end()
 
         try:
             res = await self.executor.execute_bang_shell(cmd_str)
@@ -2558,7 +2559,7 @@ class RbitApp(App[None]):
             self.is_busy = False
             self.busy_status = ""
             self._sync_ui()
-            scroll.scroll_end(animate=False)
+            scroll.pin_to_end()
 
     def _submit_prompt(self, raw_text: str) -> None:
         # Phrase-based mode switch: planning words route the turn to Plan mode.
@@ -2611,7 +2612,7 @@ class RbitApp(App[None]):
 
         scroll = self.query_one("#chat-scroll", ChatScroll)
         scroll.mount(UserMessageCard(user_msg))
-        scroll.scroll_end(animate=False)
+        scroll.pin_to_end()
 
         self._execute_agent_turn(user_msg)
 
@@ -2686,9 +2687,9 @@ class RbitApp(App[None]):
                     draft, self.engine.extra_models, live=True
                 )
                 if self._thinking is not None:
-                    scroll.mount(self._live_card, before=self._thinking)
+                    await scroll.mount(self._live_card, before=self._thinking)
                 else:
-                    scroll.mount(self._live_card)
+                    await scroll.mount(self._live_card)
             else:
                 await self._live_card.update_stream(partial_md)
             self._stream_chars = len(partial_md)
