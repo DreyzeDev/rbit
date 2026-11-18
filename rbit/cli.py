@@ -1653,7 +1653,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "status", "test", "gh", "schedule", "risk", "replay", "reload", "pair", "mini"}
+    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "audit", "usage", "status", "test", "gh", "schedule", "risk", "replay", "reload", "pair", "mini"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = args_list[1:]
@@ -1818,6 +1818,41 @@ def main(argv: list[str] | None = None) -> int:
             parsed = p.parse_args(rest)
             resource = " ".join(parsed.resource).strip() or None
             return _run_permissions(_resolve_workspace(parsed.dir), parsed.action, resource)
+
+        if sub == "usage":
+            p = argparse.ArgumentParser(prog="rbit usage", description="Token and cost accounting")
+            p.add_argument(
+                "action",
+                nargs="?",
+                default="show",
+                choices=["show", "today", "forecast", "export"],
+            )
+            p.add_argument("--days", type=int, default=7, help="Window for show/export")
+            p.add_argument("--format", default="json", choices=["json", "csv"], help="Export format")
+            p.add_argument("--out", help="Write the export to this path instead of stdout")
+            p.add_argument("--json", action="store_true", help="Machine-readable output")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            return _run_usage(
+                _resolve_workspace(parsed.dir),
+                parsed.action,
+                parsed.days,
+                parsed.format,
+                parsed.out,
+                parsed.json,
+            )
+
+        if sub == "audit":
+            p = argparse.ArgumentParser(prog="rbit audit", description="Inspect the agent action log")
+            p.add_argument("action", nargs="?", default="summary", choices=["summary", "tail", "path", "clear"])
+            p.add_argument("--day", help="Restrict to YYYY-MM-DD")
+            p.add_argument("-n", "--lines", type=int, default=40, help="Entries for `tail`")
+            p.add_argument("--json", action="store_true", help="Machine-readable output")
+            p.add_argument("-d", "--dir", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            return _run_audit(
+                _resolve_workspace(parsed.dir), parsed.action, parsed.day, parsed.lines, parsed.json
+            )
 
         if sub == "completion":
             p = argparse.ArgumentParser(prog="rbit completion", description="Install shell completion")
@@ -3118,6 +3153,187 @@ def _run_config(
         return subprocess.run([editor, str(storage.config_path)], check=False).returncode
     console.print(f"[red]Unknown config action:[/] {action}")
     return 2
+
+
+def _run_usage(
+    workspace: Path,
+    action: str,
+    days: int,
+    export_format: str,
+    out: str | None,
+    as_json: bool,
+) -> int:
+    """Reports or exports token/cost accounting from the usage ledger."""
+    from rbit.usage import UsageLedger
+
+    console = Console()
+    ledger = UsageLedger(workspace)
+    storage = StorageManager(workspace)
+    config = storage.load_config()
+
+    if action == "today":
+        status = ledger.status(config)
+        forecast = ledger.forecast(config)
+        if as_json:
+            print(
+                json.dumps(
+                    {
+                        "day": status.day,
+                        "spent_usd": round(status.spent_usd, 6),
+                        "tokens": status.tokens,
+                        "calls": status.calls,
+                        "limit_usd": status.limit_usd,
+                        "limit_tokens": status.limit_tokens,
+                        "mode": status.mode,
+                        "percent": round(status.percent * 100, 1),
+                        "unpriced_calls": status.unpriced_calls,
+                        "by_model": {k: round(v, 6) for k, v in status.by_model.items()},
+                        "forecast": forecast,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        table = Table(title=f"rbit usage - {status.day}", border_style="#282828")
+        table.add_column("Metric")
+        table.add_column("Value")
+        table.add_row("Spent", f"${status.spent_usd:.4f}")
+        table.add_row("Tokens", f"{status.tokens:,}")
+        table.add_row("Calls", str(status.calls))
+        limit = f"${status.limit_usd:.2f}" if status.limit_usd else "none"
+        table.add_row("Daily budget", f"{limit} ({status.percent * 100:.0f}% used)")
+        table.add_row("Mode", status.mode)
+        if status.unpriced_calls:
+            table.add_row("Unpriced calls", str(status.unpriced_calls))
+        hours = forecast.get("hours_left")
+        if isinstance(hours, (int, float)):
+            table.add_row("Budget lasts", f"~{hours:.1f}h at current rate")
+        console.print(table)
+        return 0
+
+    if action == "show":
+        breakdown = ledger.breakdown(days)
+        if as_json:
+            print(json.dumps(breakdown, ensure_ascii=False, indent=2))
+            return 0
+        table = Table(title=f"rbit usage - last {days} day(s)", border_style="#282828")
+        table.add_column("Metric")
+        table.add_column("Value")
+        table.add_row("Calls", str(breakdown["calls"]))
+        table.add_row("Cost", f"${breakdown['total_cost']:.4f}")
+        table.add_row("Tokens", f"{breakdown['total_tokens']:,}")
+        console.print(table)
+        if breakdown["by_model"]:
+            models = Table(title="By model", border_style="#282828")
+            models.add_column("Model")
+            models.add_column("Calls")
+            models.add_column("Tokens")
+            models.add_column("Cost")
+            for name, stats in sorted(
+                breakdown["by_model"].items(), key=lambda kv: -kv[1]["cost"]
+            ):
+                models.add_row(name, str(stats["calls"]), f"{stats['tokens']:,}", f"${stats['cost']:.4f}")
+            console.print(models)
+        return 0
+
+    if action == "forecast":
+        print(json.dumps(ledger.forecast(config), ensure_ascii=False, indent=2))
+        return 0
+
+    # export
+    text = ledger.to_csv(days) if export_format == "csv" else ledger.to_json(days)
+    if out:
+        path = Path(out)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        console.print(f"Wrote {path} ({len(text)} bytes)")
+    else:
+        print(text)
+    return 0
+
+
+def _run_audit(
+    workspace: Path,
+    action: str,
+    day: str | None,
+    lines: int,
+    as_json: bool,
+) -> int:
+    """Reads the append-only agent action log (`.rbit/audit/*.jsonl`)."""
+    from rbit.audit import AuditLog
+
+    console = Console()
+    log = AuditLog(workspace)
+    if not log.dir.exists():
+        if as_json:
+            print(json.dumps({"entries": 0, "dir": str(log.dir)}))
+        else:
+            console.print(f"No audit log yet ({log.dir}). Every tool call is recorded once the agent runs.")
+        return 0
+
+    if action == "path":
+        print(str(log.dir))
+        return 0
+
+    if action == "clear":
+        removed = 0
+        for path in log.dir.glob("*.jsonl"):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                continue
+        console.print(f"Removed {removed} audit file(s) from {log.dir}")
+        return 0
+
+    if action == "tail":
+        entries = log.read_entries(day, limit=lines)
+        if as_json:
+            print(json.dumps(entries, ensure_ascii=False, indent=2))
+            return 0
+        if not entries:
+            console.print("No entries.")
+            return 0
+        for entry in entries:
+            ts = str(entry.get("ts") or "")[11:19]
+            event = entry.get("event")
+            if event == "tool":
+                mark = "[green]ok[/]" if entry.get("ok") else "[red]fail[/]"
+                console.print(
+                    f"{ts} {mark} {entry.get('tool')} "
+                    f"({entry.get('duration_ms', 0)} ms) {str(entry.get('summary') or '')[:60]}"
+                )
+            elif event == "permission":
+                colour = "green" if entry.get("decision") == "allow" else "red"
+                console.print(
+                    f"{ts} perm [{colour}]{entry.get('decision')}[/] "
+                    f"{entry.get('action')} {str(entry.get('resource') or '')[:60]} "
+                    f"({entry.get('reason')})"
+                )
+            else:
+                console.print(f"{ts} {event} {json.dumps({k: v for k, v in entry.items() if k not in ('ts', 'event')}, ensure_ascii=False)[:120]}")
+        return 0
+
+    summary = log.summary(day)
+    if as_json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+    table = Table(title="rbit audit log", border_style="#282828")
+    table.add_column("Metric")
+    table.add_column("Value")
+    table.add_row("Entries", str(summary["entries"]))
+    table.add_row("Failures", str(summary["failures"]))
+    table.add_row("Location", summary["dir"])
+    console.print(table)
+    if summary["by_tool"]:
+        tool_table = Table(title="By tool", border_style="#282828")
+        tool_table.add_column("Tool")
+        tool_table.add_column("Calls")
+        for tool, count in sorted(summary["by_tool"].items(), key=lambda kv: -kv[1]):
+            tool_table.add_row(tool, str(count))
+        console.print(tool_table)
+    return 0
 
 
 def _run_permissions(workspace: Path, action: str, resource: str | None = None) -> int:

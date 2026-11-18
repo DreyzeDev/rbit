@@ -39,19 +39,53 @@ def _truncate(text: str, label: str) -> str:
     return text[:MAX_FILE_CHARS] + f"\n\n[truncated: {label} is larger than {MAX_FILE_CHARS} chars]"
 
 
+#: Project instruction files, most specific first. `RBIT.md` is rbit's own name;
+#: AGENTS.md and CLAUDE.md stay supported for compatibility with other agents.
+PROJECT_INSTRUCTION_FILES: tuple[str, ...] = ("RBIT.md", "AGENTS.md", "CLAUDE.md")
+
+
 def _discover_project_file(workspace: Path) -> Path | None:
-    """Nearest AGENTS.md wins over CLAUDE.md; parent directories are searched too."""
+    """Nearest instruction file wins; parent directories are searched too.
+
+    Within one directory `RBIT.md` beats AGENTS.md, which beats CLAUDE.md, so a
+    project can keep its rbit-specific rules separate from shared agent docs.
+    """
     try:
         current = workspace.resolve()
     except OSError:
         current = workspace
     directories = [current, *current.parents]
     for directory in directories:
-        for name in ("AGENTS.md", "CLAUDE.md"):
+        for name in PROJECT_INSTRUCTION_FILES:
             candidate = directory / name
             if candidate.is_file():
                 return candidate
     return None
+
+
+def discover_instruction_sources(workspace: Path, config: dict[str, Any] | None = None) -> list[str]:
+    """Lists the instruction sources that would be loaded, without reading them.
+
+    The TUI uses this to show *which* rules are active — the blueprint asks for
+    that explicitly, because silent instruction loading is impossible to debug.
+    """
+    config = config or {}
+    sources: list[str] = []
+    project = _discover_project_file(workspace)
+    if project is not None:
+        try:
+            sources.append(project.relative_to(Path(workspace).resolve()).as_posix())
+        except (ValueError, OSError):
+            sources.append(str(project))
+    global_file = _discover_global_file()
+    if global_file is not None:
+        sources.append(str(global_file))
+    for label, _path in _expand_instruction_entries(config.get("instructions"), Path(workspace)):
+        sources.append(label)
+    for entry in config.get("instructions") or []:
+        if isinstance(entry, str) and entry.strip().startswith(("http://", "https://")):
+            sources.append(entry.strip())
+    return sources
 
 
 def _discover_global_file() -> Path | None:

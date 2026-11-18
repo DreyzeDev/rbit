@@ -4,6 +4,60 @@ All notable changes to rbit are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-11-18
+
+Implements the CLI Feature Blueprint (`docs/RBIT_BLUEPRINT.md`), renamed from
+DreyzeCode to rbit. Every item below is covered by tests.
+
+### Added
+
+- **`RBIT.md` project instructions.** `RBIT.md` is now the first instruction file
+  rbit looks for, ahead of `AGENTS.md` and `CLAUDE.md`, which stay supported for
+  compatibility. `discover_instruction_sources()` reports *which* files are
+  active, and `/status` and `/doctor` show them — silently loaded rules are
+  impossible to debug.
+- **Audit log** (`rbit audit`). Append-only JSON Lines in
+  `.rbit/audit/YYYY-MM-DD.jsonl` recording every tool call and permission
+  decision: tool, arguments, outcome, summary, duration, session, agent mode.
+  Secrets are redacted at every nesting depth before writing. Actions:
+  `summary`, `tail`, `path`, `clear`, with `--day` and `--json`.
+- **Usage ledger and Budget Guard** (`rbit usage`). Per-call accounting of
+  input/output/reasoning/cached tokens and cost in
+  `.rbit/usage/YYYY-MM-DD.jsonl`, with daily `daily_budget_usd` /
+  `daily_token_limit`, per-model `model_budgets`, thresholds at 50/75/90/100%,
+  a burn-rate forecast, and JSON/CSV export. `budget_mode: strict` stops a paid
+  call *before* it happens; concurrent calls are counted via reservations so
+  parallel requests cannot jointly overshoot the cap. Cost is never invented —
+  an unknown price marks the record `priced: false` instead of guessing.
+- **Smart model router** (`rbit/router.py`). Classifies a task into
+  `fast` / `balanced` / `deep` and picks the configured model per tier. The
+  decision always carries a reason (`RoutingDecision.describe()`), a user pin
+  wins, an unavailable model falls back to the current one, and
+  `never_switch_mid_task` keeps the model stable during a task.
+- **Prompt-injection guard** (`rbit/guard.py`, `prompt_injection_guard`). Web
+  pages and search results are fenced in `<<<UNTRUSTED_CONTENT>>>` markers with an
+  explicit "this is data, not instructions" warning; high-severity findings add a
+  security notice naming them. Modes `off` / `warn` (default) / `strict`, where
+  strict refuses the content outright. Detection covers instruction overrides,
+  role changes, system-prompt and secret exfiltration, tool coercion, fake
+  system blocks and hidden Unicode. Findings are audited.
+- **Guarded `git bisect`** in the `git` tool: `status`, `start`, `good`, `bad`,
+  `skip`, `reset`, `log`. Mutating subactions go through the permission engine.
+  `git bisect run` is refused by design — it would execute an arbitrary command
+  for every step.
+- **`/plan`, `/execute`, `/bug`.** `/plan` forces Plan mode (where the mutating
+  tools are disabled, so nothing can be written by accident) and asks for a plan
+  plus todo. `/execute` returns to Build mode and runs the plan, reusing the last
+  assistant message when no task is given. `/bug` drives a reproduce → isolate
+  (bisect) → prove-with-a-test workflow.
+- `docs/RBIT_BLUEPRINT.md`: the full checklist with per-item status.
+
+### Fixed
+
+- Audit redaction now recurses into nested values. Tool arguments arrive as a
+  dict, so redacting only top-level strings let
+  `{"command": "export API_KEY=..."}` through to disk.
+
 ## [1.4.4] - 2026-11-18
 
 ### Fixed

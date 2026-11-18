@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - Python < 3.11
 import httpx
 
 from .formatters import format_file, formatter_enabled
+from .guard import guarded as guard_untrusted, risk_level, scan as scan_untrusted
 from .models import CheckpointMeta, FileChangeStat, FileSnapshot, Session, TodoItem, short_id
 from .permissions import (
     EDIT_ACTIONS,
@@ -440,6 +441,7 @@ class ToolExecutor:
         plugins: Any = None,
         http_client: Any = None,
         question_cb: Callable[[str, list[str]], Awaitable[str | None]] | None = None,
+        audit: Any = None,
     ) -> None:
         self.workspace = workspace.resolve()
         self.session = session
@@ -453,6 +455,7 @@ class ToolExecutor:
         self.plugins = plugins
         self.http_client = http_client
         self.question_cb = question_cb
+        self.audit = audit
         self._terminal_shell: Any = None
         self._browser_session: Any = None
         self.undo_stack: list[FileSnapshot] = []
@@ -588,7 +591,26 @@ class ToolExecutor:
         """True when the active mode silences prompts for this action class."""
         return mode_decision(self.current_permission_mode(), action) == "allow"
 
+    def _audit_permission(self, action: str, resource: str, allowed: bool, reason: str) -> None:
+        if self.audit is None:
+            return
+        self.audit.permission(
+            action,
+            resource,
+            "allow" if allowed else "deny",
+            reason,
+        )
+
     async def _authorize(self, action: str, resource: str, agent_mode: str) -> tuple[bool, str]:
+        allowed, reason = await self._authorize_inner(action, resource, agent_mode)
+        # Only decisions the user is affected by: "no-rule" is the silent default.
+        if reason != "no-rule":
+            self._audit_permission(action, resource, allowed, reason)
+        return allowed, reason
+
+    async def _authorize_inner(
+        self, action: str, resource: str, agent_mode: str
+    ) -> tuple[bool, str]:
         effect = self.resolve_permission_effect(action, resource, agent_mode)
         if effect == "deny":
             # An explicit `deny` is the user's veto: no mode may override it.
@@ -1099,7 +1121,7 @@ class ToolExecutor:
             elif name == "symbols":
                 res = await asyncio.to_thread(self._tool_symbols, args)
             elif name == "git":
-                res = await self._tool_git(args)
+                res = await self._tool_git(args, agent_mode=agent_mode)
             elif name == "diagnostics":
                 res = await self._tool_diagnostics(args)
             elif name == "skill":
@@ -1186,6 +1208,15 @@ class ToolExecutor:
                 {"type": "tool.result", "tool": name, "ok": res.ok, "agent_mode": agent_mode},
             )
         res.duration_ms = int((time.perf_counter() - t0) * 1000)
+        if self.audit is not None:
+            self.audit.tool_call(
+                name,
+                args,
+                ok=res.ok,
+                summary=res.summary,
+                duration_ms=res.duration_ms,
+                agent_mode=agent_mode,
+            )
         return res
 
     def _mutation_paths(self, name: str, args: dict[str, Any]) -> list[Path]:
@@ -1860,7 +1891,7 @@ class ToolExecutor:
         out = "\n".join(found) if found else "No symbols found."
         return ToolResult(True, f"{len(found)} symbols", out)
 
-    async def _tool_git(self, args: dict[str, Any]) -> ToolResult:
+    async def _tool_git(self, args: dict[str, Any], agent_mode: str = "build") -> ToolResult:
         action = str(args.get("action") or "status").strip().lower()
         raw_path = str(args.get("path") or "").strip()
         limit = max(1, min(int(args.get("limit", 20) or 20), 100))
@@ -1874,6 +1905,9 @@ class ToolExecutor:
             except ValueError:
                 return ToolResult(False, f"path outside workspace: {raw_path}", "`path` must stay inside the workspace.")
             path_args = ["--", self.rel_display(target)]
+
+        if action == "bisect":
+            return await self._git_bisect(args, agent_mode=agent_mode)
 
         if action == "status":
             cmd = ["status", "--short"]
@@ -1893,7 +1927,8 @@ class ToolExecutor:
             return ToolResult(
                 False,
                 f"unsupported git action: {action}",
-                "Allowed read-only actions: status, diff, log, show, branch, blame.",
+                "Allowed read-only actions: status, diff, log, show, branch, blame. "
+                "Bisect: action=`bisect` with `subaction` = status|start|good|bad|skip|reset|log.",
             )
 
         try:
@@ -1911,6 +1946,92 @@ class ToolExecutor:
         output = out_b.decode("utf-8", errors="replace").strip() or "(no output)"
         ok = proc.returncode == 0
         summary = f"git {action} Â· {len(output.splitlines())} line(s)"
+        return ToolResult(ok, summary, output[:6000])
+
+    #: Bisect subactions that move HEAD or refs, so they must clear permissions.
+    _BISECT_MUTATING = frozenset({"start", "good", "bad", "skip", "reset", "run"})
+
+    async def _git_bisect(self, args: dict[str, Any], agent_mode: str = "build") -> ToolResult:
+        """Drives `git bisect` so the agent can find a regression commit.
+
+        `git bisect run` is deliberately *not* accepted: it executes an arbitrary
+        shell command repeatedly. Pass good/bad commits instead and let the agent
+        verify each checkout with the normal tools, which keeps every command
+        visible and permission-checked.
+        """
+        sub = str(args.get("subaction") or args.get("sub") or "status").strip().lower()
+        rev = str(args.get("rev") or "").strip()
+
+        allowed = {"status", "start", "good", "bad", "skip", "reset", "log", "run"}
+        if sub not in allowed:
+            return ToolResult(
+                False,
+                f"unsupported bisect subaction: {sub}",
+                "Use status, start, good <rev>, bad <rev>, skip, reset or log. "
+                "`run` is rejected on purpose because it executes arbitrary commands.",
+            )
+        if sub == "run":
+            return ToolResult(
+                False,
+                "git bisect run is not allowed",
+                "`git bisect run <cmd>` executes an arbitrary command for every step. "
+                "Use `good`/`bad` and verify each checkout with the normal tools.",
+            )
+
+        if sub in self._BISECT_MUTATING:
+            allowed_perm, reason = await self._authorize(
+                "shell", f"git bisect {sub} {rev}".strip(), agent_mode
+            )
+            if not allowed_perm:
+                return ToolResult(
+                    False,
+                    f"blocked: git bisect {sub} ({reason})",
+                    f"Permission `{reason}` refused `git bisect {sub}`. Adjust `permissions` "
+                    "or the permission mode to allow it.",
+                )
+
+        if sub == "status":
+            cmd = ["bisect", "log"]
+        elif sub == "log":
+            cmd = ["bisect", "log"]
+        elif sub == "reset":
+            cmd = ["bisect", "reset"]
+        elif sub == "skip":
+            cmd = ["bisect", "skip"]
+        elif sub == "start":
+            cmd = ["bisect", "start"]
+            if rev:
+                cmd.append(rev)
+        elif sub in ("good", "bad"):
+            if not rev:
+                return ToolResult(
+                    False,
+                    f"bisect {sub} needs a revision",
+                    f"Pass `rev` (a commit, tag or `HEAD`) for `git bisect {sub}`.",
+                )
+            cmd = ["bisect", sub, rev]
+        else:  # pragma: no cover - guarded above
+            return ToolResult(False, "unsupported bisect subaction", sub)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                *cmd,
+                cwd=str(self.workspace),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out_b, _err = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        except Exception as exc:
+            return ToolResult(False, f"git bisect {sub} failed", f"git execution error: {exc}")
+
+        output = out_b.decode("utf-8", errors="replace").strip() or "(no output)"
+        ok = proc.returncode == 0
+        # Report the checked-out candidate so the agent knows what to test next.
+        first_line = next((ln for ln in output.splitlines() if ln.strip()), "")
+        summary = f"git bisect {sub}"
+        if first_line:
+            summary = f"{summary} · {first_line[:70]}"
         return ToolResult(ok, summary, output[:6000])
 
     async def _tool_lint(self, args: dict[str, Any]) -> ToolResult:
@@ -2588,13 +2709,36 @@ class ToolExecutor:
             "\n".join(lines) if lines else "Todo list cleared.",
         )
 
+    def _fence_untrusted(self, text: str, source: str) -> str:
+        """Fences externally-sourced text and records a finding when suspicious.
+
+        Web pages, search results and MCP payloads are the main vector for
+        indirect prompt injection: the text is data the model must read, not
+        instructions it should follow. The content itself is never rewritten —
+        only fenced, so a report about what a page said stays accurate.
+        """
+        cfg = self.get_config() if self.get_config is not None else {}
+        fenced, findings = guard_untrusted(text, source, cfg)
+        if findings and self.audit is not None:
+            self.audit.record(
+                "injection",
+                source=source,
+                level=risk_level(findings),
+                findings=[f.describe() for f in findings][:6],
+            )
+        return fenced
+
     async def _tool_webfetch(self, args: dict[str, Any]) -> ToolResult:
         url = str(args.get("url", "")).strip()
         if not url.startswith(("http://", "https://")):
             return ToolResult(False, "invalid url", "URL must start with http:// or https://")
         cached = self._webfetch_cache.get(url)
         if cached and time.time() - cached[0] < 600:
-            return ToolResult(True, f"cached · Markdown {len(cached[1])} chars", cached[1])
+            return ToolResult(
+                True,
+                f"cached · Markdown {len(cached[1])} chars",
+                self._fence_untrusted(cached[1], f"webfetch:{url}"),
+            )
         if self.http_client is not None:
             resp = await self.http_client.get(url, headers={"User-Agent": "rbit-cli/1.2"}, follow_redirects=True)
         else:
@@ -2609,7 +2753,7 @@ class ToolExecutor:
         return ToolResult(
             resp.status_code < 400,
             f"HTTP {resp.status_code} · Markdown {len(cleaned)} chars",
-            cleaned,
+            self._fence_untrusted(cleaned, f"webfetch:{url}"),
         )
 
     async def _tool_websearch(self, args: dict[str, Any]) -> ToolResult:
@@ -2653,13 +2797,21 @@ class ToolExecutor:
         if items:
             text = self._format_search_results(items, limit)
             self._websearch_cache[cache_key] = (time.time(), text)
-            return ToolResult(True, f"{min(len(items), limit)} result(s) for: {query}", text)
+            return ToolResult(
+                True,
+                f"{min(len(items), limit)} result(s) for: {query}",
+                self._fence_untrusted(text, f"websearch:{query}"),
+            )
         if provider not in ("duckduckgo", "ddg", "auto"):
             items, fallback_errors = await self._search_duckduckgo(query, limit)
             if items:
                 text = self._format_search_results(items, limit)
                 self._websearch_cache[cache_key] = (time.time(), text)
-                return ToolResult(True, f"{min(len(items), limit)} result(s) for: {query} (DDG fallback)", text)
+                return ToolResult(
+                    True,
+                    f"{min(len(items), limit)} result(s) for: {query} (DDG fallback)",
+                    self._fence_untrusted(text, f"websearch:{query}"),
+                )
             errors.extend(fallback_errors)
         return ToolResult(
             False,
@@ -3106,13 +3258,26 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "git",
-            "description": "Read-only Git helper: status, diff, log, show, blame.",
+            "description": (
+                "Git helper: status, diff, log, show, blame (read-only), plus a "
+                "guarded bisect (status/start/good/bad/skip/reset/log) to find the "
+                "commit that introduced a regression. `bisect run` is refused."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "diff", "log", "show", "blame"],
+                        "enum": ["status", "diff", "log", "show", "blame", "bisect"],
+                    },
+                    "subaction": {
+                        "type": "string",
+                        "enum": ["status", "start", "good", "bad", "skip", "reset", "log"],
+                        "description": "Required when action is bisect.",
+                    },
+                    "rev": {
+                        "type": "string",
+                        "description": "Revision for bisect start/good/bad (commit, tag or HEAD).",
                     },
                     "path": {"type": "string", "description": "Optional path filter (required for blame)."},
                     "limit": {"type": "integer", "description": "Log entries limit (default 20)."},

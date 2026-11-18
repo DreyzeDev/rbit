@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rbit"
-version = "1.4.4"
+version = "1.5.0"
 description = "rbit — Next-Gen Full-Screen Terminal AI Coding Agent & CLI"
 readme = "README.md"
 license = { file = "LICENSE" }

@@ -54,6 +54,8 @@ from .models import (
     count_tokens,
     short_id,
 )
+from .audit import default_audit_log
+from .usage import BudgetGuard, UsageLedger
 from .permissions import (
     describe_permission_mode,
     mode_label,
@@ -534,6 +536,10 @@ class RbitApp(App[None]):
         self._history_window: int = 30
         self._last_error: str = ""
 
+        self.audit = default_audit_log(self.workspace, self.config_data)
+        self.audit.bind_session(self.session.id)
+        self.usage = UsageLedger(self.workspace)
+        self.budget = BudgetGuard(self.usage, self.config_data)
         self.executor = ToolExecutor(
             workspace=self.workspace,
             session=self.session,
@@ -543,6 +549,7 @@ class RbitApp(App[None]):
             get_config=lambda: self.config_data,
             on_todos_updated=self._on_todos_updated,
             on_files_updated=self._on_files_updated,
+            audit=self.audit,
         )
         self.mcp = MCPManager.from_config(self.config_data, self.workspace)
         self.executor.mcp = self.mcp
@@ -560,6 +567,7 @@ class RbitApp(App[None]):
             executor=self.executor,
             get_config=lambda: self.config_data,
             storage=self.storage,
+            usage=self.usage,
         )
 
         async def _on_background_done(msg: ChatMessage) -> None:
@@ -669,6 +677,7 @@ class RbitApp(App[None]):
         try:
             self.session = unfinished
             self.executor.session = unfinished
+            self.audit.bind_session(unfinished.id)
             self._rebuild_chat_view()
             self._sync_ui()
         except NoMatches:
@@ -1340,6 +1349,7 @@ class RbitApp(App[None]):
         self._queued_prompt = None
         self.session = Session()
         self.executor.session = self.session
+        self.audit.bind_session(self.session.id)
         self._history_window = 30
         self._has_inline_notices = False
         self._sidebar_override_on_home = False
@@ -1444,6 +1454,7 @@ class RbitApp(App[None]):
         self._queued_prompt = None
         self.session = sess
         self.executor.session = sess
+        self.audit.bind_session(sess.id)
         self._history_window = 30
         self._has_inline_notices = False
         self._rebuild_chat_view()
@@ -1752,13 +1763,28 @@ class RbitApp(App[None]):
             return
         if kind == "/usage":
             tools = sum(len(message.tool_calls) for message in self.session.messages)
+            status = self.usage.status(self.config_data)
+            forecast = self.usage.forecast(self.config_data)
+            limit = f"${status.limit_usd:.2f}" if status.limit_usd else "no limit"
+            hours = forecast.get("hours_left")
+            tail = f", ~{hours:.1f}h left at this rate" if isinstance(hours, float) else ""
             self._post_notice(
                 f"Session usage: **{len(self.session.messages)}** messages, "
-                f"**{self.session.total_tokens:,}** tokens, **{tools}** tool calls."
+                f"**{self.session.total_tokens:,}** tokens, **{tools}** tool calls.\n"
+                f"Today: **${status.spent_usd:.4f}** / {limit} "
+                f"({status.percent * 100:.0f}%), **{status.tokens:,}** tokens, "
+                f"{status.calls} calls{tail}. Mode: `{status.mode}`."
             )
             return
         if kind == "/status":
+            from rbit.rules import discover_instruction_sources
+
             branch = detect_git_branch(self.workspace) or "not a repo"
+            rules = discover_instruction_sources(self.workspace, self.config_data)
+            rules_line = ", ".join(f"`{r}`" for r in rules) if rules else "none"
+            self._post_notice(
+                f"Instructions: {rules_line}"
+            )
             self._post_notice(
                 f"Workspace: `{self.workspace}`\nBranch: `{branch}`\nModel: `{self.config_data.get('model')}`\n"
                 f"Mode: **{self.agent_mode}**, sessions: {len(self.storage.list_sessions())}, "
@@ -2253,6 +2279,15 @@ class RbitApp(App[None]):
         if cmd in ("/cost", "/usage", "/status", "/permissions", "/agents", "/provider", "/hooks"):
             self._cmd_info(cmd, arg)
             return True
+        if cmd == "/plan":
+            self._cmd_plan(arg)
+            return True
+        if cmd == "/execute":
+            self._cmd_execute(arg)
+            return True
+        if cmd == "/bug":
+            self._cmd_bug(arg)
+            return True
         if cmd == "/review":
             self._cmd_review()
             return True
@@ -2315,6 +2350,73 @@ class RbitApp(App[None]):
             return True
 
 
+    # --- Plan / Execute / Bug workflows ---
+
+    def _cmd_plan(self, arg: str) -> None:
+        """`/plan <task>` - investigate and produce a plan, changing nothing.
+
+        Forcing Plan mode here (instead of relying on phrase detection) means the
+        agent physically cannot call `write`/`edit`: those tools are disabled in
+        that mode, so an accidental mutation is impossible rather than unlikely.
+        """
+        task = arg.strip()
+        self.agent_mode = "plan"
+        self._sync_ui()
+        if not task:
+            self._post_notice(
+                "**Plan mode.** Describe the task and rbit will investigate and "
+                "produce a plan with a todo list, without touching files. "
+                "`/execute` runs the plan afterwards."
+            )
+            return
+        self._submit_prompt(
+            "Составь план выполнения задачи, НЕ изменяя файлы. "
+            "Сначала исследуй код (read/grep/symbols), затем дай пронумерованный "
+            "план и обнови todo.\n\nЗадача: " + task
+        )
+
+    def _cmd_execute(self, arg: str) -> None:
+        """`/execute [task]` - run the agreed plan in Build mode."""
+        self.agent_mode = "build"
+        self._sync_ui()
+        if arg.strip():
+            self._submit_prompt(arg.strip())
+            return
+        # No explicit task: hand the agent its own last plan to carry out.
+        last_plan = ""
+        for message in reversed(self.session.messages):
+            if message.role == "assistant" and message.content.strip():
+                last_plan = message.content.strip()
+                break
+        if not last_plan:
+            self.notify(
+                "No plan to execute yet - run /plan <task> first.", severity="warning"
+            )
+            return
+        self._submit_prompt(
+            "Выполни этот план в Build-режиме, шаг за шагом, и отметь пункты в todo:"
+            "\n\n" + last_plan[:4000]
+        )
+
+    def _cmd_bug(self, arg: str) -> None:
+        """`/bug <symptom>` - reproduce, isolate with git bisect, then fix."""
+        symptom = arg.strip()
+        if not symptom:
+            self.notify("Usage: /bug <что сломано>", severity="warning")
+            return
+        self.agent_mode = "build"
+        self._sync_ui()
+        self._submit_prompt(
+            "Найди и исправь баг. Работай по шагам и не заявляй об успехе без проверки:\n"
+            "1. Воспроизведи проблему (запусти тесты/команду) и зафиксируй точную ошибку.\n"
+            "2. Найди минимальное место в коде и объясни причину.\n"
+            "3. Исправь и докажи фикс тестом, который падал до и проходит после.\n"
+            "4. Если виноват конкретный коммит - используй инструмент `git` с "
+            "action=`bisect`, проверяя каждый чекаут.\n"
+            "5. В конце дай короткий итог: причина, фикс, как проверено.\n\n"
+            "Симптом: " + symptom
+        )
+
     def _cmd_checkpoint(self, label: str) -> None:
         meta = self.executor.create_checkpoint(label or f"Step {len(self.session.messages) + 1}")
         note = f"✓ Saved checkpoint `{meta.label}` ({meta.file_count} files, id `{meta.id}`). Use `/rewind` anytime."
@@ -2358,6 +2460,10 @@ class RbitApp(App[None]):
         ollama_cnt = len(self.engine.extra_models)
         cp_cnt = self.storage.checkpoint_count()
         mem_ok = "Present" if self.storage.memory_path.exists() else "Empty"
+        from rbit.rules import discover_instruction_sources
+
+        found = discover_instruction_sources(self.workspace, self.config_data)
+        rules_txt = ", ".join(found) if found else "none"
         lag = self.ui_lag_stats
         if lag["count"]:
             lag_txt = (
@@ -2376,7 +2482,9 @@ class RbitApp(App[None]):
             f"  • Remote API    : {api_ok} ({self.config_data.get('api_base')})\n"
             f"  • Local Ollama  : {ollama_cnt} local models detected\n"
             f"  • Checkpoints   : {cp_cnt} snapshots · Memory: {mem_ok}\n"
-            f"  • UI Lag        : {lag_txt}"
+            f"  \u2022 UI Lag        : {lag_txt}\n"
+            f"  \u2022 Instructions  : {rules_txt}\n"
+            f"  \u2022 Audit log     : {self.audit.dir}"
         )
         self._post_notice(report)
 
@@ -2661,6 +2769,16 @@ class RbitApp(App[None]):
         elif self._phrase_is_build(lowered) and self.agent_mode != "build":
             self.agent_mode = "build"
             self.notify("Build mode (по фразе в промпте).", timeout=2.0)
+
+        # Budget guard: a hard stop happens *before* the paid call, never after.
+        allowed, budget_msg = self.budget.check(self.config_data.get("model", ""))
+        if not allowed:
+            self.notify(budget_msg, severity="error", timeout=8.0)
+            self._post_notice(f"**Budget guard blocked this turn.** {budget_msg}")
+            return
+        threshold = self.budget.threshold_message(self.config_data.get("model", ""))
+        if threshold:
+            self.notify(threshold, timeout=5.0)
 
         if self.is_busy:
             # Prompt queue: let the user type the next task while the agent works;

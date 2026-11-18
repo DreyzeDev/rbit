@@ -23,6 +23,7 @@ from .models import (
     short_id,
 )
 from .rules import load_rules
+from .usage import BudgetGuard, UsageLedger, estimate_cost, normalize_budget_mode, split_usage
 from .skills import load_skills, skills_prompt
 from .storage import StorageManager
 from .subagents import READONLY_TOOL_NAMES, SubagentDef, load_subagents, subagent_names
@@ -276,11 +277,14 @@ class AgentEngine:
         get_config: Callable[[], dict[str, Any]],
         storage: StorageManager | None = None,
         http_client: httpx.AsyncClient | None = None,
+        usage: UsageLedger | None = None,
     ) -> None:
         self.workspace = workspace
         self.executor = executor
         self.get_config = get_config
         self.storage = storage or StorageManager(workspace)
+        # Ledger is optional so tests and the CLI can construct a bare engine.
+        self.usage = usage
         self.http_client = http_client
         self.extra_models: list[ModelInfo] = []
         self.ollama_online: bool | None = None
@@ -790,6 +794,7 @@ class AgentEngine:
                     f"\n\n**Budget:** ${spent_after:.4f} / ${budget:.2f} "
                     f"({new_pct * 100:.0f}% used)"
                 )
+        self._record_usage(model_id, tokens_est, elapsed, session)
         return ChatMessage(
             id=short_id(),
             role="assistant",
@@ -800,6 +805,40 @@ class AgentEngine:
             duration_s=elapsed,
             tool_calls=tool_records,
         )
+
+    def _record_usage(
+        self, model_id: str, total_tokens: int, elapsed_s: float, session: Any = None
+    ) -> None:
+        """Books the turn in the usage ledger (replaces nothing, only adds).
+
+        Providers are inconsistent about reporting usage, and rbit also counts
+        tokens locally, so this records the local estimate and marks the entry
+        `priced` only when a real price is known — inventing a number would break
+        the blueprint's "never guess cost" rule.
+        """
+        ledger = getattr(self, "usage", None)
+        if ledger is None:
+            return
+        info = get_model_info(model_id, self.extra_models)
+        usage = {"input": 0, "output": 0, "reasoning": 0, "cached": 0}
+        # Split the estimate proportionally: rbit only has a total, so the whole
+        # amount is booked as output, which is the part the model generated.
+        usage["output"] = max(0, int(total_tokens))
+        cost, priced = estimate_cost(usage, info.cost_per_1k, self.get_config())
+        try:
+            ledger.record(
+                model_id,
+                provider=info.provider or "",
+                session=getattr(session, "id", "") or "",
+                input_tokens=0,
+                output_tokens=usage["output"],
+                reasoning_tokens=0,
+                cost_usd=cost,
+                priced=priced,
+                duration_ms=int(elapsed_s * 1000),
+            )
+        except Exception:
+            logger.debug("usage record failed", exc_info=True)
 
     async def _run_openai_compatible(
         self,
