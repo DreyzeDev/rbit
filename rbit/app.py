@@ -901,6 +901,11 @@ class RbitApp(App[None]):
         self.push_screen(DiffViewerModal(rel, diff))
 
     def _sync_ui(self) -> None:
+        # A turn worker can still be finishing when the app is closing (quit,
+        # Esc, `run_test` teardown). Touching widgets then raises NoMatches and
+        # surfaces as a worker crash, so bail out once the app is gone.
+        if not self.is_running:
+            return
         model_id = self.config_data.get("model", "rbit/smart-local")
         api_ok = bool((self.config_data.get("api_key") or "").strip())
         cp_count = self.storage.checkpoint_count()
@@ -2059,19 +2064,47 @@ class RbitApp(App[None]):
 
         Scrolling during the turn is deliberately timid (it must never fight the
         user), but once the turn completes the answer is what they asked for.
-        The reply card is often mounted without awaiting (inside the worker), so
-        it lands a frame or two later and grows the log again — hence the repeat
-        pins instead of a single one.
+
+        The reply card is mounted from inside the turn worker and then grows over
+        several frames (compose → Markdown render → reflow of tables and code
+        fences). A fixed set of timers fired before that finished on a long
+        session, leaving a blank strip where the answer should be. So the pin
+        repeats after every refresh until the geometry itself says the tail is
+        visible — bounded by a deadline so it cannot spin forever.
         """
         try:
             scroll = self.query_one("#chat-scroll", ChatScroll)
         except NoMatches:
             return
-        scroll.pin_to_end(force=True)
-        for delay in (0.08, 0.25, 0.6):
-            self.set_timer(
-                delay, lambda s=scroll: s.pin_to_end(force=s.stuck_to_bottom is False)
-            )
+        scroll.reveal_tail()
+        self._reveal_deadline = time.monotonic() + 3.0
+        self._reveal_attempts = 0
+        self._reveal_last_height = -1.0
+        self.call_after_refresh(self._reveal_step)
+
+    def _reveal_step(self) -> None:
+        try:
+            scroll = self.query_one("#chat-scroll", ChatScroll)
+        except NoMatches:
+            return
+        scroll.reveal_tail()
+        self._reveal_attempts += 1
+
+        # `scroll_y >= max_scroll_y` is true the instant we pin, because both are
+        # still computed from the pre-reflow layout — treating that as "settled"
+        # ended the loop before the answer had grown. Keep going while the
+        # content height is still changing, then finish once it is stable.
+        height = float(scroll.virtual_size.height)
+        grew = height != self._reveal_last_height
+        self._reveal_last_height = height
+        aligned = scroll.scroll_y >= scroll.max_scroll_y - 1
+        if aligned and not grew:
+            return
+        if self._reveal_attempts >= 240:  # hard stop, ~4s of frames
+            return
+        if time.monotonic() >= self._reveal_deadline:
+            return
+        self.call_after_refresh(self._reveal_step)
 
     def _finalize_interrupted(self) -> bool:
         """Persists the partial streamed answer with an `interrupted` marker."""

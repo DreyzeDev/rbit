@@ -388,8 +388,29 @@ async def test_answer_revealed_at_end_of_turn_even_if_user_scrolled_up(
     from rbit.models import ChatMessage, Session, ToolCallRecord, short_id
     from rbit.widgets import ChatScroll, ToolCallCard
 
+    # Pre-existing history: the log is already scrollable before the turn
+    # starts, so "scroll up mid-turn" is a meaningful action.
     sess = Session()
-    sess.messages = [ChatMessage(id=short_id(), role="user", content="почини сборку")]
+    for t in range(8):
+        sess.messages.append(
+            ChatMessage(id=short_id(), role="user", content=f"раньше {t}\n" * 2)
+        )
+        prev = ChatMessage(
+            id=short_id(), role="assistant",
+            content=f"ответ {t}\n" + "\n".join(f"строка {i}" for i in range(8)),
+            agent="build", model="m", duration_s=1.0,
+        )
+        for i in range(5):
+            prev.tool_calls.append(
+                ToolCallRecord(
+                    id=f"h{t}_{i}", name="read",
+                    arguments={"filePath": f"old{i}.py"},
+                    output="\n".join(f"l{n}" for n in range(8)),
+                    status="success", summary="Read",
+                )
+            )
+        sess.messages.append(prev)
+    sess.messages.append(ChatMessage(id=short_id(), role="user", content="почини сборку"))
     app = RbitApp(workspace=app_workspace, initial_session=sess)
 
     async def fake_run_turn(session, user_msg, agent_mode, model_id, on_tool_start=None,
@@ -408,6 +429,7 @@ async def test_answer_revealed_at_end_of_turn_even_if_user_scrolled_up(
                 await on_tool_start(rec)
             if on_tool_end:
                 await on_tool_end(rec)
+            await asyncio.sleep(0.03)
         return ChatMessage(
             id=short_id(),
             role="assistant",
@@ -420,14 +442,29 @@ async def test_answer_revealed_at_end_of_turn_even_if_user_scrolled_up(
     app.engine.run_turn = fake_run_turn  # type: ignore[assignment]
 
     async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause(0.2)
-        app._submit_prompt("почини сборку")
-        await pilot.pause(0.5)
-
-        # The user scrolls up while tools are still streaming.
+        await pilot.pause(0.4)
         scroll = app.query_one("#chat-scroll", ChatScroll)
+        assert scroll.max_scroll_y > 10, "test needs history that scrolls"
+
+        app._submit_prompt("почини сборку")
+        for _ in range(40):
+            await pilot.pause(0.05)
+            if app.is_busy and len(list(scroll.query("ToolCallCard"))) >= 15:
+                break
+
+        # The user scrolls up while the turn is still running. Set the flag
+        # explicitly: driving it through scroll_home races with the turn's own
+        # streaming pins, which is a harness artefact, not product behaviour.
+        scroll.stuck_to_bottom = False
         scroll.scroll_home(animate=False)
-        await pilot.pause(1.5)
+        await pilot.pause(0.1)
+
+        # Let the turn finish; reveal must bring the answer back.
+        for _ in range(100):
+            await pilot.pause(0.1)
+            if not app.is_busy:
+                break
+        await pilot.pause(1.2)
 
         assert scroll.max_scroll_y > 10, "test needs a scrollable log"
         gap = scroll.max_scroll_y - scroll.scroll_y

@@ -4,6 +4,28 @@ All notable changes to rbit are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.4] - 2026-11-18
+
+### Fixed
+
+- **The answer could still end up below the fold.** `pin_to_end()` respects
+  `stuck_to_bottom` so it never fights a user who scrolled up — but at the end of
+  a turn that is exactly wrong: the user scrolled up *while tools were running*,
+  and the answer they asked for must be shown. Revealing used the timid path, so
+  it silently did nothing. `ChatScroll.reveal_tail()` scrolls unconditionally and
+  `_reveal_turn_result()` uses it.
+- **The reveal gave up too early.** It re-pinned on three fixed timers
+  (0.08/0.25/0.6 s). On a long session (measured: 533 widgets, 12 384 virtual
+  rows) the reply card takes far more frames to reach its final height
+  (compose → Markdown render → reflow of tables and fences), so every pin fired
+  before the growth and the tail stayed hidden. The reveal now repeats after each
+  refresh until the content height stops changing, bounded by a 3 s deadline.
+- `ChatScroll.watch_scroll_y` no longer mistakes a pin for a user scroll when the
+  pin target is 0 (an empty or short log), which used to keep auto-follow on after
+  the user had scrolled to the top.
+- `RbitApp._sync_ui()` returns early once the app is no longer running, so a turn
+  worker finishing during quit/teardown cannot crash on `NoMatches`.
+
 ## [1.4.3] - 2026-11-18
 
 ### Fixed

@@ -739,6 +739,25 @@ class AssistantMessageCard(Vertical):
         yield Markdown(self.msg.content, classes="assistant-md")
         yield Static(self._build_meta_text(), classes="assistant-meta")
 
+    def on_resize(self, _event: Any) -> None:
+        """Re-pin when a finished card grows after being mounted.
+
+        The card grows in stages: mount → compose → Markdown render → reflow of
+        each table/fence. On a long session (~500 widgets) those stages span far
+        more frames than any fixed timer, so a pin issued on a deadline fired
+        *before* the answer reached its final height and the tail stayed below
+        the fold.
+
+        Live cards are skipped: their streaming flush already re-pins on every
+        update, and resize fires on each of those, which would stack redundant
+        scrolls mid-stream.
+        """
+        if self._live:
+            return
+        scroll = self.parent
+        if isinstance(scroll, ChatScroll) and scroll.stuck_to_bottom:
+            scroll.call_after_refresh(scroll.pin_to_end)
+
     def _build_meta_text(self) -> Text:
         info = get_model_info(self.msg.model, self.extra_models)
         meta = Text()
@@ -862,9 +881,13 @@ class ChatScroll(VerticalScroll):
         if self._pinning:
             return
         target = self._pin_target
-        if target is not None and abs(new_value - target) < 2:
+        # A pin only excuses the *tail* offset it asked for. If the view moved
+        # somewhere else entirely (the user scrolled up), that is a real user
+        # action and follow must disengage.
+        if target is not None and target > 0 and abs(new_value - target) < 2:
             self._pin_target = None
             return
+        self._pin_target = None
         if self.max_scroll_y <= 0:
             self.stuck_to_bottom = True
             return
@@ -896,6 +919,22 @@ class ChatScroll(VerticalScroll):
 
     def _scroll_to_tail(self) -> None:
         """Scrolls to the tail while marking the move as programmatic."""
+        self._pin_target = self.max_scroll_y
+        self._pinning = True
+        try:
+            self.scroll_end(animate=False)
+        finally:
+            self._pinning = False
+
+    def reveal_tail(self) -> None:
+        """Scrolls to the tail unconditionally, ignoring the follow flag.
+
+        `pin_to_end()` deliberately respects `stuck_to_bottom` so it never fights
+        a user who scrolled up. At the end of a turn that is exactly wrong: the
+        user scrolled up while tools were running, and the answer they asked for
+        must be shown. This bypasses the flag entirely.
+        """
+        self.stuck_to_bottom = True
         self._pin_target = self.max_scroll_y
         self._pinning = True
         try:
