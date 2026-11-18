@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +74,8 @@ from .widgets import (
     UserMessageCard,
     detect_git_branch,
 )
+
+LAG_WARN_MS: float = 250.0
 
 CLIPBOARD_COMMANDS: tuple[tuple[str, ...], ...] = tuple(
     cmd
@@ -498,7 +501,7 @@ class RbitApp(App[None]):
         self.session = initial_session or Session()
         self.agent_mode: str = initial_agent if initial_agent in ("build", "plan") else "build"
         self.initial_prompt = initial_prompt
-        self.git_branch: str = detect_git_branch(self.workspace)
+        self.git_branch: str = ""
         self.prompt_history: list[str] = []
         self.history_cursor: int = -1
         self.is_busy: bool = False
@@ -513,6 +516,10 @@ class RbitApp(App[None]):
         self._sidebar_override_on_home: bool = False
         self._tool_widgets: dict[str, ToolCallCard] = {}
         self._save_timer: Timer | None = None
+        self._completion_timer: Timer | None = None
+        self._completion_query: str | None = None
+        self._last_tick: float | None = None
+        self._lag_events: list[tuple[float, float]] = []
         self._live_card: AssistantMessageCard | None = None
         self._thinking: ThinkingIndicator | None = None
         self._reasoning_acc: str = ""
@@ -614,15 +621,9 @@ class RbitApp(App[None]):
             self.theme = "rbit-dark"
 
         self.set_interval(0.09, self._tick_spinner)
+        self._detect_git_branch_async()
         if not self.session.messages and self.initial_prompt is None:
-            unfinished = next(
-                (s for s in self.storage.list_sessions() if not s.finished and s.messages),
-                None,
-            )
-            if unfinished is not None:
-                self.session = unfinished
-                self.executor.session = unfinished
-                self.notify("Recovered an unfinished session — continue where you left off.", timeout=4.0)
+            self._recover_unfinished_session()
         if self.session.messages:
             self._rebuild_chat_view()
         self._update_layout_mode()
@@ -633,6 +634,64 @@ class RbitApp(App[None]):
 
         if self.initial_prompt:
             self.set_timer(0.15, lambda: self._submit_prompt(self.initial_prompt or ""))
+
+    @work(thread=True, exclusive=True, group="recover-session")
+    def _recover_unfinished_session(self) -> None:
+        """Finds an unfinished session without blocking the first frame.
+
+        `list_sessions()` parses every session file; on a home-directory
+        workspace that measured ~257 ms of frozen UI during `on_mount`.
+        """
+        try:
+            restored = [(s.id, s) for s in self.storage.list_sessions() if s.messages]
+        except Exception:
+            return
+        try:
+            self.call_from_thread(self._apply_recovered_session, restored)
+        except Exception:
+            pass
+
+    def _apply_recovered_session(self, restored: list[tuple[str, "Session"]]) -> None:
+        # The worker may land after teardown (`run_test`/quick exit) — touching
+        # widgets then raises NoMatches and killed the app in headless runs.
+        if not self.is_running or self.session.messages or self.is_busy:
+            return
+        unfinished = next((s for _sid, s in restored if not s.finished), None)
+        if unfinished is None:
+            return
+        try:
+            self.session = unfinished
+            self.executor.session = unfinished
+            self._rebuild_chat_view()
+            self._sync_ui()
+        except NoMatches:
+            return
+        self.notify(
+            "Recovered an unfinished session — continue where you left off.",
+            timeout=4.0,
+        )
+
+    @work(thread=True, exclusive=True, group="git-branch")
+    def _detect_git_branch_async(self) -> None:
+        """Resolves the git branch off the UI thread.
+
+        `git rev-parse` can take over a second on large repos or cold caches;
+        running it in the constructor froze the first frame of the TUI.
+        """
+        branch = detect_git_branch(self.workspace)
+        try:
+            self.call_from_thread(self._apply_git_branch, branch)
+        except Exception:
+            pass
+
+    def _apply_git_branch(self, branch: str) -> None:
+        self.git_branch = branch
+        if not self.is_running:
+            return
+        try:
+            self.query_one(BottomStatusBar).update_bar(self.workspace, self.git_branch)
+        except NoMatches:
+            pass
 
     def _maybe_show_doctor_hint(self) -> None:
         hint_file = self.workspace / ".rbit" / ".doctor_hint_shown"
@@ -697,6 +756,7 @@ class RbitApp(App[None]):
         self._discover_models()
 
     def _tick_spinner(self) -> None:
+        self._check_event_loop_lag()
         if self.is_busy:
             self._spin_frame += 1
             self.query_one(PromptSubHints).update_state(
@@ -707,6 +767,43 @@ class RbitApp(App[None]):
             )
             if self._thinking is not None:
                 self._thinking.tick(self._spin_frame)
+
+    def _check_event_loop_lag(self) -> None:
+        """Heartbeat watchdog: surfaces anything that froze the UI thread.
+
+        The spinner timer fires every 90ms. If a callback overruns, the next
+        tick arrives late — that delta is exactly how long the event loop was
+        blocked by synchronous work (disk, subprocess, network).
+        """
+        now = time.monotonic()
+        last = self._last_tick
+        self._last_tick = now
+        if last is None:
+            return
+        delta_ms = (now - last) * 1000.0
+        if delta_ms <= LAG_WARN_MS:
+            return
+        self._lag_events.append((now, delta_ms))
+        if len(self._lag_events) > 20:
+            self._lag_events.pop(0)
+        if self.config_data.get("warn_on_ui_lag"):
+            self.notify(
+                f"UI lag: {delta_ms:.0f} ms blocked (check /doctor or --trace)",
+                severity="warning",
+                timeout=3.0,
+            )
+
+    @property
+    def ui_lag_stats(self) -> dict[str, float]:
+        """Worst and average event-loop stall measured so far, in ms."""
+        if not self._lag_events:
+            return {"worst_ms": 0.0, "avg_ms": 0.0, "count": 0.0}
+        values = [d for _t, d in self._lag_events]
+        return {
+            "worst_ms": max(values),
+            "avg_ms": sum(values) / len(values),
+            "count": float(len(values)),
+        }
 
     @property
     def _busy_status_display(self) -> str:
@@ -799,7 +896,7 @@ class RbitApp(App[None]):
     def _sync_ui(self) -> None:
         model_id = self.config_data.get("model", "rbit/smart-local")
         api_ok = bool((self.config_data.get("api_key") or "").strip())
-        cp_count = len(self.storage.list_checkpoints())
+        cp_count = self.storage.checkpoint_count()
 
         self._update_layout_mode()
 
@@ -986,11 +1083,33 @@ class RbitApp(App[None]):
         at_match = re.search(r"@([^\s]*)$", val)
         if at_match:
             query = at_match.group(1)
-            files = self.executor.list_workspace_files(limit=120)
-            popup.show_files(query, files)
+            self._queue_file_completion(query)
             return
 
         popup.display = False
+
+    def _queue_file_completion(self, query: str) -> None:
+        """Debounces workspace listing for @-completion.
+
+        `list_workspace_files()` walks the whole tree; doing that synchronously
+        on every keystroke made typing lag on large workspaces.
+        """
+        self._completion_query = query
+        if self._completion_timer is not None:
+            self._completion_timer.stop()
+        self._completion_timer = self.set_timer(0.12, self._run_file_completion)
+
+    def _run_file_completion(self) -> None:
+        self._completion_timer = None
+        query = self._completion_query
+        if query is None:
+            return
+        try:
+            popup = self.query_one(AutocompletePopup)
+        except NoMatches:
+            return
+        files = self.executor.list_workspace_files(limit=120)
+        popup.show_files(query, files)
 
     @on(OptionList.OptionSelected, "#autocomplete-popup")
     def _on_popup_clicked(self, event: OptionList.OptionSelected) -> None:
@@ -1931,10 +2050,28 @@ class RbitApp(App[None]):
 
     def _flush_save_session(self) -> None:
         self._save_timer = None
+        self._write_session_bg(self.session)
+
+    @work(thread=True, exclusive=True, group="save-session")
+    def _write_session_bg(self, session: Session) -> None:
+        """Persists the session off the UI thread.
+
+        `save_session()` serialises the entire session and hits disk (or
+        SQLite). On long sessions that stalled the event loop for hundreds of
+        milliseconds shortly after every streamed chunk.
+        """
         try:
-            self.storage.save_session(self.session)
+            self.storage.save_session(session)
         except Exception as exc:
-            self.notify(f"Не удалось сохранить сессию: {exc}", severity="error", timeout=4.0)
+            try:
+                self.call_from_thread(
+                    self.notify,
+                    f"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0441\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c \u0441\u0435\u0441\u0441\u0438\u044e: {exc}",
+                    severity="error",
+                    timeout=4.0,
+                )
+            except Exception:
+                pass
 
     def _toggle_last_card(self) -> None:
         scroll = self.query_one("#chat-scroll", ChatScroll)
@@ -2133,19 +2270,33 @@ class RbitApp(App[None]):
             self._post_notice(msg)
 
     def _cmd_doctor(self) -> None:
-        api_ok = "Configured" if (self.config_data.get("api_key") or "").strip() else "Not set (using rbit Smart Agent)"
+        api_ok = (
+            "Configured"
+            if (self.config_data.get("api_key") or "").strip()
+            else "Not set (using rbit Smart Agent)"
+        )
         ollama_cnt = len(self.engine.extra_models)
-        cp_cnt = len(self.storage.list_checkpoints())
+        cp_cnt = self.storage.checkpoint_count()
         mem_ok = "Present" if self.storage.memory_path.exists() else "Empty"
+        lag = self.ui_lag_stats
+        if lag["count"]:
+            lag_txt = (
+                f"worst {lag['worst_ms']:.0f} ms, avg {lag['avg_ms']:.0f} ms "
+                f"({int(lag['count'])} stall(s) > {LAG_WARN_MS:.0f} ms)"
+            )
+        else:
+            lag_txt = f"none above {LAG_WARN_MS:.0f} ms"
         report = (
             f"# rbit Doctor v{__version__}\n"
-            f"  • Python / OS   : {sys.version.split()[0]} ({platform.system()} {platform.release()})\n"
+            f"  • Python / OS   : {sys.version.split()[0]} "
+            f"({platform.system()} {platform.release()})\n"
             f"  • Workspace     : {self.workspace}\n"
             f"  • Git Branch    : {self.git_branch or '(not a git repo)'}\n"
             f"  • Active Model  : {self.config_data.get('model')}\n"
             f"  • Remote API    : {api_ok} ({self.config_data.get('api_base')})\n"
             f"  • Local Ollama  : {ollama_cnt} local models detected\n"
-            f"  • Checkpoints   : {cp_cnt} snapshots · Memory: {mem_ok}"
+            f"  • Checkpoints   : {cp_cnt} snapshots · Memory: {mem_ok}\n"
+            f"  • UI Lag        : {lag_txt}"
         )
         self._post_notice(report)
 

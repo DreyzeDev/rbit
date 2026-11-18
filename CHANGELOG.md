@@ -4,6 +4,42 @@ All notable changes to rbit are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-11-18
+
+### Fixed
+
+- **TUI responsiveness.** Removed the blocking work that made the interface
+  freeze for hundreds of milliseconds at a time:
+  - `StorageManager.list_checkpoints()` re-read and JSON-parsed every
+    checkpoint (each embeds full file contents) on every `_sync_ui()` — 38 call
+    sites in the TUI. Measured **43.8 ms per refresh for 20 checkpoints
+    (24 MB)**, **325 ms** for the 15 real checkpoints in a home workspace.
+    Checkpoint index is now memoised against the directory mtime and the
+    sidebar uses `checkpoint_count()`, which only counts directory entries:
+    **0.026 ms (1665x faster)**.
+  - `detect_git_branch()` ran `git rev-parse` synchronously inside
+    `RbitApp.__init__`, freezing the first frame up to the 1.2 s timeout.
+    It now resolves on a background worker thread.
+  - Unfinished-session recovery called `list_sessions()` during `on_mount`,
+    which parses every session file — **257 ms** of frozen UI on a
+    home-directory workspace. Moved to a worker with the result applied via
+    `call_from_thread`, and guarded against teardown (`NoMatches`).
+  - `@file` autocomplete walked the whole workspace on every keystroke
+    (`os.walk` over up to 2000 entries). Now debounced by 120 ms.
+  - Session saves (`save_session()`) serialised the entire session and hit
+    disk on the UI thread right after each streamed chunk. Now written on a
+    dedicated worker thread.
+
+### Added
+
+- **Event-loop lag watchdog.** The 90 ms spinner tick doubles as a heartbeat:
+  late ticks record how long the UI thread was blocked. Exposed as
+  `RbitApp.ui_lag_stats`, shown in `/doctor` (`UI Lag: worst N ms, avg N ms`)
+  and announced with an opt-in notification via `warn_on_ui_lag` in the config.
+- `tests/test_ui_responsiveness.py` pinning all five fixes (checkpoint cache
+  invalidation, no subprocess in the constructor, completion debouncing,
+  cache-tolerant counting, lag recording).
+
 ## [Unreleased]
 
 ### Added

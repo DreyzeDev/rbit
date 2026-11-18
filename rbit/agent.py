@@ -41,6 +41,38 @@ RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 logger = logging.getLogger("rbit.agent")
 HTTP_LIMITS = httpx.Limits(max_keepalive_connections=10, max_connections=20)
 
+_SSL_CONTEXT: Any = None
+
+
+def _default_ssl_context() -> Any:
+    """Returns a process-wide SSL context for httpx clients.
+
+    Building a context costs `ssl.load_verify_locations()` over the full CA
+    bundle, which profiled at ~250 ms on Windows. httpx builds a fresh one for
+    every `AsyncClient`, and rbit creates one per streamed request — so the
+    first frame and every model discovery froze the UI thread. A single shared
+    context is safe: contexts are read-only once created.
+    """
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        try:
+            import ssl
+
+            _SSL_CONTEXT = ssl.create_default_context()
+        except Exception:
+            return True
+    return _SSL_CONTEXT
+
+
+def _http_client(timeout: float) -> httpx.AsyncClient:
+    """httpx client that reuses the cached TLS context instead of rebuilding it."""
+    return httpx.AsyncClient(
+        timeout=timeout,
+        limits=HTTP_LIMITS,
+        verify=_default_ssl_context(),
+    )
+
+
 # Prompt profiles: accent + optionally restricted toolset. Selected via config
 # `prompt_profile` (or `--prompt-profile` on the CLI).
 TOOLLESS_MODEL_MARKERS = (
@@ -215,7 +247,7 @@ async def discover_ollama_models(timeout: float = 1.2) -> list[ModelInfo]:
     """Auto-discovers locally installed Ollama models on localhost:11434."""
     discovered: list[ModelInfo] = []
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with _http_client(timeout) as client:
             resp = await client.get("http://localhost:11434/api/tags")
             if resp.status_code == 200:
                 data = resp.json()
@@ -418,7 +450,7 @@ class AgentEngine:
             if self.http_client is not None:
                 resp = await self.http_client.get(url, headers=headers)
             else:
-                async with httpx.AsyncClient(timeout=timeout, limits=HTTP_LIMITS) as client:
+                async with _http_client(timeout) as client:
                     resp = await client.get(url, headers=headers)
         except Exception as exc:
             return False, f"Cannot reach {base}: {exc}", []
@@ -1028,7 +1060,7 @@ class AgentEngine:
         try:
             if self.http_client is not None:
                 return await _drive_steps(self.http_client)
-            async with httpx.AsyncClient(timeout=75.0, limits=HTTP_LIMITS) as client:
+            async with _http_client(75.0) as client:
                 return await _drive_steps(client)
         finally:
             self._active_profile_tools = None
@@ -1229,7 +1261,7 @@ class AgentEngine:
                 }
             )
         endpoint = f"{base}/models/{model}:generateContent"
-        client_ctx = self.http_client or httpx.AsyncClient(timeout=120.0, limits=HTTP_LIMITS)
+        client_ctx = self.http_client or _http_client(120.0)
         try:
             for _ in range(10):
                 payload: dict[str, Any] = {
@@ -1370,7 +1402,7 @@ class AgentEngine:
             **(cfg.get("extra_headers") or {}),
         }
         max_tokens = int(cfg.get("max_tokens") or 4096)
-        client_ctx = self.http_client or httpx.AsyncClient(timeout=120.0, limits=HTTP_LIMITS)
+        client_ctx = self.http_client or _http_client(120.0)
         try:
             for _ in range(10):
                 payload: dict[str, Any] = {
@@ -1925,7 +1957,7 @@ class AgentEngine:
         steps = 0
         last_content = ""
         used: list[str] = []
-        client_ctx = self.http_client or httpx.AsyncClient(timeout=75.0, limits=HTTP_LIMITS)
+        client_ctx = self.http_client or _http_client(75.0)
         try:
             for _ in range(5):
                 steps += 1
@@ -2136,7 +2168,7 @@ class AgentEngine:
         model_id = str(cfg.get("model") or "openai/gpt-4.1-mini")
         try:
             own_client = self.http_client is None
-            client = self.http_client or httpx.AsyncClient(timeout=20.0, limits=HTTP_LIMITS)
+            client = self.http_client or _http_client(20.0)
             try:
                 resp = await client.post(
                     f"{api_base}/chat/completions",
@@ -2178,7 +2210,7 @@ class AgentEngine:
         model_id = str(cfg.get("model") or "openai/gpt-4.1-mini")
         try:
             own_client = self.http_client is None
-            client = self.http_client or httpx.AsyncClient(timeout=25.0, limits=HTTP_LIMITS)
+            client = self.http_client or _http_client(25.0)
             try:
                 resp = await client.post(
                     f"{api_base}/chat/completions",
@@ -2248,7 +2280,7 @@ class AgentEngine:
                 if self.http_client is not None:
                     resp = await self.http_client.post(f"{base}/chat/completions", headers=headers, json=payload)
                 else:
-                    async with httpx.AsyncClient(timeout=60.0) as client:
+                    async with _http_client(60.0) as client:
                         resp = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
                 if resp.status_code < 400:
                     text = (resp.json()["choices"][0]["message"].get("content") or "").strip()
@@ -2332,7 +2364,7 @@ class AgentEngine:
                 if self.http_client is not None:
                     resp = await self.http_client.post(f"{base}/chat/completions", headers=headers, json=payload)
                 else:
-                    async with httpx.AsyncClient(timeout=60.0) as client:
+                    async with _http_client(60.0) as client:
                         resp = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
                 if resp.status_code < 400:
                     text = (resp.json()["choices"][0]["message"].get("content") or "").strip()

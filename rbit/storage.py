@@ -22,6 +22,7 @@ class StorageManager:
         self.config_path = self.state_dir / "config.json"
         self.memory_path = self.state_dir / "memory.md"
         self.commands_dir = self.state_dir / "commands"
+        self._checkpoint_cache: tuple[tuple[int, int], list[CheckpointMeta]] | None = None
 
     def ensure_dirs(self) -> None:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -398,6 +399,7 @@ class StorageManager:
             encoding="utf-8",
         )
         self.prune_checkpoints(self.MAX_CHECKPOINTS)
+        self.invalidate_checkpoint_cache()
         return CheckpointMeta(
             id=cid,
             label=str(payload["label"]),
@@ -421,11 +423,28 @@ class StorageManager:
                 removed += 1
             except OSError:
                 continue
+        if removed:
+            self.invalidate_checkpoint_cache()
         return removed
 
     def list_checkpoints(self) -> list[CheckpointMeta]:
+        """Checkpoint index.
+
+        The TUI refreshes the sidebar on every turn, so this is on a hot path.
+        The result is memoised against the directory mtime + entry count: a
+        cheap `stat()` instead of re-reading and parsing every checkpoint JSON.
+        """
         if not self.checkpoints_dir.exists():
             return []
+        try:
+            stat = self.checkpoints_dir.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            signature = None
+        if signature is not None and self._checkpoint_cache is not None:
+            cached_sig, cached_items = self._checkpoint_cache
+            if cached_sig == signature:
+                return list(cached_items)
         items: list[CheckpointMeta] = []
         for p in sorted(
             self.checkpoints_dir.glob("*.json"),
@@ -444,7 +463,31 @@ class StorageManager:
                 )
             except Exception:
                 continue
+        if signature is not None:
+            self._checkpoint_cache = (signature, list(items))
         return items
+
+    def invalidate_checkpoint_cache(self) -> None:
+        self._checkpoint_cache = None
+
+    def checkpoint_count(self) -> int:
+        """Cheap checkpoint count for UI refreshes.
+
+        Never parses JSON: checkpoint files embed full file contents and can be
+        megabytes each (profiled at ~325 ms for 15 checkpoints on the UI
+        thread). Counting directory entries costs a fraction of a millisecond.
+        """
+        if not self.checkpoints_dir.exists():
+            return 0
+        try:
+            with os.scandir(self.checkpoints_dir) as entries:
+                return sum(
+                    1
+                    for entry in entries
+                    if entry.name.endswith(".json") and entry.is_file()
+                )
+        except OSError:
+            return 0
 
     def load_checkpoint_files(self, cid: str) -> tuple[CheckpointMeta, dict[str, str]] | None:
         path = self.checkpoints_dir / f"{cid}.json"
