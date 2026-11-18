@@ -30,6 +30,12 @@ import httpx
 
 from .formatters import format_file, formatter_enabled
 from .models import CheckpointMeta, FileChangeStat, FileSnapshot, Session, TodoItem, short_id
+from .permissions import (
+    EDIT_ACTIONS,
+    EXTERNAL_ACTIONS,
+    mode_decision,
+    permission_mode_from_config,
+)
 from .skills import load_skills, skill_tool_schema
 from .storage import StorageManager
 
@@ -573,19 +579,50 @@ class ToolExecutor:
                 matched = rule["effect"]
         return matched
 
+    def current_permission_mode(self) -> str:
+        """Effective permission mode (env override, then config, then default)."""
+        cfg = self.get_config() if self.get_config is not None else {}
+        return permission_mode_from_config(cfg if isinstance(cfg, dict) else {})
+
+    def mode_allows(self, action: str) -> bool:
+        """True when the active mode silences prompts for this action class."""
+        return mode_decision(self.current_permission_mode(), action) == "allow"
+
     async def _authorize(self, action: str, resource: str, agent_mode: str) -> tuple[bool, str]:
         effect = self.resolve_permission_effect(action, resource, agent_mode)
-        if effect is None:
-            return True, "no-rule"
+        if effect == "deny":
+            # An explicit `deny` is the user's veto: no mode may override it.
+            return False, "deny"
         if effect == "allow":
             return True, "allow"
-        if effect == "deny":
-            return False, "deny"
-        auto = os.environ.get("RBIT_AUTO_APPROVE") == "1"
-        if self.get_config is not None and self.get_config().get("auto_approve"):
-            auto = True
-        if auto:
-            return True, "auto"
+
+        mode = self.current_permission_mode()
+
+        # `auto` means literally "never prompt", so it also silences rules that
+        # asked to prompt for a specific resource. `deny` already returned above,
+        # which is why the flag is safe to honor here.
+        if mode == "auto":
+            return True, "mode"
+
+        # Otherwise a mode is only a default: an explicit `ask` rule stands
+        # (the user singled this resource out), and modes fill the "no rule" gap.
+        # Shell is excluded because `_tool_bash` owns that gate — it knows
+        # whether a command is read-only.
+        if effect is None:
+            if action in EDIT_ACTIONS or action in EXTERNAL_ACTIONS:
+                decision = mode_decision(mode, action)
+                if decision == "allow":
+                    return True, "mode"
+                if decision == "ask":
+                    if self.permission_cb is None:
+                        return False, "approval-required"
+                    approved = await self.permission_cb(
+                        "bash" if action == "shell" else action, resource
+                    )
+                    return bool(approved), "mode-ask"
+            return True, "no-rule"
+
+        # effect == "ask": the user asked to be prompted for this one.
         if self.permission_cb is None:
             return False, "approval-required"
         approved = await self.permission_cb("bash" if action == "shell" else action, resource)
@@ -2788,6 +2825,7 @@ class ToolExecutor:
             and not is_readonly
             and not self.always_allow_bash
             and not self._prefix_allowed(command)
+            and not self.mode_allows("shell")
             and self.permission_cb is not None
         ):
             allowed = await self.permission_cb("bash", command)

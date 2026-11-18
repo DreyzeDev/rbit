@@ -1812,8 +1812,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if sub == "permissions":
             p = argparse.ArgumentParser(prog="rbit permissions", description="Inspect permission rules")
-            p.add_argument("action", nargs="?", default="list", choices=["list", "show", "explain", "check"])
-            p.add_argument("resource", nargs="*", help="For explain: <action> <resource>")
+            p.add_argument("action", nargs="?", default="list", choices=["list", "show", "explain", "check", "mode"])
+            p.add_argument("resource", nargs="*", help="For explain: <action> <resource>; for mode: <mode id>")
             p.add_argument("-d", "--dir", help="Workspace directory")
             parsed = p.parse_args(rest)
             resource = " ".join(parsed.resource).strip() or None
@@ -3122,12 +3122,44 @@ def _run_config(
 
 def _run_permissions(workspace: Path, action: str, resource: str | None = None) -> int:
     from rbit.models import Session
+    from rbit.permissions import (
+        MODE_IDS,
+        mode_table,
+        normalize_permission_mode,
+        permission_mode_from_config,
+    )
     from rbit.tools import ToolExecutor
 
     console = Console()
     storage = StorageManager(workspace)
     cfg = storage.load_config()
     executor = ToolExecutor(workspace=workspace, session=Session(), storage=storage, get_config=lambda: cfg)
+    if action == "mode":
+        current = permission_mode_from_config(cfg)
+        if not resource:
+            table = Table(title="rbit permission modes", border_style="#282828")
+            table.add_column("Mode")
+            table.add_column("Commands")
+            table.add_column("Edits")
+            table.add_column("Description")
+            for mode_id, _label, description, cmd_auto, edit_auto in mode_table():
+                marker = "-> " if mode_id == current else "   "
+                table.add_row(
+                    f"{marker}{mode_id}",
+                    "auto" if cmd_auto else "ask",
+                    "auto" if edit_auto else "ask",
+                    description,
+                )
+            console.print(table)
+            console.print(f"Current: [bold]{current}[/]")
+            return 0
+        requested = normalize_permission_mode(resource, default="")
+        if not requested:
+            console.print(f"[red]Unknown mode:[/] {resource}. Use: {', '.join(MODE_IDS)}")
+            return 2
+        storage.save_config({**cfg, "permission_mode": requested})
+        console.print(f"permission mode -> [bold]{requested}[/]")
+        return 0
     if action in ("list", "show"):
         rules = cfg.get("permissions")
         if not rules:

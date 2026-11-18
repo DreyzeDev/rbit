@@ -4,6 +4,29 @@ All notable changes to rbit are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.2] - 2026-11-18
+
+### Fixed
+
+- **The answer was invisible after tool activity.** A turn could finish with
+  every tool card on screen and the model's reply nowhere in sight. Three
+  separate causes, all on the same path:
+  - `AssistantMessageCard.finalize()` did `query_one(Markdown)` inside a bare
+    `except NoMatches: return`. When the live card was mounted by the *last*
+    stream chunk it had not composed its children yet, so the final answer was
+    silently dropped. It now retries once the children exist.
+  - Nothing brought the user back to the reply when a turn completed. Auto-follow
+    during a turn is deliberately timid so it cannot fight manual scrolling, but
+    the end of a turn is exactly when the answer matters. `_reveal_turn_result()`
+    re-attaches and pins after the final reflow — with repeated pins, because the
+    card is mounted without awaiting and lands a frame or two later.
+  - Submitting a new prompt now re-engages following (`pin_to_end(force=True)`):
+    asking for something means wanting to watch it.
+  - `ChatScroll.watch_scroll_y` no longer treats a programmatic pin as a user
+    scroll. A pin lands on an offset that was current when it was issued while
+    the content has usually grown since; judging that as "the user scrolled up"
+    silently disabled follow for the rest of the turn.
+
 ## [1.4.1] - 2026-11-18
 
 ### Fixed

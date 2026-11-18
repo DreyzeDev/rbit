@@ -38,6 +38,7 @@ from .modals import (
     HelpModal,
     ModelSelectorModal,
     PermissionModal,
+    PermissionModeModal,
     QuestionModal,
     SearchResultsModal,
     SessionPickerModal,
@@ -52,6 +53,12 @@ from .models import (
     ToolCallRecord,
     count_tokens,
     short_id,
+)
+from .permissions import (
+    describe_permission_mode,
+    mode_label,
+    normalize_permission_mode,
+    permission_mode_from_config,
 )
 from .storage import StorageManager
 from .themes import RBIT_DARK, RBIT_HIGH_CONTRAST, RBIT_LIGHT
@@ -928,6 +935,7 @@ class RbitApp(App[None]):
             ollama_online=self.engine.ollama_online,
             mcp_status=self.mcp.status,
             mcp_configs=self.mcp.configs,
+            permission_mode=self.executor.current_permission_mode(),
         )
         self.query_one(BottomStatusBar).update_bar(self.workspace, self.git_branch)
 
@@ -1216,6 +1224,23 @@ class RbitApp(App[None]):
         if chosen:
             self._set_effort(chosen)
         self.query_one("#prompt-input", Input).focus()
+
+    @work
+    async def action_open_permissions(self) -> None:
+        current = self.executor.current_permission_mode()
+        chosen = await self.push_screen_wait(PermissionModeModal(current))
+        if chosen:
+            self.set_permission_mode(chosen)
+        self.query_one("#prompt-input", Input).focus()
+
+    def set_permission_mode(self, mode: str, persist: bool = True) -> None:
+        """Applies a permission mode; persisted to config unless it came from env."""
+        mode = normalize_permission_mode(mode)
+        self.config_data["permission_mode"] = mode
+        if persist:
+            self.storage.save_config(self.config_data)
+        self._sync_ui()
+        self.notify(f"Permissions: {mode_label(mode)}", timeout=2.5)
 
     @work
     async def action_open_themes(self) -> None:
@@ -1705,7 +1730,7 @@ class RbitApp(App[None]):
         self.notify(f"Undone {n} change(s) from this turn." if n else "Nothing to undo.", timeout=2.0)
         self._sync_ui()
 
-    def _cmd_info(self, kind: str) -> None:
+    def _cmd_info(self, kind: str, arg: str = "") -> None:
         from rbit.models import get_model_info
         from rbit.skills import load_skills
         from rbit.subagents import load_subagents
@@ -1736,16 +1761,18 @@ class RbitApp(App[None]):
             )
             return
         if kind == "/permissions":
-            rules = self.config_data.get("permissions")
-            if not rules:
-                self._post_notice("No explicit permission rules; default is allow unless a tool asks/denies.")
-            else:
-                lines = [
-                    f"- `{rule.get('action')}` `{rule.get('resource')}` → **{rule.get('effect')}**"
-                    for rule in rules
-                    if isinstance(rule, dict)
-                ]
-                self._post_notice("Permissions:\n" + "\n".join(lines))
+            if arg:
+                # `/permissions auto`, `/permissions commands`, ... set directly.
+                requested = normalize_permission_mode(arg, default="")
+                if not requested:
+                    self._post_notice(
+                        "Unknown mode. Use: ask, commands, edits, auto.\n"
+                        f"Current: **{mode_label(self.executor.current_permission_mode())}**"
+                    )
+                    return
+                self.set_permission_mode(requested)
+                return
+            self.action_open_permissions()
             return
         if kind == "/agents":
             agents = load_subagents(self.workspace, self.config_data)
@@ -2027,6 +2054,25 @@ class RbitApp(App[None]):
         """Follows new output only while the user is already at the bottom."""
         self.query_one("#chat-scroll", ChatScroll).follow_end()
 
+    def _reveal_turn_result(self) -> None:
+        """End of turn: brings the last message back into view.
+
+        Scrolling during the turn is deliberately timid (it must never fight the
+        user), but once the turn completes the answer is what they asked for.
+        The reply card is often mounted without awaiting (inside the worker), so
+        it lands a frame or two later and grows the log again — hence the repeat
+        pins instead of a single one.
+        """
+        try:
+            scroll = self.query_one("#chat-scroll", ChatScroll)
+        except NoMatches:
+            return
+        scroll.pin_to_end(force=True)
+        for delay in (0.08, 0.25, 0.6):
+            self.set_timer(
+                delay, lambda s=scroll: s.pin_to_end(force=s.stuck_to_bottom is False)
+            )
+
     def _finalize_interrupted(self) -> bool:
         """Persists the partial streamed answer with an `interrupted` marker."""
         card = self._live_card
@@ -2172,7 +2218,7 @@ class RbitApp(App[None]):
             self._run_coro(self._cmd_test(arg))
             return True
         if cmd in ("/cost", "/usage", "/status", "/permissions", "/agents", "/provider", "/hooks"):
-            self._cmd_info(cmd)
+            self._cmd_info(cmd, arg)
             return True
         if cmd == "/review":
             self._cmd_review()
@@ -2612,7 +2658,10 @@ class RbitApp(App[None]):
 
         scroll = self.query_one("#chat-scroll", ChatScroll)
         scroll.mount(UserMessageCard(user_msg))
-        scroll.pin_to_end()
+        # A fresh turn always re-engages auto-follow: the user just asked for
+        # something, so they want to watch it happen even if they had scrolled
+        # up to re-read an earlier answer.
+        scroll.pin_to_end(force=True)
 
         self._execute_agent_turn(user_msg)
 
@@ -2796,6 +2845,12 @@ class RbitApp(App[None]):
             queued = self._queued_prompt
             self._queued_prompt = None
             self._sync_ui()
+            # The turn is over: whatever the model produced last is the thing the
+            # user is waiting to read. Re-attach and pin after the final reflow,
+            # so a reply that arrived while the user was scrolled up (or while
+            # tool cards were still growing) still ends up on screen.
+            if not self._interrupted_turn:
+                self.call_after_refresh(self._reveal_turn_result)
             if self.config_data.get("notify_done", True) and getattr(self, "_turn_started", 0):
                 import time as _time
 

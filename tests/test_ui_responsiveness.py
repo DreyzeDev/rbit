@@ -283,3 +283,183 @@ async def test_pinning_does_not_hijack_user_scroll_up(app_workspace: Path) -> No
         scroll.pin_to_end()
         await pilot.pause(0.2)
         assert scroll.scroll_y == before, "pin_to_end must not yank a user who scrolled up"
+
+
+@pytest.mark.asyncio
+async def test_tool_cards_then_final_answer_stays_visible(app_workspace: Path) -> None:
+    """Regression: after tool cards the final answer was appended off-screen.
+
+    `watch_scroll_y` compared the post-pin offset against a `max_scroll_y` that
+    had just grown (a mounted tool card), concluded "the user scrolled up" and
+    cleared `stuck_to_bottom`. Auto-follow then stayed off for the rest of the
+    turn, so the tools were visible but the model's answer was below the fold —
+    it looked like the AI never answered.
+    """
+    from rbit.app import RbitApp
+    from rbit.models import ChatMessage, ToolCallRecord, short_id
+    from rbit.widgets import AssistantMessageCard, ChatScroll, ToolCallCard
+
+    app = RbitApp(workspace=app_workspace, initial_session=_session_with_user_turn())
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause(0.1)
+        scroll = app.query_one("#chat-scroll", ChatScroll)
+        scroll.pin_to_end(force=True)
+        await pilot.pause(0.1)
+        assert scroll.stuck_to_bottom is True
+
+        # A turn that runs many tools, exactly like on_tool_start/on_tool_end.
+        for i in range(6):
+            rec = ToolCallRecord(
+                id=f"t{i}",
+                name="read",
+                arguments={"filePath": f"src/mod{i}.py"},
+                output="\n".join(f"line {n}" for n in range(8)),
+                status="success",
+                summary="Read 8 lines",
+            )
+            await scroll.mount(ToolCallCard(rec))
+            app._smart_scroll_end()
+            await pilot.pause(0.03)
+            assert scroll.stuck_to_bottom is True, f"lost auto-follow after tool {i}"
+
+        # Then the answer streams in and is finalized.
+        app._live_card = None
+        acc: list[str] = []
+        for i in range(8):
+            acc.append("\n".join(f"answer {i}-{j}" for j in range(5)))
+            partial = "\n\n".join(acc)
+            if app._live_card is None:
+                draft = ChatMessage(
+                    id=short_id(), role="assistant", content=partial, agent="build", model="m"
+                )
+                app._live_card = AssistantMessageCard(draft, [], live=True)
+                await scroll.mount(app._live_card)
+            else:
+                await app._live_card.update_stream(partial)
+            app._smart_scroll_end()
+            await pilot.pause(0.02)
+
+        await pilot.pause(0.3)
+
+        assert scroll.max_scroll_y > 10, "test needs a scrollable log"
+        gap = scroll.max_scroll_y - scroll.scroll_y
+        assert gap <= 1, f"final answer hidden below the fold: gap {gap:.0f} rows"
+
+
+@pytest.mark.asyncio
+async def test_new_turn_reengages_following_after_user_scrolled_up(app_workspace: Path) -> None:
+    """Submitting a prompt must re-attach to the tail even from mid-log."""
+    from rbit.app import RbitApp
+    from rbit.models import ChatMessage, Session, short_id
+    from rbit.widgets import ChatScroll, UserMessageCard
+
+    sess = Session()
+    sess.messages = [
+        ChatMessage(id=short_id(), role="user", content=f"old {i}\n" * 3) for i in range(20)
+    ]
+    app = RbitApp(workspace=app_workspace, initial_session=sess)
+    async with app.run_test(size=(120, 24)) as pilot:
+        await pilot.pause(0.15)
+        scroll = app.query_one("#chat-scroll", ChatScroll)
+        scroll.scroll_home(animate=False)
+        await pilot.pause(0.1)
+        assert scroll.stuck_to_bottom is False
+
+        await scroll.mount(UserMessageCard(ChatMessage(id=short_id(), role="user", content="new")))
+        scroll.pin_to_end(force=True)
+        await pilot.pause(0.2)
+
+        assert scroll.stuck_to_bottom is True
+        assert scroll.max_scroll_y - scroll.scroll_y <= 1
+
+
+@pytest.mark.asyncio
+async def test_answer_revealed_at_end_of_turn_even_if_user_scrolled_up(
+    app_workspace: Path,
+) -> None:
+    """The reported bug: tools run, user scrolls up, the answer is never seen.
+
+    During a turn auto-follow is deliberately timid so it cannot fight the user.
+    That is fine while tools stream, but when the turn completes the answer is
+    exactly what was asked for — `_reveal_turn_result()` re-attaches and pins it
+    into view.
+    """
+    from rbit.app import RbitApp
+    from rbit.models import ChatMessage, Session, ToolCallRecord, short_id
+    from rbit.widgets import ChatScroll, ToolCallCard
+
+    sess = Session()
+    sess.messages = [ChatMessage(id=short_id(), role="user", content="почини сборку")]
+    app = RbitApp(workspace=app_workspace, initial_session=sess)
+
+    async def fake_run_turn(session, user_msg, agent_mode, model_id, on_tool_start=None,
+                            on_tool_end=None, on_status=None, on_stream_chunk=None,
+                            on_thinking=None, on_reasoning_chunk=None, **_kw):
+        for i in range(10):
+            rec = ToolCallRecord(
+                id=f"t{i}",
+                name="read",
+                arguments={"filePath": f"m{i}.py"},
+                output="\n".join(f"l{n}" for n in range(12)),
+                status="success",
+                summary="Read",
+            )
+            if on_tool_start:
+                await on_tool_start(rec)
+            if on_tool_end:
+                await on_tool_end(rec)
+        return ChatMessage(
+            id=short_id(),
+            role="assistant",
+            content="\n".join(f"итог {i}" for i in range(25)),
+            agent=agent_mode,
+            model=model_id,
+            duration_s=2.0,
+        )
+
+    app.engine.run_turn = fake_run_turn  # type: ignore[assignment]
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause(0.2)
+        app._submit_prompt("почини сборку")
+        await pilot.pause(0.5)
+
+        # The user scrolls up while tools are still streaming.
+        scroll = app.query_one("#chat-scroll", ChatScroll)
+        scroll.scroll_home(animate=False)
+        await pilot.pause(1.5)
+
+        assert scroll.max_scroll_y > 10, "test needs a scrollable log"
+        gap = scroll.max_scroll_y - scroll.scroll_y
+        assert gap <= 1, f"answer not revealed at end of turn: {gap:.0f} rows hidden"
+
+
+@pytest.mark.asyncio
+async def test_finalize_renders_when_compose_has_not_run_yet(app_workspace: Path) -> None:
+    """`finalize()` used to bail out on a fresh card and lose the answer."""
+    from rbit.app import RbitApp
+    from rbit.models import ChatMessage, short_id
+    from rbit.widgets import AssistantMessageCard, ChatScroll
+
+    app = RbitApp(workspace=app_workspace, initial_session=_session_with_user_turn())
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause(0.1)
+        scroll = app.query_one("#chat-scroll", ChatScroll)
+
+        reply = ChatMessage(
+            id=short_id(),
+            role="assistant",
+            content="финальный ответ, который обязан быть виден",
+            agent="build",
+            model="m",
+            duration_s=1.5,
+        )
+        card = AssistantMessageCard(reply, [], live=True)
+        scroll.mount(card)  # not awaited: children are not composed yet
+        await card.finalize(reply)
+        await pilot.pause(0.4)
+
+        md = card.query_one("Markdown")
+        rendered = getattr(md, "_markdown", "") or ""
+        assert "финальный ответ" in rendered
+        assert card.size.height > 0

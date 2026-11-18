@@ -21,6 +21,7 @@ from .models import (
     search_session,
     short_id,
 )
+from .permissions import mode_table, normalize_permission_mode
 from .themes import CURATED_THEMES
 
 
@@ -888,6 +889,49 @@ class PermissionModal(ModalScreen[str]):
 
     def action_deny(self) -> None:
         self.dismiss("deny")
+
+class PermissionModeModal(ModalScreen[str | None]):
+    """Picks how much rbit may do without asking (permission mode preset)."""
+
+    BINDINGS = [Binding("escape", "cancel", "Close")]
+
+    def __init__(self, current_mode: str) -> None:
+        super().__init__()
+        self.current_mode = normalize_permission_mode(current_mode)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="oc-modal"):
+            yield Static(_modal_header("Permissions"), classes="oc-modal-header")
+            yield OptionList(id="permission-mode-list", classes="oc-modal-list")
+            yield Label(
+                "Explicit `deny` rules in .rbit/config.json always win over the mode.",
+                classes="oc-modal-foot",
+            )
+
+    def on_mount(self) -> None:
+        olist = self.query_one("#permission-mode-list", OptionList)
+        selected = 0
+        for idx, (mode_id, label, _description, cmd_auto, edit_auto) in enumerate(mode_table()):
+            marks = f"cmds {'auto' if cmd_auto else 'ask'}  edits {'auto' if edit_auto else 'ask'}"
+            olist.add_option(
+                Option(
+                    _two_col_option(label, marks, active_dot=mode_id == self.current_mode),
+                    id=mode_id,
+                )
+            )
+            if mode_id == self.current_mode:
+                selected = idx
+        olist.highlighted = selected
+        olist.focus()
+
+    @on(OptionList.OptionSelected, "#permission-mode-list")
+    def _on_select(self, event: OptionList.OptionSelected) -> None:
+        if event.option_id:
+            self.dismiss(event.option_id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
 
 class QuestionModal(ModalScreen[str | None]):
     """Free-form/multiple-choice question from the agent."""

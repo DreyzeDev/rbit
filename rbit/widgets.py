@@ -23,12 +23,14 @@ from textual.widgets.option_list import Option
 
 from . import __version__
 from .models import ChatMessage, ModelInfo, Session, ToolCallRecord, get_model_info
+from .permissions import mode_short_label as permission_mode_label
 
 
 SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/models", "List and switch AI models (incl. local Ollama)"),
     ("/themes", "Switch color theme (live preview)"),
     ("/effort", "Select reasoning effort (auto / low / medium / high)"),
+    ("/permissions", "Choose what rbit may do without asking (ask / commands / edits / auto)"),
     ("/todo", "Open interactive Todo list manager"),
     ("/checkpoint", "Save named workspace snapshot (no Git needed)"),
     ("/rewind", "Rewind workspace to a saved checkpoint"),
@@ -794,13 +796,42 @@ class AssistantMessageCard(Vertical):
             md = self.query_one(Markdown)
             meta = self.query_one(".assistant-meta", Static)
         except NoMatches:
+            # The card was mounted on the very last stream chunk and has not
+            # composed its children yet. Returning here would leave the answer
+            # unrendered, so retry once the children exist — `compose()` picks
+            # up `self.msg` only for the *initial* frame, not late updates.
+            self.call_after_refresh(lambda: self._run_coro_safely(self._finalize_retry()))
             return
         await md.update(final_msg.content)
         meta.update(self._build_meta_text())
         try:
             scroll = self.parent
             if isinstance(scroll, ChatScroll):
-                scroll.call_after_refresh(scroll.pin_to_end)
+                # The turn is over: the user asked for this answer, so show it
+                # even if they had scrolled up while the tools were running.
+                scroll.pin_to_end(force=True)
+        except Exception:
+            pass
+
+    async def _finalize_retry(self) -> None:
+        """Second attempt at rendering the final answer after a late compose."""
+        try:
+            md = self.query_one(Markdown)
+            meta = self.query_one(".assistant-meta", Static)
+        except NoMatches:
+            return
+        await md.update(self.msg.content)
+        meta.update(self._build_meta_text())
+        try:
+            scroll = self.parent
+            if isinstance(scroll, ChatScroll):
+                scroll.pin_to_end(force=True)
+        except Exception:
+            pass
+
+    def _run_coro_safely(self, coro: Any) -> None:
+        try:
+            self.run_worker(coro, group="finalize-retry", exclusive=True)
         except Exception:
             pass
 
@@ -813,18 +844,36 @@ class ChatScroll(VerticalScroll):
     #: How many extra frames to keep re-scrolling while Markdown reflows.
     PIN_RETRIES: int = 6
 
+    #: Distance (rows) from the tail still considered "at the bottom".
+    BOTTOM_TOLERANCE: float = 4.0
+
     def on_mount(self) -> None:
         self._pin_attempts = 0
+        self._pinning = False
+        self._pin_target: float | None = None
 
     def watch_scroll_y(self, old_value: float, new_value: float) -> None:
         super().watch_scroll_y(old_value, new_value)
-        max_y = self.max_scroll_y
-        self.stuck_to_bottom = new_value >= max(0.0, max_y - 4)
+        # Only a *user* scroll may disable following. Programmatic pins land on
+        # an offset that was current when they were issued, while the content
+        # has usually grown since — judging those as "the user scrolled up"
+        # silently killed auto-follow for the rest of the turn, so the final
+        # answer was appended below the fold and never seen.
+        if self._pinning:
+            return
+        target = self._pin_target
+        if target is not None and abs(new_value - target) < 2:
+            self._pin_target = None
+            return
+        if self.max_scroll_y <= 0:
+            self.stuck_to_bottom = True
+            return
+        self.stuck_to_bottom = new_value >= self.max_scroll_y - self.BOTTOM_TOLERANCE
 
     def follow_end(self) -> None:
         self.pin_to_end()
 
-    def pin_to_end(self) -> None:
+    def pin_to_end(self, force: bool = False) -> None:
         """Keeps the tail of the newest message inside the viewport.
 
         A single `scroll_end()` lands on the *previous* maximum scroll offset:
@@ -833,17 +882,31 @@ class ChatScroll(VerticalScroll):
         a 16-row gap on a 20-chunk stream). Re-issuing the scroll after each
         refresh closes that gap; the retries absorb multi-frame Markdown
         reflow while tokens keep arriving.
+
+        `force=True` re-engages following — used when the app itself starts a
+        new turn, where the user clearly wants to see what happens next.
         """
+        if force:
+            self.stuck_to_bottom = True
         if not self.stuck_to_bottom:
             return
-        self.scroll_end(animate=False)
+        self._scroll_to_tail()
         self._pin_attempts = 0
         self.call_after_refresh(self._apply_pin)
+
+    def _scroll_to_tail(self) -> None:
+        """Scrolls to the tail while marking the move as programmatic."""
+        self._pin_target = self.max_scroll_y
+        self._pinning = True
+        try:
+            self.scroll_end(animate=False)
+        finally:
+            self._pinning = False
 
     def _apply_pin(self) -> None:
         if not self.stuck_to_bottom:
             return
-        self.scroll_end(animate=False)
+        self._scroll_to_tail()
         if self.scroll_y >= self.max_scroll_y - 1:
             return
         self._pin_attempts += 1
@@ -878,6 +941,7 @@ class SidebarPanel(Vertical):
         ollama_online: bool | None = None,
         mcp_status: dict[str, dict[str, Any]] | None = None,
         mcp_configs: dict[str, dict[str, Any]] | None = None,
+        permission_mode: str = "",
     ) -> None:
         info = get_model_info(model_id, extra_models)
         used = session.total_tokens
@@ -894,6 +958,9 @@ class SidebarPanel(Vertical):
         ctx.append(f"{used:,} tokens\n", style="#808080")
         ctx.append(f"{pct}% used\n", style="#808080")
         ctx.append(f"${cost:.2f} spent", style="#808080")
+        if permission_mode:
+            accent = "#e06c75" if permission_mode == "auto" else "#fab283"
+            ctx.append(f"\n{permission_mode_label(permission_mode)}", style=accent)
         if checkpoints_count:
             ctx.append(f"\n{checkpoints_count} checkpoints", style="#fab283")
         self.query_one("#sb-context", Static).update(ctx)
