@@ -861,3 +861,112 @@ async def test_ollama_transient_503_is_retried(tmp_path: Path) -> None:
         [{"role": "user", "content": "hi"}], on_status=_noop,
     )
     assert ok and text == "local ok" and calls["n"] == 2
+
+
+# ------------------------------------------- 22. smart router wired into run_turn
+
+
+ROUTER_TIERS = {"fast": "small/model", "balanced": "mid/model", "deep": "big/model#high"}
+
+
+async def _routed_turn(
+    tmp_path: Path,
+    extra_cfg: dict[str, Any],
+    prompt: str,
+    current: str = "small/model",
+    history: bool = False,
+) -> tuple[str, list[str], AgentEngine]:
+    """Runs one real turn and returns (model the API received, status lines, engine)."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content)["model"])
+        return _sse(
+            {"choices": [{"delta": {"content": "ok"}}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+            "[DONE]",
+        )
+
+    config: dict[str, Any] = {"api_key": "k", "api_base": "https://mock.local/v1", **extra_cfg}
+    executor = ToolExecutor(workspace=tmp_path, session=Session(), get_config=lambda: config)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    engine = AgentEngine(tmp_path, executor, lambda: config, http_client=client)
+    user = ChatMessage(id="u2", role="user", content=prompt)
+    earlier = (
+        [
+            ChatMessage(id="u1", role="user", content="earlier question"),
+            ChatMessage(id="a1", role="assistant", content="earlier answer"),
+        ]
+        if history
+        else []
+    )
+    statuses: list[str] = []
+
+    async def on_status(text: str) -> None:
+        statuses.append(text)
+
+    await engine.run_turn(
+        Session(messages=[*earlier, user]), user, "build", current, _noop, _noop, on_status,
+        on_stream_chunk=_noop,
+    )
+    assert len(seen) == 1
+    return seen[0], statuses, engine
+
+
+def _router(**block: Any) -> dict[str, Any]:
+    return {"model_router": {"enabled": True, "tiers": dict(ROUTER_TIERS), **block}}
+
+
+@pytest.mark.asyncio
+async def test_router_picks_the_tier_model_on_the_first_request(tmp_path: Path) -> None:
+    model, statuses, engine = await _routed_turn(tmp_path, _router(), "refactor the architecture")
+    assert model == "big/model"  # deep tier; the `#high` variant is split off, not sent
+    assert engine._active_variant == "high"
+    assert any(s.startswith("router: big/model#high [deep]") for s in statuses)
+
+
+@pytest.mark.asyncio
+async def test_never_switch_mid_task_is_enforced_in_a_live_turn(tmp_path: Path) -> None:
+    model, statuses, _ = await _routed_turn(
+        tmp_path, _router(), "refactor the architecture", history=True
+    )
+    assert model == "small/model"  # the session already has messages: keep the model
+    assert not any(s.startswith("router:") for s in statuses)  # nothing changed, nothing announced
+
+
+@pytest.mark.asyncio
+async def test_router_may_switch_mid_task_when_the_user_allows_it(tmp_path: Path) -> None:
+    model, _, _ = await _routed_turn(
+        tmp_path, _router(never_switch_mid_task=False), "refactor the architecture", history=True
+    )
+    assert model == "big/model"
+
+
+@pytest.mark.asyncio
+async def test_pin_wins_even_mid_task(tmp_path: Path) -> None:
+    model, _, _ = await _routed_turn(
+        tmp_path, _router(pin="pinned/model"), "refactor the architecture", history=True
+    )
+    assert model == "pinned/model"
+
+
+@pytest.mark.asyncio
+async def test_disabled_router_leaves_the_selected_model_alone(tmp_path: Path) -> None:
+    cfg = {"model_router": {"enabled": False, "tiers": dict(ROUTER_TIERS)}, "model_pinned": "pinned/x"}
+    model, statuses, _ = await _routed_turn(tmp_path, cfg, "refactor the architecture")
+    assert model == "small/model"  # not even a `model_pinned` entry applies while disabled
+    assert not statuses or not any(s.startswith("router:") for s in statuses)
+
+    model, _, _ = await _routed_turn(tmp_path, {}, "refactor the architecture")
+    assert model == "small/model"
+
+
+@pytest.mark.asyncio
+async def test_light_heavy_routing_is_skipped_when_the_smart_router_runs(tmp_path: Path) -> None:
+    cfg = {**_router(), "model_routing": {"enabled": True, "light": "light/x", "heavy": "heavy/x"}}
+    model, _, _ = await _routed_turn(tmp_path, cfg, "what is this file?", current="mid/model")
+    assert model == "small/model"  # fast tier from the router, not light/heavy
+
+    old_only = {"model_routing": {"enabled": True, "light": "light/x", "heavy": "heavy/x"}}
+    model, _, _ = await _routed_turn(tmp_path, old_only, "what is this file?")
+    assert model == "light/x"  # the older routing still works on its own

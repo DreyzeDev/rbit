@@ -25,6 +25,7 @@ from .models import (
     get_model_info,
     short_id,
 )
+from .router import apply_live_route, router_enabled
 from .rules import load_rules
 from .usage import BudgetGuard, UsageLedger, estimate_cost, normalize_budget_mode, split_usage
 from .skills import load_skills, skills_prompt
@@ -741,13 +742,30 @@ class AgentEngine:
                     await on_status(f"budget: {pct:.0f}% used")
                 elif pct >= 50:
                     await on_status(f"budget: {pct:.0f}% used")
+        # Smart router (`model_router`): opt-in. It runs before the `#variant` split so a
+        # tier model written as `provider/model#variant` is handled like a selected one.
+        # `never_switch_mid_task` (default on) keeps the model once the session already
+        # has messages, so the model only changes on a session's first request (or on
+        # an explicit pin).
+        routed_by_router = False
+        if router_enabled(cfg):
+            routed_by_router = True
+            has_history = any(message is not user_msg for message in session.messages)
+            decision = apply_live_route(
+                getattr(user_msg, "content", "") or "", model_id, cfg, has_history=has_history
+            )
+            if decision.model and decision.model != model_id:
+                if on_status is not None:
+                    await on_status(f"router: {decision.describe()}")
+                model_id = decision.model
         model_id, variant = self._split_model_variant(model_id)
         if model_id.startswith("opencode-go/"):
             model_id = model_id.split("/", 1)[1]
         self._active_variant = variant
         self._auto_design_section = self._auto_design_prompt(user_msg)
         routing = cfg.get("model_routing")
-        if isinstance(routing, dict) and routing.get("enabled"):
+        # The older light/heavy routing is skipped when the smart router handled this turn.
+        if not routed_by_router and isinstance(routing, dict) and routing.get("enabled"):
             routed = route_model_for_task(model_id, user_msg, routing)
             if routed and routed != model_id:
                 if on_status is not None:

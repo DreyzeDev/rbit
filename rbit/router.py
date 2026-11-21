@@ -120,6 +120,15 @@ def _router_enabled(config: dict[str, Any] | None) -> bool:
     return bool(block)
 
 
+def router_enabled(config: dict[str, Any] | None) -> bool:
+    """True when `model_router` is switched on in the config.
+
+    The agent consults this before routing at all: a disabled router must leave the
+    user's selected model alone (even a `model_pinned` entry), so routing stays opt-in.
+    """
+    return _router_enabled(config)
+
+
 def _model_available(model: str, available: list[str] | None) -> bool:
     if not available:
         return True

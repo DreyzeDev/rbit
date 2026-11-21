@@ -4,6 +4,18 @@ All notable changes to rbit are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`model_router` was never used.** The smart router (tiers, pin, policy) and its
+  `never_switch_mid_task` guard existed but nothing called them. When
+  `model_router.enabled` is set, `run_turn` now routes the request (announced as a
+  `router: <model> [<tier>] — <reason>` status line). With `never_switch_mid_task`
+  (default on) the model only changes on a session's first request or on an
+  explicit pin. A disabled router leaves the selected model alone, and the older
+  `model_routing` (light/heavy) is skipped while the smart router is active.
+
 ## [1.6.0] - 2026-11-18
 
 Closes every remaining actionable item in `docs/RBIT_BLUEPRINT.md`: 132 of 134
