@@ -8,6 +8,19 @@ All notable changes to rbit are documented here. The format follows
 
 ### Fixed
 
+- **Files that are not UTF-8 can be edited.** `edit` read such a file as UTF-8 with
+  escapes, so the model's text (real Cyrillic) never matched the bytes. The file's
+  encoding is now detected (UTF-8, UTF-8/16/32 with BOM, otherwise cp1251 for Cyrillic
+  text or the locale's / cp1252 code page), `read`, `grep` and `symbols` show decoded
+  text, and `edit`, `multi_edit`, `apply_patch` and `write` keep the file's encoding
+  and line endings. Untouched bytes always round-trip exactly; characters the code page
+  cannot hold (an emoji in a cp1251 file) are refused with a clear message instead of
+  corrupting the file. New files are still UTF-8.
+- **DNS rebinding in `webfetch` / image downloads.** The host was resolved for the SSRF
+  check and then again by httpx when connecting, so a DNS server could answer a public
+  address first and `127.0.0.1` second. Requests now connect to the address that was
+  validated (the `Host` header and TLS name stay the original host).
+
 - **`model_router` was never used.** The smart router (tiers, pin, policy) and its
   `never_switch_mid_task` guard existed but nothing called them. When
   `model_router.enabled` is set, `run_turn` now routes the request (announced as a

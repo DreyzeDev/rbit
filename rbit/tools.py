@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import codecs
 import difflib
 import fnmatch
 import html
 import ipaddress
 import json
+import locale
 import logging
 import os
 import re
@@ -237,20 +239,124 @@ def strip_ansi(text: str) -> str:
 
 
 
+class FileEncodingError(ValueError):
+    """Text cannot be written back in the encoding the file already uses."""
+
+
+def _utf8_validity(raw: bytes) -> tuple[int, int]:
+    """(characters decoded from valid multi-byte UTF-8, invalid byte sequences)."""
+    decoded = raw.decode("utf-8", errors="replace")
+    bad = decoded.count("�")
+    good = sum(1 for ch in decoded if ch > "\x7f" and ch != "�")
+    return good, bad
+
+
+def _legacy_encoding(raw: bytes) -> str:
+    """Best guess for a single-byte code page: cp1251 for Cyrillic text, else the locale's."""
+    letters = [ch for ch in raw.decode("cp1251", errors="replace") if ch.isalpha()]
+    if letters and sum(1 for ch in letters if "Ѐ" <= ch <= "ӿ") / len(letters) > 0.3:
+        return "cp1251"
+    preferred = (locale.getpreferredencoding(False) or "").lower()
+    if preferred.startswith("cp125") and preferred != "cp1251":
+        try:
+            codecs.lookup(preferred)
+            return preferred
+        except LookupError:
+            pass
+    return "cp1252"
+
+
+def detect_file_encoding(raw: bytes) -> str:
+    """Name of the codec that reads `raw` as text and writes it back byte for byte.
+
+    UTF-8 (also with a BOM, and with a few stray bytes) stays "utf-8"; UTF-16/32 with a
+    BOM keep their byte order; anything else is a legacy single-byte code page.
+
+    A wrong legacy guess cannot corrupt text the model does not touch: decoding and
+    encoding with the same codec is the identity, and bytes the codec has no character
+    for survive as escapes. Only characters the model types are encoded, and those
+    raise FileEncodingError if the code page cannot represent them.
+    """
+    if raw.startswith(codecs.BOM_UTF32_LE):
+        return "utf-32-le"
+    if raw.startswith(codecs.BOM_UTF32_BE):
+        return "utf-32-be"
+    if raw.startswith(codecs.BOM_UTF16_LE):
+        return "utf-16-le"
+    if raw.startswith(codecs.BOM_UTF16_BE):
+        return "utf-16-be"
+    if not raw or raw.isascii():
+        return "utf-8"
+    try:
+        raw.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        pass
+    if b"\x00" in raw:  # binary, or a wide encoding without a BOM: keep the byte-exact behaviour
+        return "utf-8"
+    good, bad = _utf8_validity(raw)
+    if good * 3 >= bad:  # mostly UTF-8 with a few stray bytes
+        return "utf-8"
+    return _legacy_encoding(raw)
+
+
+def decode_file_bytes(raw: bytes) -> tuple[str, str]:
+    """Returns (text, encoding). Undecodable bytes become lone surrogates and round-trip."""
+    encoding = detect_file_encoding(raw)
+    return raw.decode(encoding, errors="surrogateescape"), encoding
+
+
+def read_text_for_display(path: Path) -> str:
+    """File text for showing to the model: right encoding, U+FFFD for undecodable bytes."""
+    raw = path.read_bytes()
+    return raw.decode(detect_file_encoding(raw), errors="replace")
+
+
+def encode_file_text(text: str, encoding: str, label: str = "file") -> bytes:
+    """Encodes `text` in `encoding`, or raises FileEncodingError naming the characters it lacks."""
+    try:
+        return text.encode(encoding, errors="surrogateescape")
+    except UnicodeEncodeError:
+        missing: list[str] = []
+        for ch in dict.fromkeys(text):
+            try:
+                ch.encode(encoding, errors="surrogateescape")
+            except UnicodeEncodeError:
+                missing.append(ch)
+        shown = ", ".join(repr(ch) for ch in missing[:6]) + (" ..." if len(missing) > 6 else "")
+        raise FileEncodingError(
+            f"`{label}` is encoded as {encoding}, which cannot represent {shown}. "
+            "Use characters that exist in that encoding, or convert the file to UTF-8 first."
+        ) from None
+
+
 def atomic_write_text(path: Path, content: str) -> None:
     """Writes text via a temp file + os.replace so a crash never truncates the target.
 
-    Preserves the target's dominant line ending: without this, Windows text mode
-    turns every `\\n` into `\\r\\n`, so editing an LF file rewrote every line
-    (and vice versa), exploding git diffs and breaking follow-up edits."""
+    Keeps the target's existing encoding (cp1251, UTF-16 with BOM, ...) and preserves its
+    dominant line ending: without this, Windows text mode turns every `\\n` into
+    `\\r\\n`, so editing an LF file rewrote every line (and vice versa), exploding git
+    diffs and breaking follow-up edits."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    # surrogateescape round-trips the bytes of a non-UTF-8 file that was read the
-    # same way, instead of baking U+FFFD into the user's file.
-    data = content.encode("utf-8", errors="surrogateescape")
     try:
         original = path.read_bytes()
     except OSError:
         original = b""
+    encoding = detect_file_encoding(original) if original else "utf-8"
+    if encoding.startswith(("utf-16", "utf-32")):
+        # Not ASCII-compatible: adapt the line endings on the text, then encode.
+        original_text = original.decode(encoding, errors="surrogateescape")
+        if (
+            "\r\n" in original_text
+            and "\r\n" not in content
+            and original_text.count("\n") == original_text.count("\r\n")
+        ):
+            content = content.replace("\n", "\r\n")
+        atomic_write_bytes(path, encode_file_text(content, encoding, path.name), mode_from=path)
+        return
+    # surrogateescape round-trips the bytes of a file that was read the same way,
+    # instead of baking U+FFFD into the user's file.
+    data = encode_file_text(content, encoding, path.name)
     if b"\r\n" not in data and b"\r\n" in original:
         crlf = original.count(b"\r\n")
         bare_lf = original.count(b"\n") - crlf
@@ -608,7 +714,8 @@ def read_text_lossless(path: Path) -> tuple[str, bytes]:
     """Reads a file without ever replacing bytes: invalid UTF-8 survives as surrogates
     (re-encoded verbatim on write). Line endings are normalised to `\\n` for matching."""
     raw = path.read_bytes()
-    return raw.decode("utf-8", errors="surrogateescape").replace("\r\n", "\n"), raw
+    text, _encoding = decode_file_bytes(raw)
+    return text.replace("\r\n", "\n"), raw
 
 
 def printable(text: str) -> str:
@@ -2237,11 +2344,17 @@ class ToolExecutor:
         if target.suffix.lower() == ".pdf":
             return self._read_pdf(target, rel, offset, limit)
 
-        text = target.read_text(encoding="utf-8", errors="replace")
+        raw_bytes = target.read_bytes()
+        encoding = detect_file_encoding(raw_bytes)
+        text = raw_bytes.decode(encoding, errors="replace")
         lines = text.splitlines()
         sliced = lines[offset - 1 : offset - 1 + limit]
         numbered = "\n".join(f"{idx}: {line}" for idx, line in enumerate(sliced, start=offset))
-        return ToolResult(True, f"{len(sliced)}/{len(lines)} lines", numbered or "(empty file)")
+        output = numbered or "(empty file)"
+        if encoding != "utf-8":
+            # Tell the model: the text above is already decoded, and edits keep this encoding.
+            output += f"\n[file encoding: {encoding}; edit and write keep it]"
+        return ToolResult(True, f"{len(sliced)}/{len(lines)} lines", output)
 
     @staticmethod
     def _read_pdf(target: Path, rel: str, offset: int, limit: int) -> ToolResult:
@@ -2858,7 +2971,7 @@ class ToolExecutor:
             if include != "*" and not full.match(include):
                 continue
             try:
-                text = full.read_text(encoding="utf-8", errors="ignore")
+                text = read_text_for_display(full)
             except Exception:
                 continue
             lines = text.splitlines()
@@ -2986,7 +3099,7 @@ class ToolExecutor:
             try:
                 if fpath.stat().st_size > MAX_READ_BYTES * 2:
                     continue
-                content = fpath.read_text(encoding="utf-8", errors="replace")
+                content = read_text_for_display(fpath)
             except Exception:
                 continue
             found.extend(self._symbols_for_content(self.rel_display(fpath), content))
