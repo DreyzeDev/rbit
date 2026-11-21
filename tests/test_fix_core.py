@@ -997,3 +997,66 @@ def test_memory_append_waits_when_the_lock_file_is_mid_deletion(
     assert attempts["lock"] == 4  # three refusals were retried, the fourth took the lock
     assert "kept" in s.memory_path.read_text(encoding="utf-8")
     assert not list(tmp_path.rglob("*.lock"))  # and the lock was released afterwards
+
+
+# ---------------------------------- 23. the daily budget day is the LOCAL day
+
+
+class _FakeClock:
+    """Local time is UTC+3. At 00:30 local on the 22nd it is still 21:30 UTC on the 21st."""
+
+    local = datetime(2026, 11, 22, 0, 30)
+
+    @classmethod
+    def install(cls, monkeypatch: pytest.MonkeyPatch) -> None:
+        import rbit.usage as usage_module
+
+        clock = cls
+
+        class FakeDatetime(datetime):
+            @classmethod
+            def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+                if tz is None:
+                    return clock.local
+                from datetime import timedelta, timezone
+
+                return clock.local.replace(tzinfo=timezone(timedelta(hours=3))).astimezone(timezone.utc)
+
+        monkeypatch.setattr(usage_module, "datetime", FakeDatetime)
+
+
+def test_usage_is_filed_under_the_local_day_not_the_utc_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import date
+
+    _FakeClock.install(monkeypatch)
+    ledger = UsageLedger(tmp_path)
+    ledger.record("m", output_tokens=10, cost_usd=2.0)
+
+    assert (ledger.dir / "2026-11-22.jsonl").is_file()  # local day, although UTC says the 21st
+    assert not (ledger.dir / "2026-11-21.jsonl").exists()
+    assert len(ledger.read_day()) == 1
+    assert ledger.read_day(date(2026, 11, 21)) == []
+
+
+def test_daily_budget_resets_at_local_midnight(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _FakeClock.install(monkeypatch)
+    ledger = UsageLedger(tmp_path)
+    ledger.record("m", output_tokens=10, cost_usd=2.0)
+    guard = BudgetGuard(ledger, {"budget_mode": "strict", "daily_budget_usd": 1.0})
+
+    allowed, _ = guard.check("m", estimated_usd=0.01)
+    assert allowed is False  # 2.00 already spent "today" (local) against a 1.00 daily budget
+
+    try:
+        # 03:30 local = 00:30 UTC on the 22nd: UTC midnight has passed, the local day has not.
+        _FakeClock.local = datetime(2026, 11, 22, 3, 30)
+        allowed, _ = guard.check("m", estimated_usd=0.01)
+        assert allowed is False  # the budget must not reset at UTC midnight
+
+        _FakeClock.local = datetime(2026, 11, 23, 0, 10)  # the next local day
+        allowed, _ = guard.check("m", estimated_usd=0.01)
+        assert allowed is True  # a fresh day starts with a fresh budget
+    finally:
+        _FakeClock.local = datetime(2026, 11, 22, 0, 30)
