@@ -257,6 +257,7 @@ def apply_live_route(
     current_model: str,
     config: dict[str, Any],
     available_models: list[str] | None = None,
+    has_history: bool = True,
 ) -> RoutingDecision:
     """Like `route`, but respects `never_switch_mid_task`.
 
@@ -269,11 +270,15 @@ def apply_live_route(
     keep = block.get("never_switch_mid_task")
     if keep is None:
         keep = True
-    if keep:
-        # The caller passes the decision through anyway; `pinned` signals "do not
-        # switch". Marking here keeps the rule in one place instead of the app.
-        pass
-    return route(text, current_model, config, available_models)
+    decision = route(text, current_model, config, available_models)
+    if keep and has_history and not decision.pinned and decision.model != current_model:
+        return RoutingDecision(
+            model=current_model,
+            tier="current",
+            reason=f"{decision.reason}; model kept mid-task (never_switch_mid_task)",
+            fallback=True,
+        )
+    return decision
 
 
 def tier_of(config: dict[str, Any] | None, model: str) -> str:

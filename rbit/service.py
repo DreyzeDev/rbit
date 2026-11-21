@@ -60,19 +60,43 @@ class ServiceState:
         )
 
 
+class ServiceStartError(RuntimeError):
+    """The background service died or never became healthy."""
+
+
 def _alive(pid: int) -> bool:
     if pid <= 0:
         return False
     if os.name == "nt":
-        out = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, check=False
-        )
-        return str(pid) in out.stdout
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            # Access denied still means the process exists.
+            return ctypes.get_last_error() == 5
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
     try:
         os.kill(pid, 0)
         return True
+    except PermissionError:
+        return True
     except OSError:
         return False
+
+
+pid_alive = _alive
+
+
+def _no_proxy_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _free_port(start: int = 8333, host: str = "127.0.0.1") -> int:
@@ -89,10 +113,42 @@ def _free_port(start: int = 8333, host: str = "127.0.0.1") -> int:
 
 def _health(url: str, timeout: float = 1.0) -> bool:
     try:
-        with urllib.request.urlopen(f"{url}/health", timeout=timeout) as response:
+        with _no_proxy_opener().open(f"{url}/health", timeout=timeout) as response:
             return response.status == 200
     except (urllib.error.URLError, OSError, ValueError):
         return False
+
+
+def _authenticated(url: str, token: str, timeout: float = 1.5) -> bool:
+    """True when the server at `url` accepts our service token (identity check)."""
+    request = urllib.request.Request(f"{url}/v1/status", headers={"Authorization": f"Bearer {token}"} if token else {})
+    try:
+        with _no_proxy_opener().open(request, timeout=timeout) as response:
+            return response.status == 200
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write `text` to `path`, creating it with 0600 permissions (no chmod race)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
+def _cmdline_mentions_rbit(pid: int) -> bool:
+    """Best-effort process identity check where /proc is available."""
+    try:
+        data = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    return b"rbit" in data
 
 
 class ServiceManager:
@@ -109,17 +165,11 @@ class ServiceManager:
             return None
 
     def write(self, state: ServiceState) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
         data = state.to_dict()
         settings = self.get_settings()
         if settings:
             data["settings"] = settings
-        self.state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        if os.name != "nt":
-            try:
-                os.chmod(self.state_path, 0o600)
-            except OSError:
-                pass
+        _write_private(self.state_path, json.dumps(data, indent=2))
 
     def clear(self) -> None:
         try:
@@ -201,14 +251,31 @@ class ServiceManager:
             if process.poll() is not None:
                 break
             time.sleep(0.2)
-        return state
+        died = process.poll() is not None
+        if not died:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        settings = self.get_settings()
+        self.clear()
+        if settings:
+            self._write_raw({"settings": settings})
+        reason = "the process exited" if died else "the health check never succeeded"
+        raise ServiceStartError(f"service failed to start ({reason}); see log: {log_path}")
 
     def stop(self) -> bool:
         state = self.read()
         if state is None:
             return False
         was_running = _alive(state.pid)
-        if was_running:
+        # Never kill a PID we cannot prove is our server (PIDs get reused).
+        if was_running and not (_authenticated(state.url, state.token) or _cmdline_mentions_rbit(state.pid)):
+            was_running = False
+            killable = False
+        else:
+            killable = was_running
+        if killable:
             try:
                 if os.name == "nt":
                     subprocess.run(
@@ -240,13 +307,7 @@ class ServiceManager:
             return {}
 
     def _write_raw(self, data: dict[str, Any]) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        if os.name != "nt":
-            try:
-                os.chmod(self.state_path, 0o600)
-            except OSError:
-                pass
+        _write_private(self.state_path, json.dumps(data, indent=2))
 
     def get_settings(self) -> dict[str, Any]:
         settings = self._raw().get("settings")

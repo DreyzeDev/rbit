@@ -22,6 +22,7 @@ from textual.css.query import NoMatches
 from textual.markup import escape as markup_escape
 from textual.timer import Timer
 from textual.widgets import Input, Markdown, OptionList, Static
+from textual.worker import get_current_worker
 
 from . import __version__
 from .agent import AgentEngine
@@ -122,6 +123,31 @@ def _write_clipboard(text: str) -> bool:
     return False
 
 
+# `@path` / `@"path with spaces"` attachment references (shared by the
+# autocomplete popup and prompt submission).
+_AT_TRAILING_RE = re.compile(r'@(?:"([^"]*)|([^\s"]*))$')
+_AT_REF_RE = re.compile(r'@(?:"([^"]+)"|([^\s"]+))')
+
+
+def trailing_at_query(text: str) -> str | None:
+    """Returns the partial `@` token at the end of `text` (None when absent)."""
+    m = _AT_TRAILING_RE.search(text)
+    if not m:
+        return None
+    return m.group(1) if m.group(1) is not None else m.group(2)
+
+
+def format_at_ref(path: str) -> str:
+    """Formats a path as an attachment reference, quoting names with spaces."""
+    path = path.replace("\\", "/")
+    return f'@"{path}"' if any(ch.isspace() for ch in path) else f"@{path}"
+
+
+def parse_at_refs(text: str) -> list[str]:
+    """Extracts attachment references (without the leading `@` and quotes)."""
+    return [m.group(1) or m.group(2) for m in _AT_REF_RE.finditer(text)]
+
+
 RBIT_TUI_CSS = """
 Screen {
     background: $background;
@@ -158,13 +184,15 @@ Screen {
 
 /* --- Home Logo & Tip --- */
 #home-logo {
-    width: 78;
+    width: 100%;
+    max-width: 78;
     content-align: center middle;
     margin-bottom: 2;
 }
 
 #home-tip {
-    width: 78;
+    width: 100%;
+    max-width: 78;
     content-align: center middle;
     margin-top: 2;
 }
@@ -275,7 +303,8 @@ Screen {
 }
 
 #center-stage.is-home #prompt-outer {
-    width: 78;
+    width: 100%;
+    max-width: 78;
 }
 
 #center-stage.is-session #prompt-outer {
@@ -467,6 +496,9 @@ class RbitApp(App[None]):
 
     TITLE = "rbit"
     CSS = RBIT_TUI_CSS
+    # Textual's built-in palette claims ctrl+p with a priority binding (even over
+    # open modals) and shadows rbit's own palette; rbit binds ctrl+p itself.
+    ENABLE_COMMAND_PALETTE = False
 
     BINDINGS = [
         Binding("ctrl+p", "open_palette", "Commands", show=False),
@@ -517,7 +549,9 @@ class RbitApp(App[None]):
         self.is_busy: bool = False
         self.busy_status: str = ""
         self._busy_worker: Any = None
-        self._queued_prompt: str | None = None
+        self._queued_prompts: list[str] = []
+        self._history_recalled: str | None = None
+        self._load_older_seq: int = 0
         self._auto_fix_round: bool = False
         self._sidebar_width: int = max(24, min(60, int(self.config_data.get("sidebar_width", 34))))
         self._stream_chars: int = 0
@@ -823,10 +857,31 @@ class RbitApp(App[None]):
         }
 
     @property
+    def _queued_prompt(self) -> str | None:
+        """First queued prompt (None when the queue is empty)."""
+        return self._queued_prompts[0] if self._queued_prompts else None
+
+    @_queued_prompt.setter
+    def _queued_prompt(self, value: str | None) -> None:
+        self._queued_prompts = [value] if value else []
+
+    def _drain_queue(self) -> None:
+        """Dispatches the next queued prompt once the app is idle again.
+
+        Called from the `finally` of every busy worker (agent turn, bang,
+        compact, /test…), so a prompt typed meanwhile is never stranded.
+        """
+        if not self._queued_prompts or self.is_busy:
+            return
+        nxt = self._queued_prompts.pop(0)
+        self.call_after_refresh(self._submit_prompt, nxt)
+
+    @property
     def _busy_status_display(self) -> str:
-        if self._queued_prompt and self.is_busy:
-            preview = self._queued_prompt.strip().replace("\n", " ")[:28]
-            return f"{self.busy_status}  ·  в очереди: {preview}…".strip()
+        if self._queued_prompts and self.is_busy:
+            preview = self._queued_prompts[0].strip().replace("\n", " ")[:28]
+            extra = f" (+{len(self._queued_prompts) - 1})" if len(self._queued_prompts) > 1 else ""
+            return f"{self.busy_status}  ·  в очереди: {preview}…{extra}".strip()
         if self._stream_chars and self.is_busy:
             return f"{self.busy_status}  ·  ≈{self._stream_chars // 4} tok"
         return self.busy_status
@@ -1021,17 +1076,27 @@ class RbitApp(App[None]):
                 popup.action_cursor_up()
                 return
 
-        if inp.has_focus and not inp.value and self.prompt_history:
+        if inp.has_focus and self.prompt_history and event.key in ("up", "down"):
+            # Browsing is active while the field still holds what the history
+            # cursor put there; once the user edits it (or it is empty) a fresh
+            # ↑ starts again from the newest entry.
+            browsing = self.history_cursor >= 0 and inp.value == self._history_recalled
+            if not browsing and inp.value:
+                return
+            if not browsing:
+                self.history_cursor = -1
             if event.key == "up":
                 event.prevent_default()
                 self.history_cursor = min(len(self.prompt_history) - 1, self.history_cursor + 1)
-                inp.value = self.prompt_history[-(self.history_cursor + 1)]
-                inp.cursor_position = len(inp.value)
-            elif event.key == "down" and self.history_cursor >= 0:
+            elif browsing:
                 event.prevent_default()
                 self.history_cursor -= 1
-                inp.value = self.prompt_history[-(self.history_cursor + 1)] if self.history_cursor >= 0 else ""
-                inp.cursor_position = len(inp.value)
+            else:
+                return
+            text = self.prompt_history[-(self.history_cursor + 1)] if self.history_cursor >= 0 else ""
+            self._history_recalled = text
+            inp.value = text
+            inp.cursor_position = len(inp.value)
 
     @on(AgentModeBadge.Toggled)
     def _on_badge_clicked(self) -> None:
@@ -1088,7 +1153,8 @@ class RbitApp(App[None]):
             self._interrupted_turn = self._finalize_interrupted()
             self.is_busy = False
             self.busy_status = ""
-            self._queued_prompt = None  # interrupt means stop everything
+            self._queued_prompts.clear()  # interrupt means stop everything
+            self._busy_worker = None
             self._post_notice("Interrupted by user (esc).")
             self._sync_ui()
 
@@ -1098,7 +1164,15 @@ class RbitApp(App[None]):
         val = event.value
         popup = self.query_one(AutocompletePopup)
 
+        if self.history_cursor >= 0 and val == self._history_recalled:
+            # Recalled from history with the arrow keys: no autocomplete popup,
+            # so ↑/↓ keep browsing history.
+            self._cancel_file_completion()
+            popup.display = False
+            return
+
         if val.startswith("/") and " " not in val:
+            self._cancel_file_completion()
             extra = [
                 (f"/{name}", str(meta.get("description", "")))
                 for name, meta in self.storage.load_custom_commands().items()
@@ -1106,13 +1180,20 @@ class RbitApp(App[None]):
             popup.show_slash(val, extra)
             return
 
-        at_match = re.search(r"@([^\s]*)$", val)
-        if at_match:
-            query = at_match.group(1)
+        query = trailing_at_query(val)
+        if query is not None:
             self._queue_file_completion(query)
             return
 
+        self._cancel_file_completion()
         popup.display = False
+
+    def _cancel_file_completion(self) -> None:
+        """Stops a pending debounced @-completion and forgets its query."""
+        if self._completion_timer is not None:
+            self._completion_timer.stop()
+            self._completion_timer = None
+        self._completion_query = None
 
     def _queue_file_completion(self, query: str) -> None:
         """Debounces workspace listing for @-completion.
@@ -1135,6 +1216,15 @@ class RbitApp(App[None]):
         except NoMatches:
             return
         files = self.executor.list_workspace_files(limit=120)
+        # The listing can take a while; the field may have changed (cleared,
+        # submitted, edited) since the timer was armed. Re-check before showing.
+        try:
+            current = trailing_at_query(self.query_one("#prompt-input", Input).value)
+        except NoMatches:
+            return
+        if current is None or current != self._completion_query:
+            popup.display = False
+            return
         popup.show_files(query, files)
 
     @on(OptionList.OptionSelected, "#autocomplete-popup")
@@ -1149,16 +1239,18 @@ class RbitApp(App[None]):
         if kind == "slash":
             inp.value = value + " "
         elif kind == "file":
-            value = value.replace("\\", "/")
+            ref = format_at_ref(value)
             # lambda replacement: a plain template string would interpret
             # control sequences like \t or \n inside Windows paths.
-            inp.value = re.sub(r"@([^\s]*)$", lambda _m: f"@{value} ", inp.value, count=1)
+            inp.value = _AT_TRAILING_RE.sub(lambda _m: f"{ref} ", inp.value, count=1)
         inp.cursor_position = len(inp.value)
         inp.focus()
 
     # --- Modals & Actions ---
     @work
     async def action_open_palette(self) -> None:
+        if len(self.screen_stack) > 1:
+            return  # a modal is already open: never stack the palette on top of it
         act = await self.push_screen_wait(
             CommandPaletteModal(self.config_data.get("palette_recents", []))
         )
@@ -1286,6 +1378,9 @@ class RbitApp(App[None]):
 
     @work
     async def action_open_checkpoints(self) -> None:
+        if self.is_busy:
+            self.notify("Agent is busy — press Esc first.", severity="warning")
+            return
         cps = self.storage.list_checkpoints()
         res = await self.push_screen_wait(CheckpointModal(cps))
         if res:
@@ -1293,6 +1388,10 @@ class RbitApp(App[None]):
             if action == "create":
                 self._cmd_checkpoint(payload)
             elif action == "restore":
+                if self.is_busy:
+                    self.notify("Agent is busy — press Esc first.", severity="warning")
+                    self.query_one("#prompt-input", Input).focus()
+                    return
                 msg = self.executor.restore_checkpoint(payload)
                 self._post_notice(f"↺ {msg}")
                 self._sync_ui()
@@ -1309,15 +1408,27 @@ class RbitApp(App[None]):
         if action == "new":
             self.action_new_session()
         elif action == "delete":
-            self.storage.delete_session(sid)
-            if sid == self.session.id:
-                self.action_new_session()
+            self._delete_session_from_picker(sid)
         elif action == "switch":
             for s in sessions:
                 if s.id == sid:
                     self._load_session_into_ui(s)
                     break
         self.query_one("#prompt-input", Input).focus()
+
+    def _delete_session_from_picker(self, sid: str) -> bool:
+        """Deletes a stored session; the current one is protected during a turn.
+
+        Deleting the live session while a turn runs used to resurrect it: the
+        turn's debounced save wrote the file again after the delete.
+        """
+        if sid == self.session.id and self.is_busy:
+            self.notify("Cannot delete the current session while the agent is busy — press Esc first.", severity="warning")
+            return False
+        self.storage.delete_session(sid)
+        if sid == self.session.id:
+            self.action_new_session()
+        return True
 
     @work
     async def action_open_connect(self) -> None:
@@ -1466,6 +1577,12 @@ class RbitApp(App[None]):
 
     def _rebuild_chat_view(self, limit: int | None = None) -> None:
         scroll = self.query_one("#chat-scroll", ChatScroll)
+        # `remove_children()` is asynchronous: the old widgets (and their ids)
+        # stay registered until the removal finishes, so a fixed id for the
+        # "load older" notice raised DuplicateIds on a second rebuild.
+        load_older_taken = any(
+            str(getattr(child, "id", "") or "").startswith("load-older") for child in scroll.children
+        )
         scroll.remove_children()
         self._tool_widgets.clear()
         # Live widgets were just detached; drop the stale references so an
@@ -1482,8 +1599,10 @@ class RbitApp(App[None]):
                 visible = [*pinned_early, *visible]
         widgets: list[Any] = []
         if truncated:
+            self._load_older_seq += 1
+            notice_id = f"load-older-{self._load_older_seq}" if load_older_taken else "load-older"
             widgets.append(
-                Static("↑ Load older messages", id="load-older", classes="system-notice")
+                Static("↑ Load older messages", id=notice_id, classes="system-notice")
             )
         for m in visible:
             if m.role == "user":
@@ -1502,7 +1621,7 @@ class RbitApp(App[None]):
         self.notify("Loaded older messages.", timeout=2.0)
 
     def on_click(self, event: events.Click) -> None:
-        if getattr(event.widget, "id", None) == "load-older":
+        if str(getattr(event.widget, "id", "") or "").startswith("load-older"):
             self._load_older()
 
     def _post_notice(self, text: str, *, markup: bool = False) -> None:
@@ -1562,11 +1681,14 @@ class RbitApp(App[None]):
         pct = self.session.total_tokens / info.context_window * 100
         if pct >= threshold:
             self.notify(f"Контекст {pct:.0f}% — авто-компакция…", timeout=3.0)
-            self._busy_worker = self._compact_context()
+            self._start_compact()
 
     @work
     async def _cmd_continue_session(self, arg: str) -> None:
         """/continue <id|prefix> — вплетает выжимку другой сессии в текущую."""
+        if self.is_busy:
+            self.notify("Agent is busy — press Esc first.", severity="warning")
+            return
         arg = arg.strip()
         if not arg:
             self.notify("Usage: /continue <session-id|prefix>", severity="warning")
@@ -1840,21 +1962,20 @@ class RbitApp(App[None]):
             count = sum(self.plugins.count(hook) for hook in ("tool.execute.before", "tool.execute.after", "chat.params", "event"))
             self._post_notice(f"Plugin hooks registered: **{count}** across 4 hook types.")
 
-    async def _cmd_test(self, path: str) -> None:
+    async def _cmd_test(self, path: str) -> str | None:
+        """Runs the tests; returns a follow-up prompt for the agent on failure."""
         cmd = path.strip() or detect_test_command(self.workspace)
         if not cmd:
             self.notify("No test command detected; use /test <command>.", severity="warning")
-            return
+            return None
         self.notify(f"Running: {cmd}", timeout=2.0)
         res = await self.executor.execute("bash", {"command": cmd, "timeout": 300})
         tail = "\n".join(res.output.splitlines()[-25:]) or "(no output)"
         if res.ok:
             self._post_notice(f"✓ Tests passed\n\n{tail}")
-        else:
-            self._post_notice(f"✗ Tests failed — отправляю падения агенту\n\n{tail}")
-            self._submit_prompt(
-                "[test failures] Тесты упали. Вот вывод:\n\n" + tail + "\n\nНайди причину и исправь."
-            )
+            return None
+        self._post_notice(f"✗ Tests failed — отправляю падения агенту\n\n{tail}")
+        return "[test failures] Тесты упали. Вот вывод:\n\n" + tail + "\n\nНайди причину и исправь."
 
     def _cmd_review(self) -> None:
         self.agent_mode = "plan"
@@ -1870,7 +1991,8 @@ class RbitApp(App[None]):
             self.notify("Usage: /explain <file>", severity="warning")
             return
         self._submit_prompt(
-            f"Объясни файл `{path}`: назначение, ключевые функции/классы, связи с остальным кодом. @ {path}"
+            f"Объясни файл `{path}`: назначение, ключевые функции/классы, связи с остальным кодом. "
+            f"{format_at_ref(path)}"
         )
 
     def _cmd_deps(self) -> None:
@@ -1901,7 +2023,15 @@ class RbitApp(App[None]):
         cfg_editor = str(self.config_data.get("editor") or "").strip()
         for candidate in (_os.environ.get("VISUAL"), _os.environ.get("EDITOR"), cfg_editor):
             if candidate and candidate.strip():
-                return shlex.split(candidate)
+                try:
+                    # Windows paths contain backslashes: POSIX splitting would eat them.
+                    parts = shlex.split(candidate, posix=(_os.name != "nt"))
+                except ValueError:
+                    continue  # unbalanced quotes: try the next source
+                if _os.name == "nt":
+                    parts = [p[1:-1] if len(p) > 1 and p[0] == p[-1] and p[0] in "\"'" else p for p in parts]
+                if parts:
+                    return parts
         return ["notepad"] if _os.name == "nt" else ["vi"]
 
     async def _cmd_edit(self, path: str) -> None:
@@ -1921,8 +2051,13 @@ class RbitApp(App[None]):
                 self.notify(f"Cannot resolve path: {path}", severity="warning")
                 return
             if not target.exists():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text("", encoding="utf-8")
+                # Do not create an empty file up front: a typo'd path would
+                # leave junk behind. Editors create it themselves on save.
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    self.notify(f"Cannot create folder: {exc}", severity="error")
+                    return
         try:
             with self.suspend():
                 await asyncio.to_thread(
@@ -1930,6 +2065,10 @@ class RbitApp(App[None]):
                 )
         except Exception as exc:
             self.notify(f"Editor failed: {exc}", severity="error")
+            return
+        if not editing_prompt and not target.exists():
+            self.notify(f"Not saved (file was not created): {path.strip()}", severity="warning")
+            self._sync_ui()
             return
         if editing_prompt:
             new_text = target.read_text(encoding="utf-8", errors="replace").strip()
@@ -1943,44 +2082,111 @@ class RbitApp(App[None]):
             self.notify(f"Saved: {self.executor.rel_display(target)}", timeout=2.0)
         self._sync_ui()
 
-    async def _cmd_fix(self, command: str) -> None:
-        """/fix <cmd> — run a command; when it fails, feed the output to the agent."""
+    async def _cmd_fix(self, command: str) -> str | None:
+        """/fix <cmd> — run a command; when it fails, returns a prompt for the agent."""
         command = command.strip()
         if not command:
             self.notify("Usage: /fix <command>", severity="warning")
-            return
+            return None
         self.notify(f"Running: {command[:60]}", timeout=2.0)
         res = await self.executor.execute("bash", {"command": command, "timeout": 300})
         tail = "\n".join(res.output.splitlines()[-30:]) or "(no output)"
         if res.ok:
             self._post_notice(f"✓ Command succeeded — nothing to fix\n\n{tail}")
-            return
+            return None
         self._post_notice(f"✗ Command failed — отправляю вывод агенту\n\n{tail}")
-        self._submit_prompt(
-            f"[fix] Команда `{command}` упала с выводом:\n\n{tail}\n\nНайди причину и исправь."
-        )
+        return f"[fix] Команда `{command}` упала с выводом:\n\n{tail}\n\nНайди причину и исправь."
 
     async def _cmd_macro(self, name: str) -> None:
         import json as _json
 
-        path = self.workspace / ".rbit" / "macros" / f"{name.strip()}.json"
-        if not name.strip() or not path.exists():
+        name = name.strip()
+        if not name or any(ch in name for ch in "/\\") or ".." in name or "\x00" in name:
+            self.notify(f"Bad macro name: {name!r}", severity="warning")
+            return
+        path = self.workspace / ".rbit" / "macros" / f"{name}.json"
+        if not path.exists():
             self.notify(f"Macro not found: {path}", severity="warning")
             return
         try:
             steps = _json.loads(path.read_text(encoding="utf-8"))
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             self.notify(f"Bad macro JSON: {exc}", severity="error")
             return
-        for step in steps if isinstance(steps, list) else []:
+        if not isinstance(steps, list):
+            self.notify("Bad macro: expected a JSON list of steps.", severity="error")
+            return
+        for number, step in enumerate(steps, start=1):
+            if not isinstance(step, dict):
+                self._post_notice(f"▸ step {number}: skipped (expected an object, got {type(step).__name__})")
+                continue
             tool = str(step.get("tool") or "")
             if not tool:
                 continue
-            res = await self.executor.execute(tool, step.get("args") or {})
+            args = step.get("args")
+            res = await self.executor.execute(tool, args if isinstance(args, dict) else {})
             self._post_notice(f"▸ {tool}: {res.summary}\n\n{res.output[:1200]}")
 
-    def _run_coro(self, coro) -> None:
-        self.run_worker(coro, exclusive=False)
+    def _run_coro(self, coro, label: str = "Background task") -> Any:
+        """Runs a coroutine as a worker that can never take the app down.
+
+        Textual's default `exit_on_error=True` turns any exception in a worker
+        into an app crash; here it becomes an inline notice instead.
+        """
+
+        async def guarded() -> None:
+            try:
+                await coro
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._last_error = str(exc)
+                self._notify_failure(label, exc)
+
+        return self.run_worker(guarded(), exclusive=False, exit_on_error=False)
+
+    def _notify_failure(self, label: str, exc: BaseException) -> None:
+        try:
+            self._post_notice(f"✗ {label} failed: {exc}")
+        except Exception:
+            try:
+                self.notify(f"{label} failed: {exc}", severity="error", timeout=5.0)
+            except Exception:
+                pass
+
+    def _start_busy_job(self, job, status: str) -> bool:
+        """Runs `job()` (an async callable returning an optional follow-up prompt)
+        as a busy job: sets `is_busy`, is cancellable with Esc, and refuses to
+        overlap an agent turn. Returns False when it could not start."""
+        if self.is_busy:
+            self.notify("Agent is busy — press Esc first.", severity="warning")
+            return False
+        self.is_busy = True
+        self.busy_status = status
+        self._sync_ui()
+
+        async def runner() -> None:
+            follow_up: str | None = None
+            try:
+                follow_up = await job()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._last_error = str(exc)
+                self._notify_failure(status, exc)
+            finally:
+                if self._busy_worker is get_current_worker():
+                    self._busy_worker = None
+                self.is_busy = False
+                self.busy_status = ""
+                self._sync_ui()
+            if follow_up:
+                self._submit_prompt(follow_up)
+            else:
+                self._drain_queue()
+
+        self._busy_worker = self.run_worker(runner(), exclusive=False, exit_on_error=False, group="rbit-job")
+        return True
 
     def _os_notify(self, text: str) -> None:
         try:
@@ -2193,8 +2399,24 @@ class RbitApp(App[None]):
             return
         self.call_after_refresh(self._reveal_step)
 
+    def _mark_running_cards_interrupted(self) -> None:
+        """Esc cancels the worker mid-tool: its cards would spin as `running` forever."""
+        try:
+            cards = list(self.query_one("#chat-scroll", ChatScroll).query(ToolCallCard))
+        except NoMatches:
+            return
+        for card in cards:
+            rec = card.record
+            # Background shells (pid set) keep running on purpose and have their own stop control.
+            if rec.status != "running" or rec.pid:
+                continue
+            rec.status = "error"
+            rec.summary = "interrupted"
+            card.update_record(rec)
+
     def _finalize_interrupted(self) -> bool:
         """Persists the partial streamed answer with an `interrupted` marker."""
+        self._mark_running_cards_interrupted()
         card = self._live_card
         self._live_card = None
         if card is None or not card.msg.content.strip():
@@ -2303,16 +2525,19 @@ class RbitApp(App[None]):
             self._cmd_checkpoint(arg)
             return True
         if cmd == "/rewind":
+            if self.is_busy:
+                self.notify("Agent is busy — press Esc first.", severity="warning")
+                return True
             self.action_open_checkpoints()
             return True
         if cmd == "/remember":
             self._cmd_remember(arg)
             return True
         if cmd in ("/edit", "/editor"):
-            self._run_coro(self._cmd_edit(arg))
+            self._run_coro(self._cmd_edit(arg), "/edit")
             return True
         if cmd == "/fix":
-            self._run_coro(self._cmd_fix(arg))
+            self._start_busy_job(lambda: self._cmd_fix(arg), "Running /fix…")
             return True
         if cmd == "/export":
             self._cmd_export(arg)
@@ -2335,7 +2560,7 @@ class RbitApp(App[None]):
             self._cmd_pin()
             return True
         if cmd == "/test":
-            self._run_coro(self._cmd_test(arg))
+            self._start_busy_job(lambda: self._cmd_test(arg), "Running /test…")
             return True
         if cmd in ("/cost", "/usage", "/status", "/permissions", "/agents", "/provider", "/hooks"):
             self._cmd_info(cmd, arg)
@@ -2370,7 +2595,10 @@ class RbitApp(App[None]):
             self._cmd_skill(arg)
             return True
         if cmd == "/macro":
-            self._run_coro(self._cmd_macro(arg))
+            async def _macro_job() -> None:
+                await self._cmd_macro(arg)
+
+            self._start_busy_job(_macro_job, "Running /macro…")
             return True
         if cmd == "/undoturn":
             self._cmd_undo_turn()
@@ -2505,8 +2733,25 @@ class RbitApp(App[None]):
             self._post_notice(msg)
 
     def _cmd_export(self, arg: str) -> None:
-        out_path = (self.workspace / arg) if arg else None
-        saved = self.storage.export_session_markdown(self.session, out_path)
+        arg = arg.strip()
+        out_path: Path | None = None
+        try:
+            if arg:
+                if "\x00" in arg:
+                    raise ValueError("path contains a NUL character")
+                candidate = (self.workspace / arg).resolve()
+                try:
+                    candidate.relative_to(self.workspace)
+                except ValueError:
+                    raise ValueError("export path must stay inside the workspace") from None
+                if candidate.is_dir():
+                    candidate = candidate / f"rbit-session-{self.session.id}.md"
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                out_path = candidate
+            saved = self.storage.export_session_markdown(self.session, out_path)
+        except (OSError, ValueError) as exc:
+            self.notify(f"Export failed: {exc}", severity="error", timeout=5.0)
+            return
         rel = self.executor.rel_display(saved)
         msg = f"✓ Exported session Markdown to `{rel}`"
         if self._is_home_state:
@@ -2585,38 +2830,59 @@ class RbitApp(App[None]):
         if len(self.session.messages) <= 2:
             self.notify("Context is already compact.", timeout=2.0)
             return
+        self._start_compact()
+
+    def _start_compact(self) -> None:
+        # Mark busy synchronously: the worker body only starts on the next loop
+        # iteration, and a prompt submitted in between must be queued.
+        self.is_busy = True
+        self.busy_status = "Compacting context into a handoff summary..."
         self._busy_worker = self._compact_context()
 
     @work(exclusive=True, group="rbit-compact")
     async def _compact_context(self) -> None:
-        count = len(self.session.messages)
-        older = list(self.session.messages[:-2])
+        session = self.session
+        count = len(session.messages)
+        older = list(session.messages[:-2])
+        pinned = [m for m in older if m.pinned]
         self.is_busy = True
         self.busy_status = "Compacting context into a handoff summary..."
         self._sync_ui()
         try:
-            summary_text = await self.engine.summarize_session(
-                older, self.config_data.get("model", "rbit/smart-local")
-            )
-        except Exception as exc:
-            summary_text = self.engine._heuristic_summary(older) + f"\n\n(LLM summary failed: {exc})"
+            try:
+                summary_text = await self.engine.summarize_session(
+                    older, self.config_data.get("model", "rbit/smart-local")
+                )
+            except Exception as exc:
+                summary_text = self.engine._heuristic_summary(older) + f"\n\n(LLM summary failed: {exc})"
 
-        summary_msg = ChatMessage(
-            id=short_id(),
-            role="assistant",
-            content=(
-                f"**[Compacted]** {count - 2} earlier message(s) → handoff summary\n\n{summary_text}"
-            ),
-            agent=self.agent_mode,
-            model=self.config_data.get("model", "rbit/smart-local"),
-            tokens=max(24, count_tokens(summary_text)),
-        )
-        self.session.messages = [summary_msg] + self.session.messages[-2:]
-        self.storage.save_session(self.session)
-        self.is_busy = False
-        self.busy_status = ""
-        self._rebuild_chat_view()
-        self._sync_ui()
+            summary_msg = ChatMessage(
+                id=short_id(),
+                role="assistant",
+                content=(
+                    f"**[Compacted]** {count - 2} earlier message(s) → handoff summary\n\n{summary_text}"
+                ),
+                agent=self.agent_mode,
+                model=self.config_data.get("model", "rbit/smart-local"),
+                tokens=max(24, count_tokens(summary_text)),
+            )
+            # Pinned messages survive compaction.
+            session.messages = [summary_msg, *pinned, *session.messages[-2:]]
+            self.storage.save_session(session)
+            if session is self.session:
+                self._rebuild_chat_view()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._last_error = str(exc)
+            self._notify_failure("Compaction", exc)
+        finally:
+            if self._busy_worker is get_current_worker():
+                self._busy_worker = None
+            self.is_busy = False
+            self.busy_status = ""
+            self._sync_ui()
+            self._drain_queue()
 
     def action_retry_last(self) -> None:
         self._cmd_retry()
@@ -2741,11 +3007,15 @@ class RbitApp(App[None]):
     def _on_input_submitted(self, event: Input.Submitted) -> None:
         popup = self.query_one(AutocompletePopup)
         raw = event.value.strip()
+        # A pending debounced @-completion must not resurrect the popup after submit.
+        self._cancel_file_completion()
+        if popup.display and not raw:
+            popup.display = False  # nothing typed: a stale popup must not insert a file
         if popup.display:
             accepted = popup.accept_highlighted()
             if accepted and accepted[0] == "file":
-                at_match = re.search(r"@([^\s]*)$", event.value)
-                if at_match and at_match.group(1) == accepted[1].replace("\\", "/"):
+                typed = trailing_at_query(event.value)
+                if typed is not None and typed == accepted[1].replace("\\", "/"):
                     popup.display = False  # token already typed in full — submit as is
                 else:
                     # A path is only part of a prompt, so filling it in (and
@@ -2817,11 +3087,24 @@ class RbitApp(App[None]):
             rec.output = res.output
             rec.duration_ms = res.duration_ms
             card.update_record(rec)
+        except asyncio.CancelledError:
+            if rec.status == "running":
+                rec.status = "error"
+                rec.summary = "interrupted"
+                card.update_record(rec)
+            raise
+        except Exception as exc:
+            rec.status = "error"
+            rec.summary = f"failed: {exc}"
+            card.update_record(rec)
         finally:
+            if self._busy_worker is get_current_worker():
+                self._busy_worker = None
             self.is_busy = False
             self.busy_status = ""
             self._sync_ui()
             scroll.pin_to_end()
+            self._drain_queue()
 
     def _submit_prompt(self, raw_text: str) -> None:
         # Phrase-based mode switch: planning words route the turn to Plan mode.
@@ -2846,13 +3129,13 @@ class RbitApp(App[None]):
         if self.is_busy:
             # Prompt queue: let the user type the next task while the agent works;
             # it is dispatched automatically when the current turn finishes.
-            self._queued_prompt = raw_text
+            self._queued_prompts.append(raw_text)
             preview = raw_text.strip().replace("\n", " ")[:40]
             self.notify(f"В очереди — выполнится после текущего хода: {preview}", timeout=3.0)
             self._sync_ui()
             return
 
-        attachments = re.findall(r"@([^\s]+)", raw_text)
+        attachments = parse_at_refs(raw_text)
         valid_attachments = []
         for rel in attachments:
             if rel in VIRTUAL_ATTACHMENTS:
@@ -2862,7 +3145,7 @@ class RbitApp(App[None]):
             try:
                 if self.executor.resolve_path(target).exists():
                     valid_attachments.append(rel)
-            except ValueError:
+            except (OSError, ValueError):
                 continue
 
         if len(self.session.messages) == 0 and self.session.title in ("New Session", "Новая сессия"):
@@ -2889,7 +3172,8 @@ class RbitApp(App[None]):
         # up to re-read an earlier answer.
         scroll.pin_to_end(force=True)
 
-        self._execute_agent_turn(user_msg)
+        # Track the worker so Esc cancels exactly this turn (not a stale one).
+        self._busy_worker = self._execute_agent_turn(user_msg)
 
     @work(exclusive=True, group="rbit-turn")
     async def _execute_agent_turn(self, user_msg: ChatMessage) -> None:
@@ -3012,6 +3296,7 @@ class RbitApp(App[None]):
                     older = list(session.messages[:-2])
                     if not older:
                         raise
+                    pinned_older = [m for m in older if m.pinned]
                     summary_text = await self.engine.summarize_session(older, model_id)
                     summary_msg = ChatMessage(
                         id=short_id(),
@@ -3023,7 +3308,7 @@ class RbitApp(App[None]):
                         model=model_id,
                         tokens=max(24, count_tokens(summary_text)),
                     )
-                    session.messages = [summary_msg] + session.messages[-2:]
+                    session.messages = [summary_msg, *pinned_older, *session.messages[-2:]]
                     self.storage.save_session(session)
                     self._rebuild_chat_view()
             if self._interrupted_turn:
@@ -3072,10 +3357,11 @@ class RbitApp(App[None]):
             self._settle_thinking()
             session.finished = True
             self._schedule_save_session(delay=0.05)
+            if self._busy_worker is get_current_worker():
+                self._busy_worker = None
             self.is_busy = False
             self.busy_status = ""
-            queued = self._queued_prompt
-            self._queued_prompt = None
+            queued = self._queued_prompts.pop(0) if self._queued_prompts else None
             self._sync_ui()
             # The turn is over: whatever the model produced last is the thing the
             # user is waiting to read. Re-attach and pin after the final reflow,

@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -20,7 +22,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-GIT_URL_RE = re.compile(r"^(https?://|git@|ssh://|git://)")
+GIT_URL_RE = re.compile(r"^(https://|git@|ssh://)")
+#: Schemes that are refused outright (unauthenticated / local-file transports).
+_REFUSED_URL_RE = re.compile(r"^(http://|git://|file://|ext::|-)", re.IGNORECASE)
 
 #: Files that make up a skill; anything else in the source is ignored.
 SKILL_FILES = ("SKILL.md", "skill.md")
@@ -53,11 +57,16 @@ def _digest(path: Path) -> str:
 
 
 def _origin_path(target_dir: Path) -> Path:
+    # One file per kind: skills and plugins used to share `.rbit/.origin.json`,
+    # so a same-named skill and plugin overwrote each other's origin.
+    return target_dir / ".origin.json"
+
+
+def _legacy_origin_path(target_dir: Path) -> Path:
     return target_dir.parent / ".origin.json"
 
 
-def read_origins(target_dir: Path) -> dict[str, Any]:
-    path = _origin_path(target_dir)
+def _load_json_dict(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
     try:
@@ -66,6 +75,17 @@ def read_origins(target_dir: Path) -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+def read_origins(target_dir: Path) -> dict[str, Any]:
+    kind = "skill" if target_dir.name == "skills" else "plugin"
+    legacy = {
+        name: meta
+        for name, meta in _load_json_dict(_legacy_origin_path(target_dir)).items()
+        if isinstance(meta, dict) and meta.get("kind") == kind
+    }
+    legacy.update(_load_json_dict(_origin_path(target_dir)))
+    return legacy
 
 
 def write_origin(target_dir: Path, name: str, source: str, kind: str, digest: str = "") -> None:
@@ -86,16 +106,45 @@ def write_origin(target_dir: Path, name: str, source: str, kind: str, digest: st
         pass
 
 
+def _rmtree(path: Path) -> None:
+    """Remove a directory tree; read-only files are made writable; failures are loud."""
+
+    def _onerror(func: Any, target: str, _exc: Any) -> None:
+        try:
+            os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+            func(target)
+        except OSError:
+            pass
+
+    shutil.rmtree(path, onerror=_onerror)
+    if path.exists():
+        raise InstallError(f"could not remove {path}; close programs using it and retry")
+
+
+def _ignore_links_and_git(directory: str, names: list[str]) -> list[str]:
+    """copytree ignore: never copy symlinks (they could point outside the source) or .git."""
+    return [n for n in names if n == ".git" or (Path(directory) / n).is_symlink()]
+
+
+def _name_from_source(source: str) -> str:
+    tail = re.split(r"[/:\\]", source.rstrip("/\\"))[-1]
+    return re.sub(r"\.git$", "", tail)
+
+
 def fetch_source(source: str, workdir: Path, *, timeout: float = 60.0) -> Path:
     """Materialises `source` locally: a git URL is cloned, a path is copied."""
+    if _REFUSED_URL_RE.match(source):
+        raise InstallError("only https:// and ssh git URLs (or a local path) are accepted as a source")
     if GIT_URL_RE.match(source):
         dest = workdir / "source"
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
         try:
             proc = subprocess.run(
-                ["git", "clone", "--depth", "1", source, str(dest)],
+                ["git", "clone", "--depth", "1", "--", source, str(dest)],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=env,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise InstallError(f"git clone failed: {exc}") from exc
@@ -139,6 +188,8 @@ def install_skill(
             raise InstallError(
                 "no SKILL.md found at the source root or one directory below"
             )
+        if entry.is_symlink():
+            raise InstallError("SKILL.md must be a regular file, not a symlink")
         # Name priority: explicit --name, then the directory holding SKILL.md.
         # When SKILL.md sits at the source root, the root directory names it —
         # using the file stem would produce the generic name "SKILL".
@@ -146,6 +197,9 @@ def install_skill(
             skill_name = name.strip()
         elif entry.parent != root:
             skill_name = entry.parent.name
+        elif GIT_URL_RE.match(source):
+            # A clone lands in a generic "source" dir; name the skill after the repo.
+            skill_name = _name_from_source(source) or entry.stem
         else:
             skill_name = root.name or entry.stem
         # A leading dot would let `.` / `..` name the skills dir (or `.rbit`) itself,
@@ -163,7 +217,7 @@ def install_skill(
                     "re-run with force to replace it"
                 )
             replaced = True
-            shutil.rmtree(target_dir, ignore_errors=True)
+            _rmtree(target_dir)
         else:
             replaced = False
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -172,8 +226,12 @@ def install_skill(
         for sibling in entry.parent.iterdir():
             if sibling == entry or sibling == target_dir:
                 continue
+            if sibling.is_symlink():
+                continue
             if sibling.is_dir() and (sibling.name in {"assets", "references", "templates"}):
-                shutil.copytree(sibling, target_dir / sibling.name, dirs_exist_ok=True)
+                shutil.copytree(
+                    sibling, target_dir / sibling.name, dirs_exist_ok=True, ignore=_ignore_links_and_git
+                )
         write_origin(skills_dir, skill_name, source, "skill", _digest(target_dir / "SKILL.md"))
     return InstallResult(skill_name, target_dir, source, "skill", replaced)
 
@@ -237,8 +295,8 @@ def install_plugin(
                 f"plugin `{name}` is already installed; re-run with force to replace it"
             )
         if replaced:
-            shutil.rmtree(target_dir, ignore_errors=True)
-        shutil.copytree(root, target_dir, dirs_exist_ok=True)
+            _rmtree(target_dir)
+        shutil.copytree(root, target_dir, dirs_exist_ok=True, ignore=_ignore_links_and_git)
         write_origin(plugins_dir, name, source, "plugin", "")
     if approve:
         _set_plugin_enabled(workspace, name, True)
@@ -296,7 +354,7 @@ def remove_plugin(workspace: Path, name: str) -> None:
     if not target.is_dir():
         raise InstallError(f"plugin `{name}` is not installed")
     _set_plugin_enabled(workspace, name, False)
-    shutil.rmtree(target, ignore_errors=True)
+    _rmtree(target)
     data = read_origins(target.parent)
     data.pop(name, None)
     try:

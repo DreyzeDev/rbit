@@ -25,11 +25,15 @@ function esc(s) {
 }
 
 function md(text) {
-  let out = esc(text);
-  out = out.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang, code) => `<pre>${code}</pre>`);
+  // Code blocks are parked behind placeholders so inline rules never touch their contents.
+  const blocks = [];
+  let out = esc(text).replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang, code) => {
+    blocks.push(`<pre>${code}</pre>`);
+    return `\u0000${blocks.length - 1}\u0000`;
+  });
   out = out.replace(/`([^`\n]+)`/g, "<code>$1</code>");
   out = out.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
-  return out;
+  return out.replace(/\u0000(\d+)\u0000/g, (_m, index) => blocks[Number(index)]);
 }
 
 function addMsg(role, text) {
@@ -101,6 +105,7 @@ async function refreshSessions() {
 }
 
 async function loadSession(id) {
+  if (busy) return; // never switch sessions under a running turn
   try {
     const res = await fetch(`${BASE}/v1/sessions/${id}`, { headers: AUTH });
     if (!res.ok) throw new Error(String(res.status));
@@ -119,6 +124,7 @@ async function loadSession(id) {
 
 document.getElementById("menu-btn").onclick = () => sessionsEl.classList.toggle("hidden");
 document.getElementById("tab-new").onclick = () => {
+  if (busy) return; // a running turn keeps its session
   sessionId = null;
   setHome();
   renderTabs();
@@ -182,6 +188,9 @@ async function send() {
           if (!streamEl) streamEl = addMsg("assistant", "");
           streamEl.innerHTML = md(ev.text);
           feed.scrollTop = feed.scrollHeight;
+        } else if (ev.type === "session") {
+          sessionId = ev.session_id;
+          renderTabs();
         } else if (ev.type === "message") {
           streamEl?.remove();
           streamEl = null;

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,41 @@ from .models import short_id
 
 def _now() -> float:
     return time.time()
+
+
+LOCK_MAX_AGE = 6 * 3600.0
+
+
+def acquire_lock(lock_path: Path, *, max_age: float = LOCK_MAX_AGE) -> bool:
+    """Create an exclusive lock file holding our PID.
+
+    A lock whose PID is dead, or that is older than `max_age`, is stale and is replaced.
+    """
+    from .service import pid_alive
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                pid = int(lock_path.read_text(encoding="utf-8").strip() or 0)
+                age = time.time() - lock_path.stat().st_mtime
+            except (OSError, ValueError):
+                pid, age = 0, max_age + 1
+            if pid > 0 and pid != os.getpid() and pid_alive(pid) and age < max_age:
+                return False
+            try:
+                lock_path.unlink()
+            except OSError:
+                return False
+            continue
+        try:
+            os.write(fd, str(os.getpid()).encode())
+        finally:
+            os.close(fd)
+        return True
+    return False
 
 
 class Scheduler:
@@ -30,7 +66,9 @@ class Scheduler:
 
     def save(self, entries: list[dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, self.path)  # atomic: readers never see a half-written file
 
     @staticmethod
     def next_run(spec: str, *, after: float | None = None) -> float | None:
@@ -40,10 +78,14 @@ class Scheduler:
         match = re.fullmatch(r"every\s+(\d+)\s*([smhd])", value)
         if match:
             amount = int(match.group(1))
+            if amount < 1:
+                return None
             unit = {"s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
             return base + amount * unit
         match = re.fullmatch(r"daily\s+(\d{1,2}):(\d{2})", value)
         if match:
+            if int(match.group(1)) > 23 or int(match.group(2)) > 59:
+                return None
             now = datetime.fromtimestamp(base, tz=timezone.utc).astimezone()
             target = now.replace(hour=int(match.group(1)), minute=int(match.group(2)), second=0, microsecond=0)
             if target.timestamp() <= base:
@@ -91,13 +133,23 @@ class Scheduler:
         minute, hour, day, month, weekday = fields
         current = datetime.fromtimestamp(base, tz=timezone.utc).astimezone().replace(second=0, microsecond=0) + timedelta(minutes=1)
         limit = current + timedelta(days=366)
+        day_restricted = day.strip() != "*"
+        weekday_restricted = weekday.strip() != "*"
         while current < limit:
+            cron_wd = (current.weekday() + 1) % 7  # 0 = Sunday
+            day_ok = Scheduler._cron_field(day, current.day, minimum=1, maximum=31)
+            weekday_ok = Scheduler._cron_field(weekday, cron_wd, minimum=0, maximum=7) or (
+                cron_wd == 0 and Scheduler._cron_field(weekday, 7, minimum=0, maximum=7)
+            )
+            if day_restricted and weekday_restricted:
+                date_ok = day_ok or weekday_ok  # classic cron: either field may match
+            else:
+                date_ok = day_ok and weekday_ok
             if (
-                Scheduler._cron_field(minute, current.minute, minimum=0, maximum=59)
+                date_ok
+                and Scheduler._cron_field(minute, current.minute, minimum=0, maximum=59)
                 and Scheduler._cron_field(hour, current.hour, minimum=0, maximum=23)
-                and Scheduler._cron_field(day, current.day, minimum=1, maximum=31)
                 and Scheduler._cron_field(month, current.month, minimum=1, maximum=12)
-                and Scheduler._cron_field(weekday, (current.weekday() + 1) % 7, minimum=0, maximum=6)
             ):
                 return current.timestamp()
             current += timedelta(minutes=1)
@@ -129,10 +181,12 @@ class Scheduler:
 
     def remove(self, target: str) -> bool:
         entries = self.load()
-        remaining = [entry for entry in entries if entry.get("id") != target and entry.get("name") != target]
-        if len(remaining) == len(entries):
+        index = next((i for i, entry in enumerate(entries) if entry.get("id") == target), None)
+        if index is None:
+            index = next((i for i, entry in enumerate(entries) if entry.get("name") == target), None)
+        if index is None:
             return False
-        self.save(remaining)
+        self.save(entries[:index] + entries[index + 1 :])  # exactly one entry
         return True
 
     def due(self, now: float | None = None) -> list[dict[str, Any]]:

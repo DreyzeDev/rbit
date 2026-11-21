@@ -39,6 +39,8 @@ mobile = ["qrcode>=7.4"]
 keyring = ["keyring>=24.0.0"]
 pdf = ["pypdf>=5.0.0"]
 browser = ["playwright>=1.45.0"]
+crypto = ["cryptography>=42.0.0"]
+all = ["rbit[tokens,mobile,keyring,pdf,browser,crypto]"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.10"]
 
 [tool.setuptools.packages.find]

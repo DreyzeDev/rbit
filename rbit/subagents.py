@@ -100,17 +100,36 @@ def _load_file(path: Path) -> SubagentDef | None:
     return _definition(name, meta, body or text, str(path))
 
 
-def _collect(directory: Path, agents: dict[str, SubagentDef]) -> None:
+def _collect(directory: Path, agents: dict[str, SubagentDef], *, override: bool = False) -> None:
+    """Project directories pass `override=True` so they win over global/built-in ones."""
     if not directory.is_dir():
         return
+    seen: set[str] = set()
     for entry in sorted(directory.iterdir()):
         definition: SubagentDef | None = None
         if entry.is_file() and entry.suffix.lower() == ".md":
             definition = _load_file(entry)
-        elif entry.is_dir() and (entry / "AGENT.md").is_file():
-            definition = _load_file(entry / "AGENT.md")
-        if definition is not None:
-            agents.setdefault(definition.name, definition)
+        elif entry.is_dir():
+            nested = next(
+                (c for c in sorted(entry.iterdir()) if c.is_file() and c.name.lower() == "agent.md"),
+                None,
+            )
+            if nested is not None:
+                definition = _load_file(nested)
+        if definition is None or definition.name.lower() in seen:
+            continue
+        seen.add(definition.name.lower())
+        _store(agents, definition.name, definition, override=override)
+
+
+def _store(agents: dict[str, SubagentDef], name: str, definition: SubagentDef, *, override: bool) -> None:
+    """Agent names match case-insensitively, like skill names."""
+    existing = next((key for key in agents if key.lower() == name.lower()), None)
+    if existing is not None:
+        if not override:
+            return
+        del agents[existing]
+    agents[name] = definition
 
 
 def global_agent_dirs() -> list[Path]:
@@ -126,8 +145,8 @@ def load_subagents(workspace: Path, config: dict[str, Any] | None = None) -> dic
     agents = builtin_subagents()
     for directory in global_agent_dirs():
         _collect(directory, agents)
-    _collect(workspace / ".rbit" / "agents", agents)
-    _collect(workspace / ".rbit" / "agent", agents)
+    _collect(workspace / ".rbit" / "agents", agents, override=True)
+    _collect(workspace / ".rbit" / "agent", agents, override=True)
     entries = (config or {}).get("agents")
     if isinstance(entries, dict):
         for name, entry in entries.items():

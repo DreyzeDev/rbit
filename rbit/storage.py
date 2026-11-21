@@ -4,15 +4,68 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import logging
 import os
+import re
+import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .models import CheckpointMeta, Session, short_id
+
+log = logging.getLogger(__name__)
+
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_DEFAULT_BASE = "https://openrouter.ai/api/v1"
+
+
+def _host_of(url: str) -> str:
+    try:
+        return (urlparse(url if "://" in url else "https://" + url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _host_matches(host: str, suffix: str) -> bool:
+    return host == suffix or host.endswith("." + suffix)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Cross-platform liveness probe (no /proc dependency: macOS has none)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong(0)
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return code.value == 259  # STILL_ACTIVE
+                return True
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 class StorageManager:
     MAX_CHECKPOINTS = 20
+    MAX_AUTO_CHECKPOINTS = 20
 
     def __init__(self, workspace: Path | None = None) -> None:
         self.workspace = (workspace or Path.cwd()).resolve()
@@ -23,6 +76,12 @@ class StorageManager:
         self.memory_path = self.state_dir / "memory.md"
         self.commands_dir = self.state_dir / "commands"
         self._checkpoint_cache: tuple[tuple[int, int], list[CheckpointMeta]] | None = None
+        #: Set when config.json was unreadable; the original is kept in config.json.bak.
+        self.config_warning: str = ""
+        #: Where the effective API key came from: "config" | "env" | "".
+        self.api_key_source: str = ""
+        #: Session files that failed to load during the last list_sessions().
+        self.corrupt_sessions: list[str] = []
 
     def ensure_dirs(self) -> None:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -70,23 +129,28 @@ class StorageManager:
         lock = Path(tempfile.gettempdir()) / f"rbit-lock-{key}.lock"
         self.ensure_dirs()
         pid = os.getpid()
-        if lock.exists():
+        for _ in range(5):
             try:
-                other = int(lock.read_text(encoding="utf-8").strip() or 0)
-                if other and other != pid and Path(f"/proc/{other}").exists() is False and os.name != "nt":
+                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                try:
+                    other = int(lock.read_text(encoding="utf-8").strip() or 0)
+                except (ValueError, OSError):
+                    other = 0
+                if other and other != pid and _pid_alive(other):
                     return False, other
-                if other and other != pid and os.name == "nt":
-                    # Windows: check the process exists via tasklist-free heuristic
-                    import ctypes
-
-                    kernel32 = ctypes.windll.kernel32
-                    handle = kernel32.OpenProcess(0x100000, False, other)  # PROCESS_QUERY_LIMITED_INFORMATION
-                    if handle:
-                        kernel32.CloseHandle(handle)
-                        return False, other
-            except (ValueError, OSError):
-                pass
-        lock.write_text(str(pid), encoding="utf-8")
+                if other == pid:
+                    return True, None
+                try:  # stale or unreadable lock: take it over and retry atomically
+                    lock.unlink()
+                except OSError:
+                    time.sleep(0.05)
+                continue
+            except OSError:
+                return True, None
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(str(pid))
+            return True, None
         return True, None
 
     def release_lock(self) -> None:
@@ -95,7 +159,13 @@ class StorageManager:
             import tempfile
 
             key = hashlib.sha256(str(self.workspace).lower().encode("utf-8", errors="replace")).hexdigest()[:16]
-            Path(tempfile.gettempdir(), f"rbit-lock-{key}.lock").unlink(missing_ok=True)
+            lock = Path(tempfile.gettempdir(), f"rbit-lock-{key}.lock")
+            try:
+                owner = int(lock.read_text(encoding="utf-8").strip() or 0)
+            except (ValueError, OSError):
+                owner = 0
+            if owner == os.getpid():  # never remove another instance's lock
+                lock.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -134,17 +204,18 @@ class StorageManager:
             "theme": "rbit-dark",
             "model": self._detect_default_model(),
             "api_base": raw_base,
-            "api_key": os.environ.get("RBIT_API_KEY")
-            or os.environ.get("OPENROUTER_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
-            or "",
+            "api_key": "",
             "sidebar_visible": True,
             "auto_approve_safe": True,
             "allow_secret_reads": False,
         }
+        self.config_warning = ""
         if self.config_path.exists():
             try:
-                loaded = json.loads(self.config_path.read_text(encoding="utf-8"))
+                # utf-8-sig: a BOM (Notepad, PowerShell) must not make the config "empty".
+                loaded = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
+                if not isinstance(loaded, dict):
+                    raise ValueError("config.json must contain a JSON object")
                 if loaded.get("theme") in ("opencode", "opencode-dark"):
                     loaded["theme"] = "rbit-dark"
                 if loaded.get("theme") == "opencode-light":
@@ -152,8 +223,15 @@ class StorageManager:
                 if loaded.get("model") == "opencode/smart-local":
                     loaded["model"] = "rbit/smart-local"
                 default_cfg.update({k: v for k, v in loaded.items() if v is not None})
-            except Exception:
-                pass
+            except Exception as exc:
+                self._backup_corrupt_config(exc)
+        file_key = str(default_cfg.get("api_key") or "").strip()
+        self.api_key_source = "config" if file_key else ""
+        if not file_key:
+            env_key = self._env_api_key_for(str(default_cfg.get("api_base") or ""), raw_base)
+            if env_key:
+                default_cfg["api_key"] = env_key
+                self.api_key_source = "env"
 
         profile = (os.environ.get("RBIT_PROFILE") or "").strip()
         if profile:
@@ -163,6 +241,56 @@ class StorageManager:
                     {k: v for k, v in profiles[profile].items() if v is not None}
                 )
         return default_cfg
+
+    def _backup_corrupt_config(self, exc: Exception) -> None:
+        """Keeps an unreadable config.json as config.json.bak instead of overwriting it."""
+        bak = self.config_path.with_name(self.config_path.name + ".bak")
+        try:
+            if bak.exists():
+                bak = self.config_path.with_name(f"{self.config_path.name}.{int(time.time())}.bak")
+            bak.write_bytes(self.config_path.read_bytes())
+            self.config_warning = f"config.json is unreadable ({exc}); original kept as {bak.name}, using defaults."
+        except OSError:
+            self.config_warning = f"config.json is unreadable ({exc}); using defaults."
+        log.warning(self.config_warning)
+
+    @staticmethod
+    def _env_api_key_for(api_base: str, env_base: str) -> str:
+        """Returns the env API key that is allowed to be sent to `api_base`.
+
+        A key is only used for the host it belongs to: OPENAI_API_KEY never goes to
+        openrouter.ai, and no env key follows a project config to a foreign host.
+        """
+        host = _host_of(api_base)
+        env_host = _host_of(env_base)
+        explicit_base = bool(os.environ.get("RBIT_API_BASE") or os.environ.get("OPENAI_BASE_URL"))
+        same_as_env_base = bool(host) and host == env_host
+        candidates = (
+            ("RBIT_API_KEY", same_as_env_base),
+            ("OPENROUTER_API_KEY", _host_matches(host, "openrouter.ai")),
+            ("OPENAI_API_KEY", _host_matches(host, "openai.com") or (explicit_base and same_as_env_base)),
+        )
+        for name, allowed in candidates:
+            value = (os.environ.get(name) or "").strip()
+            if value and allowed:
+                return value
+        return ""
+
+    @classmethod
+    def env_key_allowed(cls, key: str, api_base: str) -> bool:
+        """False when `key` is an environment key that must not go to `api_base`."""
+        key = (key or "").strip()
+        env_keys = {
+            (os.environ.get(n) or "").strip()
+            for n in ("RBIT_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY")
+        }
+        env_keys.discard("")
+        if key not in env_keys:
+            return True
+        env_base = (
+            os.environ.get("RBIT_API_BASE") or os.environ.get("OPENAI_BASE_URL") or _DEFAULT_BASE
+        ).rstrip("/")
+        return cls._env_api_key_for(api_base, env_base) == key
 
     def _detect_default_model(self) -> str:
         if (
@@ -176,19 +304,61 @@ class StorageManager:
     def _atomic_write_json(self, path: Path, payload: str) -> None:
         """Writes via a temp file + os.replace: a crash mid-save never truncates
         the target into unreadable JSON (which list_sessions silently skips)."""
+        import tempfile
+
         self.ensure_dirs()
-        tmp = path.with_name(f".{path.name}.tmp")
-        tmp.write_text(payload, encoding="utf-8")
-        os.replace(tmp, path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Unique temp name in the same folder (same filesystem => atomic replace);
+        # mkstemp creation gives 0600 on POSIX, which suits config/secrets.
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+                fh.write(payload)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            last_exc: OSError | None = None
+            for attempt in range(8):
+                try:
+                    os.replace(tmp_name, path)
+                    last_exc = None
+                    break
+                except PermissionError as exc:  # Windows: target briefly locked by AV/readers
+                    last_exc = exc
+                    time.sleep(0.05 * (attempt + 1))
+            if last_exc is not None:
+                raise last_exc
+        finally:
+            try:
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+            except OSError:
+                pass
 
     def save_config(self, cfg: dict[str, Any]) -> None:
+        cfg = dict(cfg)
+        # A key that came from the environment is never persisted to disk.
+        key = str(cfg.get("api_key") or "").strip()
+        if key and key != "keyring":
+            env_keys = {
+                (os.environ.get(n) or "").strip()
+                for n in ("RBIT_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY")
+            }
+            env_keys.discard("")
+            if key in env_keys and self.api_key_source != "config":
+                cfg["api_key"] = self._existing_file_key()
         profile = (os.environ.get("RBIT_PROFILE") or "").strip()
         if profile:
             raw: dict[str, Any] = {}
             if self.config_path.exists():
                 try:
-                    raw = json.loads(self.config_path.read_text(encoding="utf-8"))
-                except Exception:
+                    raw = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
+                    if not isinstance(raw, dict):
+                        raise ValueError("not an object")
+                except Exception as exc:
+                    self._backup_corrupt_config(exc)
                     raw = {}
             profiles = raw.get("profiles")
             if not isinstance(profiles, dict):
@@ -209,6 +379,13 @@ class StorageManager:
                 os.chmod(self.config_path, 0o600)
             except OSError:
                 pass
+
+    def _existing_file_key(self) -> str:
+        try:
+            data = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
+            return str(data.get("api_key") or "") if isinstance(data, dict) else ""
+        except Exception:
+            return ""
 
     # --- Sessions ---
     def _use_sqlite(self) -> bool:
@@ -260,8 +437,22 @@ class StorageManager:
         key = base64.urlsafe_b64encode(hashlib.sha256(passphrase.encode()).digest())
         return Fernet(key).decrypt(stored.split(":", 2)[2].encode("ascii")).decode("utf-8")
 
+    @staticmethod
+    def _redacted_session_dict(session: Session) -> dict[str, Any]:
+        """Session payload for disk: secrets printed by tools (env/.env dumps) are masked."""
+        from .tools import redact_secrets
+
+        data = session.to_dict()
+        for message in data.get("messages", []):
+            for call in message.get("tool_calls") or []:
+                for field in ("output", "diff", "summary"):
+                    value = call.get(field)
+                    if isinstance(value, str) and value:
+                        call[field] = redact_secrets(value)
+        return data
+
     def save_session(self, session: Session) -> None:
-        payload = json.dumps(session.to_dict(), ensure_ascii=False, indent=2)
+        payload = json.dumps(self._redacted_session_dict(session), ensure_ascii=False, indent=2)
         if self._use_sqlite():
             import time as _time
 
@@ -282,6 +473,7 @@ class StorageManager:
         return json.loads(self._decrypt(raw))
 
     def list_sessions(self, include_archived: bool = False) -> list[Session]:
+        self.corrupt_sessions = []
         if not self.sessions_dir.exists():
             return []
         sessions: list[Session] = []
@@ -293,9 +485,11 @@ class StorageManager:
             try:
                 if self._use_sqlite():
                     break
-                data = self._decode_session_file(p.read_text(encoding="utf-8"))
+                data = self._decode_session_file(p.read_text(encoding="utf-8-sig"))
                 sessions.append(Session.from_dict(data))
-            except Exception:
+            except Exception as exc:
+                self.corrupt_sessions.append(p.name)
+                log.warning("skipping unreadable session %s: %s", p.name, exc)
                 continue
         if self._use_sqlite():
             conn = self._sqlite_conn()
@@ -305,7 +499,9 @@ class StorageManager:
                 ):
                     try:
                         sessions.append(Session.from_dict(self._decode_session_file(raw)))
-                    except Exception:
+                    except Exception as exc:
+                        self.corrupt_sessions.append("sessions.db")
+                        log.warning("skipping unreadable sqlite session: %s", exc)
                         continue
             finally:
                 conn.close()
@@ -314,18 +510,40 @@ class StorageManager:
         return sessions
 
     def find_session(self, id_or_prefix: str) -> Session | None:
-        q = id_or_prefix.strip().lower()
-        for s in self.list_sessions(include_archived=True):
-            if s.id.lower() == q or s.id.lower().startswith(q):
+        q = (id_or_prefix or "").strip().lower()
+        if not q:
+            return None
+        sessions = self.list_sessions(include_archived=True)
+        for s in sessions:
+            if s.id.lower() == q:
                 return s
-        return None
+        matches = [s for s in sessions if s.id.lower().startswith(q)]
+        # An ambiguous prefix must not silently pick "the first" session.
+        return matches[0] if len(matches) == 1 else None
 
     def delete_session(self, session_id: str) -> bool:
-        path = self.sessions_dir / f"{session_id}.json"
+        sid = (session_id or "").strip()
+        if not _SAFE_ID_RE.match(sid):
+            return False
+        deleted = False
+        path = self.sessions_dir / f"{sid}.json"
+        try:
+            if path.resolve().parent != self.sessions_dir.resolve():
+                return False
+        except OSError:
+            return False
         if path.exists():
             path.unlink()
-            return True
-        return False
+            deleted = True
+        if self._sqlite_path().exists():
+            conn = self._sqlite_conn()
+            try:
+                with conn:
+                    cur = conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+                    deleted = deleted or cur.rowcount > 0
+            finally:
+                conn.close()
+        return deleted
 
     # --- Project Memory (.rbit/memory.md + RBIT.md) ---
     def load_project_memory(self) -> str:
@@ -346,10 +564,54 @@ class StorageManager:
     def append_memory_rule(self, rule: str) -> Path:
         self.ensure_dirs()
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        existing = self.memory_path.read_text(encoding="utf-8") if self.memory_path.exists() else "# rbit Project Memory\n\n"
-        updated = existing.rstrip() + f"\n- [{stamp}] {rule.strip()}\n"
-        self.memory_path.write_text(updated, encoding="utf-8")
+        line = f"- [{stamp}] {rule.strip()}\n"
+        # Append-only under a cross-process lock: no read-modify-write, no lost entries.
+        with self._file_lock(self.memory_path):
+            data = self.memory_path.read_bytes() if self.memory_path.exists() else b""
+            if not data.strip():
+                prefix = "# rbit Project Memory\n\n"
+            else:
+                prefix = "" if data.endswith(b"\n") else "\n"
+            with self.memory_path.open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(prefix + line)
         return self.memory_path
+
+    @staticmethod
+    def _file_lock(target: Path):
+        """Tiny advisory lock (`<file>.lock`, O_EXCL) with retry and stale-lock recovery."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _cm():
+            lock = target.with_name(target.name + ".lock")
+            deadline = time.monotonic() + 10.0
+            fd = -1
+            while fd < 0:
+                try:
+                    fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                except FileExistsError:
+                    try:
+                        if time.time() - lock.stat().st_mtime > 30:
+                            lock.unlink()
+                            continue
+                    except OSError:
+                        pass
+                    if time.monotonic() > deadline:
+                        break  # give up waiting: better a racy append than a hung UI
+                    time.sleep(0.005)
+                except OSError:
+                    break
+            try:
+                yield
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+                    try:
+                        lock.unlink()
+                    except OSError:
+                        pass
+
+        return _cm()
 
     # --- Custom Project Slash Commands (.rbit/commands/*.md) ---
     def load_custom_commands(self) -> dict[str, dict[str, str]]:
@@ -386,7 +648,8 @@ class StorageManager:
     # --- Workspace Checkpoints (Git-independent time travel) ---
     def save_checkpoint(self, label: str, files_map: dict[str, str]) -> CheckpointMeta:
         self.ensure_dirs()
-        cid = short_id()
+        is_auto = str(label or "").strip().lower().startswith("auto")
+        cid = ("auto-" if is_auto else "") + short_id()
         created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         payload = {
             "id": cid,
@@ -394,9 +657,9 @@ class StorageManager:
             "created_at": created,
             "files": files_map,
         }
-        (self.checkpoints_dir / f"{cid}.json").write_text(
+        self._atomic_write_json(
+            self.checkpoints_dir / f"{cid}.json",
             json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
         )
         self.prune_checkpoints(self.MAX_CHECKPOINTS)
         self.invalidate_checkpoint_cache()
@@ -416,8 +679,13 @@ class StorageManager:
             key=lambda item: item.stat().st_mtime,
             reverse=True,
         )
+        # Manual and automatic checkpoints rotate independently, so a burst of
+        # auto-checkpoints can never evict the ones the user made on purpose.
+        manual = [p for p in files if not p.name.startswith("auto-")]
+        auto = [p for p in files if p.name.startswith("auto-")]
+        doomed = manual[max(1, keep):] + auto[max(1, self.MAX_AUTO_CHECKPOINTS):]
         removed = 0
-        for path in files[max(1, keep):]:
+        for path in doomed:
             try:
                 path.unlink()
                 removed += 1

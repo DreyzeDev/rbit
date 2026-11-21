@@ -13,6 +13,8 @@ import json
 import logging
 import os
 import shutil
+from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -195,6 +197,56 @@ def build_servers(config: dict[str, Any] | None, workspace: Path) -> list[LSPSer
     return definitions
 
 
+def utf16_units(text: str, index: int) -> int:
+    """UTF-16 code units in text[:index] (LSP positions are UTF-16 based)."""
+    return len(text[: max(0, index)].encode("utf-16-le", "surrogatepass")) // 2
+
+
+def utf16_to_index(text: str, units: int) -> int:
+    """Convert a UTF-16 column to a Python str index."""
+    count = 0
+    for idx, ch in enumerate(text):
+        if count >= units:
+            return idx
+        count += 2 if ord(ch) > 0xFFFF else 1
+    return len(text)
+
+
+def _read_lines(path: Path) -> list[str]:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+
+def _server_column(path: Path, line0: int, units: int) -> int:
+    """1-based character column for a 0-based line and UTF-16 column from a server."""
+    lines = _read_lines(path)
+    if 0 <= line0 < len(lines):
+        return utf16_to_index(lines[line0], units) + 1
+    return units + 1
+
+
+def _client_position(path: Path, line: int, column: int) -> dict[str, int]:
+    """LSP position from 1-based line / character column."""
+    line0 = max(0, line - 1)
+    col0 = max(0, column - 1)
+    lines = _read_lines(path)
+    if line0 < len(lines):
+        col0 = utf16_units(lines[line0], col0)
+    return {"line": line0, "character": col0}
+
+
+def _coerce_id(value: Any) -> Any:
+    """JSON-RPC ids may be ints or strings; normalise numeric strings."""
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    return value
+
+
 def _encode_message(payload: dict[str, Any]) -> bytes:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     return f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
@@ -221,6 +273,9 @@ class LSPClient:
     async def start(self) -> bool:
         if self.process is not None:
             return True
+        if self._failed:
+            # Negative cache: do not respawn a server that already failed.
+            return False
         try:
             self.process = await asyncio.create_subprocess_exec(
                 *self.definition.command,
@@ -297,7 +352,14 @@ class LSPClient:
                     if blank in (b"\r\n", b"\n", b""):
                         break
                 body = await stdout.readexactly(length)
-                await self._handle_message(json.loads(body.decode("utf-8")))
+                try:
+                    message = json.loads(body.decode("utf-8"))
+                    if isinstance(message, dict):
+                        await self._handle_message(message)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - one bad message must not kill the reader
+                    logger.debug("lsp %s: bad message ignored", self.definition.name, exc_info=True)
         except (asyncio.CancelledError, asyncio.IncompleteReadError, OSError, ValueError):
             return
         finally:
@@ -308,7 +370,7 @@ class LSPClient:
 
     async def _handle_message(self, message: dict[str, Any]) -> None:
         if "id" in message and ("result" in message or "error" in message):
-            future = self._pending.pop(int(message["id"]), None)
+            future = self._pending.pop(_coerce_id(message["id"]), None)
             if future is not None and not future.done():
                 if "error" in message:
                     future.set_exception(RuntimeError(str(message["error"])))
@@ -316,7 +378,7 @@ class LSPClient:
                     future.set_result(message.get("result"))
             return
         if "id" in message and "method" in message:
-            await self._handle_server_request(int(message["id"]), str(message["method"]), message.get("params"))
+            await self._handle_server_request(message["id"], str(message["method"]), message.get("params"))
             return
         method = message.get("method")
         params = message.get("params") or {}
@@ -327,7 +389,7 @@ class LSPClient:
         elif method in ("window/logMessage", "window/showMessage"):
             logger.debug("lsp %s %s: %s", self.definition.name, method, params.get("message"))
 
-    async def _handle_server_request(self, request_id: int, method: str, params: Any) -> None:
+    async def _handle_server_request(self, request_id: Any, method: str, params: Any) -> None:
         if method == "workspace/configuration":
             items = params.get("items") if isinstance(params, dict) else None
             result: Any = [None for _ in items] if isinstance(items, list) else []
@@ -347,11 +409,12 @@ class LSPClient:
             if not isinstance(item, dict):
                 continue
             start = item.get("range", {}).get("start", {})
+            line0 = int(start.get("line", 0))
             parsed.append(
                 LSPDiagnostic(
                     path=path,
-                    line=int(start.get("line", 0)) + 1,
-                    column=int(start.get("character", 0)) + 1,
+                    line=line0 + 1,
+                    column=_server_column(path, line0, int(start.get("character", 0))),
                     severity=SEVERITY_NAMES.get(int(item.get("severity", 1)), "error"),
                     message=str(item.get("message") or "").strip(),
                     source=str(item.get("source") or self.definition.name),
@@ -360,12 +423,13 @@ class LSPClient:
         return parsed
 
     def _uri_to_path(self, uri: str) -> Path:
-        if uri.startswith("file://"):
-            raw = uri[7:]
-            if os.name == "nt" and raw.startswith("/"):
-                raw = raw[1:]
+        if uri.startswith("file:"):
+            parsed = urlparse(uri)
+            raw = url2pathname(parsed.path)
+            if parsed.netloc and parsed.netloc != "localhost":
+                raw = f"//{unquote(parsed.netloc)}{unquote(parsed.path)}" if os.name == "nt" else raw
             return Path(raw).resolve()
-        return Path(uri)
+        return Path(unquote(uri))
 
     async def _send(self, payload: dict[str, Any]) -> None:
         if self.process is None or self.process.stdin is None:
@@ -450,12 +514,13 @@ class LSPClient:
                 continue
             range_info = item.get("range") or item.get("location", {}).get("range") or {}
             start = range_info.get("start", {}) if isinstance(range_info, dict) else {}
+            line0 = int(start.get("line", 0))
             symbols.append(
                 {
                     "name": str(item.get("name") or ""),
                     "kind": int(item.get("kind") or 0),
-                    "line": int(start.get("line", 0)) + 1,
-                    "column": int(start.get("character", 0)) + 1,
+                    "line": line0 + 1,
+                    "column": _server_column(path, line0, int(start.get("character", 0))),
                 }
             )
         return symbols
@@ -468,7 +533,7 @@ class LSPClient:
         uri = path.resolve().as_uri()
         params = {
             "textDocument": {"uri": uri},
-            "position": {"line": max(0, line - 1), "character": max(0, column - 1)},
+            "position": _client_position(path, line, column),
             "newName": new_name,
         }
         try:
@@ -567,9 +632,9 @@ class LSPClient:
                 if start_line < 0 or end_line >= len(lines):
                     continue
                 start_text = lines[start_line]
-                start_column = min(int(range_info.get("start_column", 0)), len(start_text))
+                start_column = utf16_to_index(start_text, int(range_info.get("start_column", 0)))
                 end_text = lines[end_line]
-                end_column = min(int(range_info.get("end_column", 0)), len(end_text))
+                end_column = utf16_to_index(end_text, int(range_info.get("end_column", 0)))
                 prefix = start_text[:start_column]
                 suffix = end_text[end_column:]
                 lines[start_line : end_line + 1] = [prefix + new_text + suffix]
@@ -588,7 +653,7 @@ class LSPClient:
             result = await asyncio.wait_for(
                 self._request(
                     "textDocument/hover",
-                    {"textDocument": {"uri": uri}, "position": {"line": max(0, line - 1), "character": max(0, column - 1)}},
+                    {"textDocument": {"uri": uri}, "position": _client_position(path, line, column)},
                 ),
                 5.0,
             )
@@ -609,7 +674,7 @@ class LSPClient:
         uri = path.resolve().as_uri()
         params = {
             "textDocument": {"uri": uri},
-            "position": {"line": max(0, line - 1), "character": max(0, column - 1)},
+            "position": _client_position(path, line, column),
         }
         if method == "textDocument/references":
             params["context"] = {"includeDeclaration": True}
@@ -627,11 +692,13 @@ class LSPClient:
             if not target or not isinstance(range_info, dict):
                 continue
             position = range_info.get("start") or {}
+            target_path = self._uri_to_path(str(target))
+            line0 = int(position.get("line", 0))
             locations.append(
                 {
-                    "path": str(self._uri_to_path(str(target))),
-                    "line": int(position.get("line", 0)) + 1,
-                    "column": int(position.get("character", 0)) + 1,
+                    "path": str(target_path),
+                    "line": line0 + 1,
+                    "column": _server_column(target_path, line0, int(position.get("character", 0))),
                 }
             )
         return locations

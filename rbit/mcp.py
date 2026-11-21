@@ -29,11 +29,29 @@ from typing import Any
 
 import httpx
 
+from . import __version__
+
 logger = logging.getLogger("rbit.mcp")
 
 PROTOCOL_VERSION = "2024-11-05"
 MAX_TOOL_OUTPUT = 80_000
 MAX_STDERR_TAIL = 40
+STREAM_LIMIT = 64 * 1024 * 1024  # a single JSON-RPC line may be large (tool results)
+
+# Environment variables safe to hand to MCP servers.  Secrets such as
+# RBIT_* / *_API_KEY / tokens are NOT inherited; pass them via `environment`.
+_ENV_ALLOWLIST = {
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "HOME", "USERPROFILE",
+    "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES",
+    "PROGRAMFILES(X86)", "TEMP", "TMP", "TMPDIR", "USER", "USERNAME", "LOGNAME", "SHELL", "LANG",
+    "LC_ALL", "LC_CTYPE", "TERM", "TZ", "NODE_PATH", "NODE_OPTIONS", "NPM_CONFIG_PREFIX",
+    "VIRTUAL_ENV", "PYTHONPATH", "PYTHONIOENCODING", "PYTHONUTF8", "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME", "XDG_CACHE_HOME", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE",
+}
+
+
+def _base_env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k.upper() in _ENV_ALLOWLIST}
 
 
 class MCPError(RuntimeError):
@@ -106,7 +124,7 @@ class MCPClient:
     def _command_argv(self) -> list[str]:
         raw = self.config.get("command")
         if isinstance(raw, str):
-            raw = shlex.split(raw)
+            raw = shlex.split(raw, posix=(os.name != "nt"))
         if not isinstance(raw, (list, tuple)):
             return []
         argv = [str(part) for part in raw if str(part)]
@@ -142,7 +160,7 @@ class MCPClient:
                 {
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {},
-                    "clientInfo": {"name": "rbit", "version": "1.3.1"},
+                    "clientInfo": {"name": "rbit", "version": __version__},
                 },
                 timeout=self.timeout,
             )
@@ -166,7 +184,7 @@ class MCPClient:
         return "\n".join(self._stderr_tail[-MAX_STDERR_TAIL:])
 
     async def _start_stdio(self) -> None:
-        env = os.environ.copy()
+        env = _base_env()
         extra_env = self.config.get("environment") or self.config.get("env") or {}
         if isinstance(extra_env, dict):
             env.update({str(k): str(v) for k, v in extra_env.items()})
@@ -178,6 +196,7 @@ class MCPClient:
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
             env=env,
+            limit=STREAM_LIMIT,
         )
         self._reader = asyncio.create_task(self._read_loop())
         self._stderr = asyncio.create_task(self._stderr_loop())
@@ -204,17 +223,29 @@ class MCPClient:
         proc = self._proc
         self._proc = None
         if proc is not None and proc.returncode is None:
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except Exception:  # noqa: BLE001 - already closed
+                    pass
             try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
+                await asyncio.wait_for(proc.wait(), timeout=1.0)
             except asyncio.TimeoutError:
                 try:
-                    proc.kill()
+                    proc.terminate()
                 except ProcessLookupError:
                     pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        logger.debug("MCP %s: process did not exit after kill", self.name)
         if self._owned_http and self.http_client is not None:
             try:
                 await self.http_client.aclose()
@@ -280,6 +311,8 @@ class MCPClient:
         proc = self._proc
         if proc is None or proc.stdin is None:
             raise MCPError("server process is not running")
+        if self._reader is None or self._reader.done() or self.error:
+            raise MCPError(self.error or "server connection is closed")
         fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
         try:
@@ -375,7 +408,11 @@ class MCPClient:
             return
         try:
             while True:
-                line = await proc.stdout.readline()
+                try:
+                    line = await proc.stdout.readline()
+                except (ValueError, asyncio.LimitOverrunError) as exc:
+                    self.error = f"server sent a line longer than the {STREAM_LIMIT // (1024 * 1024)} MiB limit: {exc}"
+                    break
                 if not line:
                     break
                 text = line.decode("utf-8", errors="replace").strip()
@@ -389,23 +426,42 @@ class MCPClient:
                 if not isinstance(msg, dict):
                     continue
                 rid = msg.get("id")
-                if rid is not None and rid in self._pending:
+                if "method" in msg:
+                    # A server-initiated request/notification: never treat it as a
+                    # response to one of our pending ids (ids may collide).
+                    if rid is not None:
+                        if msg.get("method") == "ping":
+                            await self._respond_result(rid, {})
+                        else:
+                            # sampling/roots etc.: refuse politely.
+                            await self._respond_error(rid, -32601, "method not supported by rbit")
+                elif rid is not None and rid in self._pending:
                     fut = self._pending.get(rid)
                     if fut is not None and not fut.done():
                         fut.set_result(msg)
-                elif "method" in msg and rid is not None:
-                    # Server-initiated request (sampling/roots): refuse politely.
-                    await self._respond_error(rid, -32601, "method not supported by rbit")
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.debug("MCP %s reader stopped", self.name, exc_info=True)
         finally:
-            err = MCPError("server closed the connection")
+            if not self._closed and not self.error:
+                self.error = "server closed the connection"
+            err = MCPError(self.error or "server closed the connection")
             for fut in list(self._pending.values()):
                 if not fut.done():
                     fut.set_exception(err)
             self._pending.clear()
+
+    async def _respond_result(self, rid: Any, result: dict[str, Any]) -> None:
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            return
+        payload = {"jsonrpc": "2.0", "id": rid, "result": result}
+        try:
+            proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     async def _respond_error(self, rid: Any, code: int, message: str) -> None:
         proc = self._proc
@@ -593,7 +649,16 @@ class MCPManager:
         self._http_client = http_client
         self.clients: dict[str, MCPClient] = {}
         for name, cfg in self.configs.items():
-            client = MCPClient(name, cfg, self.workspace, http_client=http_client)
+            try:
+                client = MCPClient(name, cfg, self.workspace, http_client=http_client)
+            except Exception as exc:  # noqa: BLE001 - one bad server must not break the rest
+                self.status[name] = {
+                    "connected": False,
+                    "tools": 0,
+                    "error": f"invalid configuration: {exc}",
+                    "transport": "invalid",
+                }
+                continue
             self.clients[name] = client
             self.status[name] = {
                 "connected": False,

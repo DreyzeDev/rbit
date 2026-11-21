@@ -7,13 +7,18 @@ import asyncio
 import difflib
 import fnmatch
 import html
+import ipaddress
 import json
+import logging
 import os
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import tempfile
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -28,7 +33,7 @@ except ImportError:  # pragma: no cover - Python < 3.11
 
 import httpx
 
-from .formatters import format_file, formatter_enabled
+from .formatters import build_formatters, format_file, formatter_enabled, formatter_is_custom
 from .guard import guarded as guard_untrusted, risk_level, scan as scan_untrusted
 from .models import CheckpointMeta, FileChangeStat, FileSnapshot, Session, TodoItem, short_id
 from .permissions import (
@@ -39,6 +44,8 @@ from .permissions import (
 )
 from .skills import load_skills, skill_tool_schema
 from .storage import StorageManager
+
+logger = logging.getLogger(__name__)
 
 IGNORED_DIRS = {
     ".git",
@@ -76,7 +83,6 @@ READONLY_BASH_PREFIXES = (
     "Get-ChildItem",
     "Get-Location",
     "Test-Path",
-    "pytest",
 )
 
 READONLY_TOOLS: frozenset[str] = frozenset(
@@ -85,7 +91,13 @@ READONLY_TOOLS: frozenset[str] = frozenset(
 
 MUTATING_TOOLS: frozenset[str] = frozenset({"write", "edit", "multi_edit", "apply_patch"})
 
-_STATEMENT_SPLIT = re.compile(r"(?:;|\|\||&&|\||\r?\n)")
+_STATEMENT_SPLIT = re.compile(r"(?:;|\|\||&&|\||&|\r?\n)")
+
+#: Shell constructs that can smuggle a second command or write a file.
+_SHELL_UNSAFE_CHARS = re.compile(r"[;&|<>`\r\n]|\$\(|\$\{")
+
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*$")
+_WRAPPER_COMMANDS = frozenset({"sudo", "doas", "env", "command", "exec", "nohup", "time", "nice", "builtin", "xargs"})
 
 
 class _SearchResultsParser(HTMLParser):
@@ -139,18 +151,74 @@ def _clean_search_url(url: str) -> str:
     return url
 
 
-def is_readonly_bash_command(command: str) -> bool:
-    """A command is read-only only if EVERY statement starts with a whitelisted
-    prefix and there are no output redirects. `echo x; rm y` and `ls > f` are
-    mutations, even though the first token looks harmless."""
-    if ">" in command:
+def split_shell_statements(command: str) -> list[str]:
+    """Splits a command line into statements on `;`, `&&`, `||`, `|`, `&` and newlines."""
+    return [part.strip() for part in _STATEMENT_SPLIT.split(command) if part.strip()]
+
+
+def normalize_shell_statement(statement: str) -> str:
+    """Collapses whitespace and strips `sudo`/`env`/`command`/`FOO=1` style wrappers.
+
+    The result is what a deny rule or danger check should look at, so that
+    `sudo  rm   -rf x` and `FOO=1 git  push` cannot dodge a `rm *`/`git push *` rule."""
+    tokens = statement.replace("\t", " ").strip().lstrip("({").split()
+    while tokens:
+        head = tokens[0]
+        if _ENV_ASSIGNMENT.match(head):
+            tokens.pop(0)
+            continue
+        if head.lower() in _WRAPPER_COMMANDS:
+            tokens.pop(0)
+            while tokens and (tokens[0].startswith("-") or _ENV_ASSIGNMENT.match(tokens[0])):
+                tokens.pop(0)
+            continue
+        break
+    return " ".join(tokens)
+
+
+def _readonly_statement_ok(tokens: list[str]) -> bool:
+    """True when one statement (already split into tokens) is a whitelisted read-only command."""
+    lowered = [t.lower() for t in tokens]
+    matched = False
+    for prefix in READONLY_BASH_PREFIXES:
+        parts = prefix.lower().split()
+        if lowered[: len(parts)] == parts:
+            matched = True
+            break
+    if not matched:
         return False
-    statements = [s.strip() for s in _STATEMENT_SPLIT.split(command) if s.strip()]
+    if lowered[0] == "git" and len(lowered) > 1:
+        sub = lowered[1]
+        rest = lowered[2:]
+        if any(t.startswith("--output") for t in rest):
+            return False
+        if sub == "branch":
+            list_flags = {"--list", "-l", "--contains", "--merged", "--no-merged"}
+            plain_flags = {"-a", "-r", "-v", "-vv", "--all", "--remote", "--show-current", "--no-color", "--color"}
+            listing = any(t in list_flags for t in rest)
+            for token in rest:
+                if token.startswith("-"):
+                    if token not in list_flags and token not in plain_flags:
+                        return False
+                elif not listing:
+                    return False
+    return True
+
+
+def is_readonly_bash_command(command: str) -> bool:
+    """A command is read-only only if EVERY statement is a whitelisted command
+    (matched on token boundaries) and the line has no redirects, command
+    substitution, backticks or process substitution. `echo x; rm y`, `ls > f`,
+    `ls & rm y` and `ls $(rm y)` are mutations even though the first word looks
+    harmless."""
+    if re.search(r"[<>`]|\$\(|\$\{", command):
+        return False
+    statements = split_shell_statements(command)
     if not statements:
         return False
     for statement in statements:
-        lowered = statement.lower()
-        if not any(lowered.startswith(pref.lower()) for pref in READONLY_BASH_PREFIXES):
+        tokens = statement.split()
+        if not tokens or not _readonly_statement_ok(tokens):
             return False
     return True
 
@@ -168,6 +236,7 @@ def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
+
 def atomic_write_text(path: Path, content: str) -> None:
     """Writes text via a temp file + os.replace so a crash never truncates the target.
 
@@ -175,17 +244,59 @@ def atomic_write_text(path: Path, content: str) -> None:
     turns every `\\n` into `\\r\\n`, so editing an LF file rewrote every line
     (and vice versa), exploding git diffs and breaking follow-up edits."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = content.encode("utf-8")
+    # surrogateescape round-trips the bytes of a non-UTF-8 file that was read the
+    # same way, instead of baking U+FFFD into the user's file.
+    data = content.encode("utf-8", errors="surrogateescape")
     try:
         original = path.read_bytes()
     except OSError:
         original = b""
-    if b"\r\n" not in data and original.count(b"\r\n") * 2 > original.count(b"\n"):
-        data = data.replace(b"\n", b"\r\n")
+    if b"\r\n" not in data and b"\r\n" in original:
+        crlf = original.count(b"\r\n")
+        bare_lf = original.count(b"\n") - crlf
+        if bare_lf == 0:
+            data = data.replace(b"\n", b"\r\n")
+        else:
+            data = _merge_mixed_line_endings(original, data)
+    atomic_write_bytes(path, data, mode_from=path)
+
+
+def _merge_mixed_line_endings(original: bytes, data: bytes) -> bytes:
+    """Keeps each untouched line's own ending in a file that mixes CRLF and LF."""
+    old_lines = original.splitlines(keepends=True)
+    new_lines = data.splitlines(keepends=True)
+    crlf = original.count(b"\r\n")
+    dominant = b"\r\n" if crlf * 2 > original.count(b"\n") else b"\n"
+    if len(old_lines) > 20000 or len(new_lines) > 20000:
+        return data.replace(b"\n", dominant) if dominant == b"\r\n" else data
+    old_plain = [ln.rstrip(b"\r\n") for ln in old_lines]
+    new_plain = [ln.rstrip(b"\r\n") for ln in new_lines]
+    out: list[bytes] = []
+    matcher = difflib.SequenceMatcher(None, old_plain, new_plain, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            out.extend(old_lines[i1:i2])
+            continue
+        for ln in new_lines[j1:j2]:
+            body = ln.rstrip(b"\r\n")
+            ending = ln[len(body):]
+            out.append(body + (dominant if ending else b""))
+    return b"".join(out)
+
+
+def atomic_write_bytes(path: Path, data: bytes, mode_from: Path | None = None) -> None:
+    """Writes raw bytes via a temp file + os.replace, keeping the target's permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
     os.close(fd)
     try:
         Path(tmp_name).write_bytes(data)
+        source = mode_from if mode_from is not None else path
+        if source.exists():
+            try:
+                shutil.copymode(source, tmp_name)
+            except OSError:
+                pass
         os.replace(tmp_name, path)
     finally:
         if os.path.exists(tmp_name):
@@ -203,10 +314,75 @@ DANGEROUS_BASH_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", re.IGNORECASE),
     re.compile(r"\bgit\s+push\b[^\n]*--force\b|\bgit\s+push\b[^\n]*\s-f(?:\s|$)", re.IGNORECASE),
     re.compile(r"\bformat\s+[a-z]:", re.IGNORECASE),
-    re.compile(r"\bdiskpart\b|\bshutdown\b", re.IGNORECASE),
     re.compile(r"\bdel\s+/[sqf]{1,3}\b", re.IGNORECASE),
     re.compile(r"\bRemove-Item\b[^\n]*-Recurse[^\n]*(?:[A-Za-z]:\\|/)", re.IGNORECASE),
 )
+
+#: Commands that are only dangerous when they *are* the command of a statement
+#: (so `grep shutdown log` and `npm run shutdown` stay allowed).
+_POWER_COMMANDS = frozenset(
+    {"shutdown", "shutdown.exe", "reboot", "halt", "poweroff", "diskpart", "diskpart.exe", "stop-computer", "restart-computer"}
+)
+_ROOT_TARGET = re.compile(
+    r"^(?:/\*?|~/?\*?|\$home/?\*?|\$\{home\}/?\*?|\$env:(?:userprofile|homepath|systemdrive)\\?\*?|[a-z]:[\\/]*\*?)$",
+    re.IGNORECASE,
+)
+
+
+def _clean_token(token: str) -> str:
+    return token.strip("\"'")
+
+
+def _is_root_target(token: str) -> bool:
+    return bool(_ROOT_TARGET.match(_clean_token(token)))
+
+
+def _statement_danger(statement: str) -> str:
+    tokens = statement.split()
+    if not tokens:
+        return ""
+    head = _clean_token(tokens[0]).lower()
+    args = tokens[1:]
+    lowered = [a.lower() for a in args]
+    if head in _POWER_COMMANDS:
+        return statement
+    if head in ("rm", "rm.exe", "rmdir", "rd", "del", "erase", "remove-item", "ri"):
+        flags = [a for a in lowered if a.startswith("-") or (a.startswith("/") and len(a) <= 3)]
+        short = "".join(f.lstrip("-/") for f in flags if not f.startswith("--"))
+        recursive = (
+            "--recursive" in lowered
+            or "r" in short
+            or "s" in short and head in ("rmdir", "rd", "del", "erase")
+            or any(f.startswith("-rec") for f in lowered)
+        )
+        if "--no-preserve-root" in lowered:
+            return statement
+        if recursive and any(_is_root_target(a) for a in args if not a.startswith("-")):
+            return statement
+        return ""
+    if head == "git":
+        rest = list(args)
+        while rest and rest[0].startswith("-"):
+            rest = rest[2:] if rest[0] in ("-c", "-C") else rest[1:]
+        if rest and rest[0].lower() == "push":
+            for arg in rest[1:]:
+                low = arg.lower()
+                if low.startswith("--force") or low == "--mirror":
+                    return statement
+                if re.fullmatch(r"-[a-z]+", low) and "f" in low:
+                    return statement
+                if arg.startswith("+") and len(arg) > 1:
+                    return statement
+        return ""
+    if head == "dd":
+        if any(a.lower().startswith("of=/dev/") for a in args):
+            return statement
+        return ""
+    if head.startswith("mkfs"):
+        return statement
+    if head == "format" and args and re.match(r"^[a-z]:", _clean_token(args[0]), re.IGNORECASE):
+        return statement
+    return ""
 
 
 def is_dangerous_command(command: str) -> str:
@@ -215,6 +391,10 @@ def is_dangerous_command(command: str) -> str:
         match = pattern.search(command)
         if match:
             return match.group(0)
+    for statement in split_shell_statements(command):
+        found = _statement_danger(normalize_shell_statement(statement))
+        if found:
+            return found
     return ""
 
 
@@ -276,6 +456,9 @@ SECRET_EXACT_NAMES = frozenset(
         ".envrc",
         "secrets.yaml",
         "secrets.yml",
+        ".git-credentials",
+        ".pgpass",
+        ".htpasswd",
     }
 )
 SECRET_EXTENSIONS = frozenset({".pem", ".key", ".p12", ".pfx", ".keystore", ".jks"})
@@ -309,36 +492,87 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 def is_secret_file(path: Path) -> bool:
     """Returns True if `path` looks like a secret/credential file that should not be read by default."""
-    name = path.name.lower()
+    # `.env::$DATA` (NTFS alternate data stream), `.env.` and `.env ` all open the
+    # real `.env` on Windows, so compare the canonical name.
+    name = path.name.split(":", 1)[0].rstrip(" .").lower()
+    if not name:
+        return False
     if name.endswith(SAFE_TEMPLATE_SUFFIXES):
         return False
     if name in SECRET_EXACT_NAMES or name.startswith(".env."):
         return True
-    if path.suffix.lower() in SECRET_EXTENSIONS:
+    if Path(name).suffix in SECRET_EXTENSIONS:
         return True
-    if name == "config.json" and path.parent.name.lower() == ".rbit":
+    if name.endswith((".tfstate", ".tfstate.backup")) or ".tfstate." in name:
+        return True
+    parent = path.parent.name.split(":", 1)[0].rstrip(" .").lower()
+    if parent == ".aws" and name in ("credentials", "config"):
+        return True
+    if parent == ".docker" and name == "config.json":
+        return True
+    in_rbit = any(part.lower() == ".rbit" for part in path.parts[:-1])
+    if in_rbit and ((name.startswith("config") and name.endswith(".json")) or ".backup-" in name or name.startswith("config.json")):
         return True
     return False
 
 
-def redact_secrets(text: str) -> str:
-    """Redacts API keys, OAuth tokens, PEM private keys, and env secrets from text."""
+_SECRET_KEY_NAMES = r"(?:[A-Z0-9_]*_)?(?:API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|CLIENT_SECRET|PASSWORD)"
+
+#: Source-code-safe variants of the generic `KEY=value` rule: only literal values
+#: are redacted, so `PASSWORD = load_password()` stays intact.
+_CODE_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"(\b" + _SECRET_KEY_NAMES + r"\s*[:=]\s*)(['\"])[^'\"\s]{8,}\2"),
+        r"\1\2[REDACTED]\2",
+    ),
+    (
+        re.compile(
+            r"(\b" + _SECRET_KEY_NAMES + r"=)(?=[A-Za-z0-9_\-./+=]*\d)[A-Za-z0-9_\-./+=]{12,}(?![\w(\[])"
+        ),
+        r"\1[REDACTED]",
+    ),
+)
+
+
+def redact_secrets(text: str, *, code: bool = False) -> str:
+    """Redacts API keys, OAuth tokens, PEM private keys, and env secrets from text.
+
+    With `code=True` (file contents shown to the model) the unquoted `KEY = value`
+    rule is limited to literals, so identifiers and calls in source are not mangled."""
     if not text:
         return text
     out = text
-    for pat, repl in _SECRET_PATTERNS:
+    patterns = _SECRET_PATTERNS[:-1] + _CODE_SECRET_PATTERNS if code else _SECRET_PATTERNS
+    for pat, repl in patterns:
         out = pat.sub(repl, out)
     return out
 
 
+def _strip_blocks(text: str) -> str:
+    """Removes <script>/<style>/... blocks in linear time (a lazy `.*?` regex is quadratic on unclosed tags)."""
+    lowered = text.lower()
+    out: list[str] = []
+    pos = 0
+    opener = re.compile(r"<(script|style|noscript|nav|header|footer|aside)\b[^>]{0,2000}>", re.IGNORECASE)
+    while True:
+        match = opener.search(text, pos)
+        if not match:
+            out.append(text[pos:])
+            break
+        out.append(text[pos : match.start()])
+        close = lowered.find(f"</{match.group(1).lower()}>", match.end())
+        if close == -1:
+            out.append(" ")
+            pos = match.end()
+            continue
+        out.append(" ")
+        pos = close + len(match.group(1)) + 3
+    return "".join(out)
+
+
 def html_to_markdown(raw: str) -> str:
     """Converts HTML to a compact readable Markdown outline (headings, links, lists)."""
-    text = re.sub(
-        r"<(script|style|noscript|nav|header|footer|aside)[^>]*>.*?</\1>",
-        " ",
-        raw,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
+    text = _strip_blocks(raw[:MAX_HTML_CHARS])
 
     def _heading(match: re.Match[str]) -> str:
         level = int(match.group(1))
@@ -346,7 +580,7 @@ def html_to_markdown(raw: str) -> str:
         body = html.unescape(re.sub(r"\s+", " ", body)).strip()
         return f"\n\n{'#' * level} {body}\n\n" if body else "\n\n"
 
-    text = re.sub(r"<h([1-3])[^>]*>(.*?)</h\1>", _heading, text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<h([1-3])[^>]{0,500}>(.{0,2000}?)</h\1>", _heading, text, flags=re.DOTALL | re.IGNORECASE)
 
     def _link(match: re.Match[str]) -> str:
         href = match.group(1).strip()
@@ -355,12 +589,12 @@ def html_to_markdown(raw: str) -> str:
         return f"[{label}]({href})" if label else href
 
     text = re.sub(
-        r"<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
+        r"<a\b[^>]{0,500}href=[\"']([^\"']{1,2000})[\"'][^>]{0,500}>(.{0,2000}?)</a>",
         _link,
         text,
         flags=re.DOTALL | re.IGNORECASE,
     )
-    text = re.sub(r"<li[^>]*>(.*?)</li>", r"\n- \1", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<li[^>]{0,500}>(.{0,2000}?)</li>", r"\n- \1", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"</(p|div|tr|section|article)>", "\n\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
@@ -368,6 +602,322 @@ def html_to_markdown(raw: str) -> str:
     lines = [line.strip() for line in text.splitlines()]
     text = "\n".join(line for line in lines if line)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def read_text_lossless(path: Path) -> tuple[str, bytes]:
+    """Reads a file without ever replacing bytes: invalid UTF-8 survives as surrogates
+    (re-encoded verbatim on write). Line endings are normalised to `\\n` for matching."""
+    raw = path.read_bytes()
+    return raw.decode("utf-8", errors="surrogateescape").replace("\r\n", "\n"), raw
+
+
+def printable(text: str) -> str:
+    """Makes text with escaped surrogates safe to print/serialise."""
+    return text.encode("utf-8", errors="replace").decode("utf-8")
+
+
+_NESTED_QUANTIFIER = re.compile(r"\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*(?:[+*]|\{\d+,\d*\})")
+
+
+def _regex_is_risky(pattern: str) -> bool:
+    """Heuristic ReDoS check: a quantified group that itself contains a quantifier, like `(a+)+`."""
+    return bool(_NESTED_QUANTIFIER.search(pattern)) or len(pattern) > 500
+
+
+MAX_FETCH_BYTES = 2_000_000
+MAX_HTML_CHARS = 300_000
+MAX_REDIRECTS = 5
+MAX_OUTPUT_KEEP = 100_000
+
+_SENSITIVE_ENV_NAMES = frozenset(
+    {
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENROUTER_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GROQ_API_KEY",
+        "MISTRAL_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "XAI_API_KEY",
+        "COHERE_API_KEY",
+        "TOGETHER_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "HF_TOKEN",
+        "HUGGINGFACE_API_KEY",
+    }
+)
+
+
+def sanitized_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for child processes with the agent's own LLM credentials removed."""
+    source = os.environ if base is None else base
+    clean: dict[str, str] = {}
+    for key, value in source.items():
+        upper = key.upper()
+        if upper in _SENSITIVE_ENV_NAMES:
+            continue
+        if upper.startswith("RBIT_") and upper.endswith(("_KEY", "_TOKEN", "_SECRET", "_PASSWORD")):
+            continue
+        clean[key] = value
+    return clean
+
+
+def truncate_middle(text: str, limit: int = 4000) -> str:
+    """Keeps the head and the tail of long output: the end usually holds the error."""
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head
+    omitted = len(text) - limit
+    return f"{text[:head]}\n…[truncated {omitted} chars]…\n{text[-tail:]}"
+
+
+async def _read_capped(stream: Any, keep: int = MAX_OUTPUT_KEEP) -> bytes:
+    """Drains a pipe completely (so the child never blocks) but stores only head + tail."""
+    if stream is None:
+        return b""
+    head = bytearray()
+    tail = bytearray()
+    dropped = 0
+    while True:
+        data = await stream.read(65536)
+        if not data:
+            break
+        if len(head) < keep:
+            take = data[: keep - len(head)]
+            head.extend(take)
+            data = data[len(take):]
+        if data:
+            tail.extend(data)
+            if len(tail) > keep:
+                dropped += len(tail) - keep
+                del tail[: len(tail) - keep]
+    marker = f"\n…[output truncated, {dropped} bytes dropped]…\n".encode("utf-8") if dropped else b""
+    return bytes(head) + marker + bytes(tail)
+
+
+async def _kill_process_tree(proc: Any) -> None:
+    """Kills the whole process tree of `proc` (a plain kill() leaves grandchildren running)."""
+    if proc.returncode is None:
+        if os.name == "nt":
+            try:
+                killer = await asyncio.create_subprocess_exec(
+                    "taskkill",
+                    "/T",
+                    "/F",
+                    "/PID",
+                    str(proc.pid),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(killer.wait(), timeout=10.0)
+            except Exception:
+                pass
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)  # type: ignore[attr-defined]
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True for loopback, link-local, private (RFC1918, fc00::/7), unspecified and other non-public addresses."""
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return not ip.is_global or ip.is_multicast or ip.is_loopback or ip.is_link_local or ip.is_private or ip.is_unspecified
+
+
+def _parse_ip_literal(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    host = host.strip("[]")
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    try:  # decimal / hex / octal IPv4 spellings (2130706433, 0x7f.1) that resolvers accept
+        return ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(host)))
+    except (OSError, ValueError):
+        return None
+
+
+async def check_url_safe(url: str, *, allow_private: bool = False) -> str | None:
+    """SSRF guard: returns an error message when `url` must not be fetched, else None."""
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+    except ValueError:
+        return "invalid URL"
+    if parsed.scheme not in ("http", "https"):
+        return "URL must start with http:// or https://"
+    if not host:
+        return "URL has no host"
+    if allow_private:
+        return None
+    lowered = host.lower().rstrip(".")
+    if lowered == "localhost" or lowered.endswith(".localhost"):
+        return f"blocked: {host} is a loopback host"
+    literal = _parse_ip_literal(host)
+    if literal is not None:
+        if _is_blocked_ip(literal):
+            return f"blocked: {host} is a private, loopback or link-local address"
+        return None
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
+    except (socket.gaierror, UnicodeError, OSError):
+        return None  # unresolvable: the request itself will fail
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+        except ValueError:
+            continue
+        if _is_blocked_ip(ip):
+            return f"blocked: {host} resolves to a private, loopback or link-local address ({ip})"
+    return None
+
+
+@dataclass
+class FetchedPage:
+    status_code: int
+    content: bytes
+    encoding: str = "utf-8"
+    truncated: bool = False
+
+    @property
+    def text(self) -> str:
+        return self.content.decode(self.encoding or "utf-8", errors="replace")
+
+
+class UnsafeURL(ValueError):
+    """Raised when a URL (or one of its redirect hops) points at a non-public host."""
+
+
+def _charset_from(content_type: str) -> str:
+    match = re.search(r"charset=([\w\-]+)", content_type or "", re.IGNORECASE)
+    if match:
+        try:
+            "".encode(match.group(1))
+            return match.group(1)
+        except LookupError:
+            pass
+    return "utf-8"
+
+
+async def safe_http_get(
+    client: Any,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    allow_private: bool = False,
+    max_bytes: int = MAX_FETCH_BYTES,
+    max_redirects: int = MAX_REDIRECTS,
+) -> FetchedPage:
+    """GET with a per-hop SSRF check, manual redirects and a streamed body size cap."""
+    current = url
+    for _hop in range(max_redirects + 1):
+        problem = await check_url_safe(current, allow_private=allow_private)
+        if problem:
+            raise UnsafeURL(problem)
+        if isinstance(client, httpx.AsyncClient):
+            async with client.stream("GET", current, headers=headers, follow_redirects=False) as resp:
+                status = resp.status_code
+                location = resp.headers.get("location", "")
+                encoding = _charset_from(resp.headers.get("content-type", ""))
+                body = bytearray()
+                truncated = False
+                if not (300 <= status < 400 and location):
+                    async for chunk in resp.aiter_bytes():
+                        body.extend(chunk)
+                        if len(body) > max_bytes:
+                            del body[max_bytes:]
+                            truncated = True
+                            break
+        else:  # injected duck-typed client (tests): no streaming API
+            resp = await client.get(current, headers=headers, follow_redirects=False)
+            status = resp.status_code
+            location = (resp.headers.get("location", "") if getattr(resp, "headers", None) else "") or ""
+            encoding = _charset_from(resp.headers.get("content-type", "") if getattr(resp, "headers", None) else "")
+            raw = resp.content if isinstance(getattr(resp, "content", None), (bytes, bytearray)) else str(resp.text).encode("utf-8")
+            truncated = len(raw) > max_bytes
+            body = bytearray(raw[:max_bytes])
+        if 300 <= status < 400 and location:
+            current = str(httpx.URL(current).join(location))
+            continue
+        return FetchedPage(status, bytes(body), encoding, truncated)
+    raise UnsafeURL(f"too many redirects (more than {max_redirects})")
+
+
+def _is_reparse_point(path: str | Path) -> bool:
+    """True for symlinks and Windows junctions/reparse points."""
+    try:
+        if os.path.islink(path):
+            return True
+        return bool(getattr(os.lstat(path), "st_file_attributes", 0) & 0x400)
+    except OSError:
+        return False
+
+
+def is_protected_agent_path(rel_parts: tuple[str, ...]) -> bool:
+    """Paths the agent must never rewrite silently: VCS internals, the audit log and the app config."""
+    parts = tuple(part.lower() for part in rel_parts)
+    if ".git" in parts:
+        return True
+    if parts and parts[0] == ".rbit" and len(parts) >= 2:
+        if parts[1] == "audit" or parts[1].startswith("config") or ".backup-" in parts[-1]:
+            return True
+    return False
+
+
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Translates a glob (`*`, `?`, `[..]`, `**`, `{a,b}`) into an anchored regex on `/` paths."""
+
+    def convert(text: str) -> str:
+        out: list[str] = []
+        i = 0
+        n = len(text)
+        while i < n:
+            c = text[i]
+            if c == "*":
+                if text[i : i + 2] == "**":
+                    i += 2
+                    if text[i : i + 1] == "/":
+                        out.append("(?:.*/)?")
+                        i += 1
+                    else:
+                        out.append(".*")
+                    continue
+                out.append("[^/]*")
+            elif c == "?":
+                out.append("[^/]")
+            elif c == "[":
+                j = text.find("]", i + 2)
+                if j == -1:
+                    out.append(re.escape(c))
+                else:
+                    body = text[i + 1 : j]
+                    if body.startswith("!"):
+                        body = "^" + body[1:]
+                    out.append("[" + body.replace("\\", "\\\\") + "]")
+                    i = j
+            elif c == "{":
+                j = text.find("}", i + 1)
+                if j == -1:
+                    out.append(re.escape(c))
+                else:
+                    options = text[i + 1 : j].split(",")
+                    out.append("(?:" + "|".join(convert(opt) for opt in options) + ")")
+                    i = j
+            else:
+                out.append(re.escape(c))
+            i += 1
+        return "".join(out)
+
+    flags = re.IGNORECASE if os.name == "nt" else 0
+    return re.compile("^" + convert(pattern.replace("\\", "/")) + "$", flags)
 
 
 @dataclass
@@ -473,6 +1023,8 @@ class ToolExecutor:
         self._file_cache: tuple[float, list[str]] | None = None
         self.session_readonly: bool = False
         self.extra_roots: list[Path] = []
+        self._listing_truncated: bool = False
+        self._formatter_audited: set[str] = set()
 
     def _gitignore_matcher(self) -> GitIgnoreMatcher:
         if self._gitignore is None:
@@ -573,14 +1125,46 @@ class ToolExecutor:
             self.saved_permissions.append(entry)
 
     def resolve_permission_effect(self, action: str, resource: str, agent_mode: str = "build") -> str | None:
-        """Returns the last matching effect, or None when no rule covers the request."""
-        matched: str | None = None
-        for rule in self.permission_rule_chain(agent_mode):
-            if not permission_pattern_matches(rule["action"], action):
-                continue
-            if permission_pattern_matches(rule["resource"], resource, action=action):
-                matched = rule["effect"]
-        return matched
+        """Returns the last matching effect, or None when no rule covers the request.
+
+        Shell commands are judged statement by statement (split on `; && || | &`
+        and newlines, wrappers like `sudo`/`env`/`FOO=1` stripped, whitespace
+        collapsed): a `deny` on any statement denies the line, and an `allow`
+        only holds when every statement is allowed."""
+        rules = self.permission_rule_chain(agent_mode)
+
+        def last_match(value: str) -> str | None:
+            matched: str | None = None
+            for rule in rules:
+                if not permission_pattern_matches(rule["action"], action):
+                    continue
+                if permission_pattern_matches(rule["resource"], value, action=action):
+                    matched = rule["effect"]
+            return matched
+
+        if action != "shell":
+            return last_match(resource)
+
+        collapsed = " ".join(resource.split())
+        statements = [normalize_shell_statement(s) for s in split_shell_statements(resource)]
+        statements = [s for s in statements if s]
+        candidates = [resource, collapsed]
+        whole = [last_match(c) for c in candidates]
+        per_statement = [last_match(s) for s in statements]
+        everything = whole + per_statement
+        if "deny" in everything:
+            return "deny"
+        if len(statements) <= 1:
+            # Single statement: the normalized form is as good as the literal one.
+            effects = [e for e in whole + per_statement if e is not None]
+            return effects[-1] if effects else None
+        if "ask" in per_statement:
+            return "ask"
+        if per_statement and all(e == "allow" for e in per_statement):
+            return "allow"
+        if any(e is None for e in per_statement):
+            return None
+        return last_match(collapsed)
 
     def current_permission_mode(self) -> str:
         """Effective permission mode (env override, then config, then default)."""
@@ -704,6 +1288,47 @@ class ToolExecutor:
         except ValueError:
             return target.as_posix(), target
 
+    async def _check_protected_edit(
+        self, target: Path, resource: str, agent_mode: str
+    ) -> ToolResult | None:
+        """Writes to `.git/**`, `.rbit/config*` and `.rbit/audit/**` always need a human yes.
+
+        Even `edits`/`auto` modes do not silence this: those paths can run code
+        (git hooks, config) or erase the audit trail. A rule that names the
+        protected path explicitly (allow or deny) is the user's own decision and
+        is honoured; a blanket `edit *` allow is not."""
+        try:
+            rel_parts = target.relative_to(self.workspace).parts
+        except ValueError:
+            return None
+        if not is_protected_agent_path(rel_parts):
+            return None
+        explicit: str | None = None
+        for rule in self.permission_rule_chain(agent_mode):
+            if not permission_pattern_matches(rule["action"], "edit"):
+                continue
+            mentions = ".git" in rule["resource"].lower() or ".rbit" in rule["resource"].lower()
+            if mentions and permission_pattern_matches(rule["resource"], resource, action="edit"):
+                explicit = rule["effect"]
+        if explicit == "allow":
+            return None
+        reason = "denied by a permission rule" if explicit == "deny" else "protected path"
+        approved = False
+        if explicit != "deny" and self.permission_cb is not None:
+            approved = bool(await self.permission_cb("edit", f"{resource} (protected path)"))
+            reason = "rejected by the user"
+        elif explicit != "deny":
+            reason = "requires approval, but no interactive client is attached"
+        if approved:
+            return None
+        self._audit_permission("edit", resource, False, "protected-path")
+        return ToolResult(
+            False,
+            f"blocked: protected path {resource[:40]}",
+            f"Permission denied: `{resource}` is protected (git internals, rbit config or audit log) - {reason}. "
+            "Add an explicit `edit` rule naming this path in `permissions` to allow it.",
+        )
+
     async def _preflight_permissions(
         self, name: str, args: dict[str, Any], agent_mode: str
     ) -> ToolResult | None:
@@ -746,6 +1371,10 @@ class ToolExecutor:
                     )
                 if reason != "no-rule" and allowed and target.parent not in self.extra_roots:
                     self.extra_roots.append(target.parent)
+            if action == "edit" and target is not None:
+                protected_block = await self._check_protected_edit(target, resource, agent_mode)
+                if protected_block is not None:
+                    return protected_block
             allowed, reason = await self._authorize(action, resource, agent_mode)
             if not allowed:
                 detail = (
@@ -781,11 +1410,30 @@ class ToolExecutor:
         except Exception:
             return []
 
+    MAX_LISTED_FILES = 5000
+
+    def _points_outside(self, path: str | Path) -> bool:
+        """True when `path` is a symlink/junction whose target leaves the workspace."""
+        if not _is_reparse_point(path):
+            return False
+        try:
+            real = Path(os.path.realpath(path))
+        except OSError:
+            return True
+        for root in (self.workspace, *self.extra_roots):
+            try:
+                real.relative_to(root)
+                return False
+            except ValueError:
+                continue
+        return True
+
     def list_workspace_files(self, limit: int = 250) -> list[str]:
         now = time.monotonic()
         if self._file_cache is not None and now - self._file_cache[0] < 2.0:
             return self._file_cache[1][:limit]
         results: list[str] = []
+        truncated = False
         ignore = self._gitignore_matcher()
         for root, dirs, files in os.walk(self.workspace):
             root_rel = self.rel_display(Path(root))
@@ -794,17 +1442,22 @@ class ToolExecutor:
                 for d in dirs
                 if d not in IGNORED_DIRS
                 and not ignore.is_ignored(f"{root_rel}/{d}" if root_rel != "." else d, is_dir=True)
+                and not self._points_outside(os.path.join(root, d))
             ]
             for fname in sorted(files):
                 full = Path(root) / fname
                 rel = self.rel_display(full)
                 if ignore.is_ignored(rel):
                     continue
+                if self._points_outside(full):
+                    continue
                 results.append(rel)
-                if len(results) >= 2000:
+                if len(results) >= self.MAX_LISTED_FILES:
+                    truncated = True
                     break
-            if len(results) >= 2000:
+            if truncated:
                 break
+        self._listing_truncated = truncated
         self._file_cache = (now, results)
         return results[:limit]
 
@@ -899,24 +1552,59 @@ class ToolExecutor:
         noun = "syntax issue" if len(issues) == 1 else "syntax issues"
         diag_block = "\n".join(f"- {item}" for item in issues)
         return (
-            f"{summary} Â· {len(issues)} {noun}",
-            f"{output}\n\nDiagnostics (syntax errors detected â€” fix immediately):\n{diag_block}",
+            f"{summary} · {len(issues)} {noun}",
+            f"{output}\n\nDiagnostics (syntax errors detected — fix immediately):\n{diag_block}",
         )
 
     # --- Undo / Redo ---
-    def undo_last(self) -> str:
+    def _push_snapshot(
+        self,
+        label: str,
+        target: Path,
+        existed: bool,
+        old_text: str,
+        new_text: str,
+        old_bytes: bytes | None = None,
+    ) -> None:
+        """Records an undo step; the original bytes are kept so non-UTF-8 files restore exactly."""
+        snap = FileSnapshot(
+            step_label=label,
+            path=str(target),
+            existed_before=existed,
+            previous_content=old_text,
+            new_content=new_text,
+        )
+        snap.previous_bytes = old_bytes  # type: ignore[attr-defined]
+        self.undo_stack.append(snap)
+        self.redo_stack.clear()
+
+    def undo_last(self, force: bool = False) -> str:
         if not self.undo_stack:
             return "No file changes to undo."
         snap = self.undo_stack.pop()
         target = Path(snap.path)
+        rel = self.rel_display(target)
+        if not force:
+            try:
+                current = read_text_lossless(target)[0] if target.exists() else None
+            except OSError:
+                current = None
+            if current is None or current != snap.new_content.replace("\r\n", "\n"):
+                return (
+                    f"Cannot undo `{rel}` ({snap.step_label}): the file changed after that edit, "
+                    "so reverting would silently overwrite newer content. The file was left as it is."
+                )
         if snap.existed_before:
             target.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(target, snap.previous_content)
+            previous_bytes = getattr(snap, "previous_bytes", None)
+            if previous_bytes is not None:
+                atomic_write_bytes(target, previous_bytes, mode_from=target)
+            else:
+                atomic_write_text(target, snap.previous_content)
         elif target.exists():
             target.unlink()
         self.invalidate_file_cache()
         self.redo_stack.append(snap)
-        rel = self.rel_display(target)
         if self.on_files_updated:
             self.on_files_updated()
         return f"Reverted `{rel}` ({snap.step_label})"
@@ -971,12 +1659,15 @@ class ToolExecutor:
 
     # --- Named Workspace Checkpoints (No Git required) ---
     MANIFEST_KEY = "__manifest__"
+    TRUNCATED_KEY = "__truncated__"
 
     def create_checkpoint(self, label: str = "") -> CheckpointMeta:
         files_map: dict[str, str] = {}
         manifest: list[str] = []
         self.invalidate_file_cache()
-        for rel in self.list_workspace_files(limit=400):
+        listed = self.list_workspace_files(limit=self.MAX_LISTED_FILES)
+        truncated = self._listing_truncated
+        for rel in listed:
             full = self.workspace / rel
             if not self._secret_reads_allowed() and is_secret_file(full):
                 continue
@@ -989,39 +1680,80 @@ class ToolExecutor:
                 # manifest entry keeps restore_checkpoint from ever deleting it.
                 continue
         files_map[self.MANIFEST_KEY] = json.dumps(manifest, ensure_ascii=False)
+        if truncated:
+            # The file listing hit its cap: the manifest is incomplete, so a restore
+            # must never delete "extra" files based on it.
+            files_map[self.TRUNCATED_KEY] = "1"
         return self.storage.save_checkpoint(label or "Manual checkpoint", files_map)
+
+    def _safe_restore_path(self, rel: Any) -> Path | None:
+        """Validates a checkpoint manifest key: no absolute paths, `..`, protected paths or escaping links."""
+        if not isinstance(rel, str) or not rel or "\x00" in rel:
+            return None
+        candidate = Path(rel)
+        if candidate.is_absolute() or candidate.drive or ".." in candidate.parts:
+            return None
+        if is_protected_agent_path(candidate.parts):
+            return None
+        full = self.workspace / candidate
+        try:
+            full.resolve().relative_to(self.workspace)
+        except (ValueError, OSError):
+            return None
+        return full
 
     def restore_checkpoint(self, cid: str) -> str:
         loaded = self.storage.load_checkpoint_files(cid)
         if not loaded:
             return f"Checkpoint `{cid}` not found."
         meta, saved_files = loaded
+        saved_files = dict(saved_files)
         self.invalidate_file_cache()
-        current_files = set(self.list_workspace_files(limit=400))
+
+        # Safety net: restore is destructive, so snapshot the current state first.
+        try:
+            self.create_checkpoint(f"auto: before restore of {meta.label}"[:80])
+        except Exception:
+            logger.warning("could not create the pre-restore safety checkpoint", exc_info=True)
+        self.invalidate_file_cache()
+        current_files = set(self.list_workspace_files(limit=self.MAX_LISTED_FILES))
+        current_truncated = self._listing_truncated
 
         # Files that existed at checkpoint time (text or binary). Older checkpoints
         # have no manifest; then the saved text files are the best approximation.
         manifest = set(saved_files.keys())
         raw_manifest = saved_files.pop(self.MANIFEST_KEY, None)
+        saved_truncated = saved_files.pop(self.TRUNCATED_KEY, None) is not None
+        manifest.discard(self.MANIFEST_KEY)
+        manifest.discard(self.TRUNCATED_KEY)
         if raw_manifest:
             try:
-                manifest = manifest | set(json.loads(raw_manifest))
+                manifest = manifest | {str(item) for item in json.loads(raw_manifest) if isinstance(item, str)}
             except (TypeError, ValueError):
                 pass
 
         # Restore saved text files
         restored = 0
+        skipped = 0
         for rel, content in saved_files.items():
-            full = self.workspace / rel
+            full = self._safe_restore_path(rel)
+            if full is None or not isinstance(content, str):
+                skipped += 1
+                continue
             full.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_text(full, content)
             restored += 1
         # Remove newly created files that didn't exist at checkpoint time. Only
         # files a snapshot could hold (decodable text, within the size limit) are
-        # deletable — restore could never recreate a binary file, so it must stay.
+        # deletable - restore could never recreate a binary file, so it must stay.
         removed = 0
-        for rel in current_files - manifest:
-            full = self.workspace / rel
+        keep_extra = saved_truncated or current_truncated
+        for rel in sorted(current_files - manifest):
+            if keep_extra:
+                break
+            full = self._safe_restore_path(rel)
+            if full is None:
+                continue
             if not self._secret_reads_allowed() and is_secret_file(full):
                 continue
             try:
@@ -1033,8 +1765,16 @@ class ToolExecutor:
             full.unlink()
             removed += 1
 
+        # The old undo/redo history describes a workspace that no longer exists.
+        self.undo_stack.clear()
+        self.redo_stack.clear()
         self.invalidate_file_cache()
-        return f"Rewound workspace to `{meta.label}` ({restored} restored, {removed} removed)."
+        notes = ""
+        if skipped:
+            notes += f", {skipped} unsafe path(s) skipped"
+        if keep_extra:
+            notes += ", file listing was truncated so no files were removed"
+        return f"Rewound workspace to `{meta.label}` ({restored} restored, {removed} removed{notes})."
 
     # --- Direct Bang Shell Execution (!command) ---
     async def execute_bang_shell(self, command: str) -> ToolResult:
@@ -1063,11 +1803,26 @@ class ToolExecutor:
                 output="This session was started with --readonly: no mutating tools are allowed.",
                 duration_ms=int((time.perf_counter() - t0) * 1000),
             )
-        if agent_mode == "plan" and name in ("write", "edit", "multi_edit", "apply_patch"):
+        notebook_mutation = name == "notebook" and str(args.get("action", "read")).lower() != "read"
+        if agent_mode == "plan" and (name in ("write", "edit", "multi_edit", "apply_patch") or notebook_mutation):
             return ToolResult(
                 ok=False,
                 summary=f"{name} blocked in Plan mode",
                 output="Plan mode is read-only. Press Tab to switch to Build mode to modify files.",
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+            )
+        schedule_mutation = name == "schedule" and str(args.get("action") or "list").strip().lower() in (
+            "create",
+            "add",
+            "remove",
+            "delete",
+        )
+        if schedule_mutation and (agent_mode == "plan" or self.session_readonly):
+            why = "read-only session" if self.session_readonly else "Plan mode"
+            return ToolResult(
+                ok=False,
+                summary=f"schedule blocked: {why}",
+                output=f"Creating or removing schedules is not allowed in {why}.",
                 duration_ms=int((time.perf_counter() - t0) * 1000),
             )
 
@@ -1101,7 +1856,7 @@ class ToolExecutor:
             await self.plugins.trigger("before_command", {"tool": name, "args": args, "agent_mode": agent_mode})
 
         try:
-            if name in ("write", "edit", "multi_edit", "apply_patch"):
+            if name in ("write", "edit", "multi_edit", "apply_patch") or notebook_mutation:
                 self._maybe_auto_checkpoint()
 
             if name == "read":
@@ -1133,7 +1888,7 @@ class ToolExecutor:
             elif name == "question":
                 res = await self._tool_question(args)
             elif name == "terminal":
-                res = await self._tool_terminal(args)
+                res = await self._tool_terminal(args, agent_mode=agent_mode)
             elif name == "image_generate":
                 res = await self._tool_image_generate(args)
             elif name == "mcp_resource":
@@ -1186,11 +1941,15 @@ class ToolExecutor:
                     "on_error", {"tool": name, "args": args, "error": str(exc), "agent_mode": agent_mode}
                 )
 
-        res.output = redact_secrets(res.output)
+        res.output = redact_secrets(res.output, code=name in ("read", "read_many_files", "symbols"))
         if res.diff:
             res.diff = redact_secrets(res.diff)
         if res.ok and name in ("write", "edit", "multi_edit", "apply_patch"):
-            formatted = await asyncio.to_thread(self._format_mutated_files, name, args)
+            try:
+                formatted = await self._format_mutated_files(name, args, agent_mode)
+            except Exception as exc:  # noqa: BLE001 - a formatter must never fail the edit itself
+                logger.warning("formatter step failed after %s: %s", name, exc)
+                formatted = ""
             if formatted:
                 res.output = f"{res.output}\n\n{formatted}".strip()
         if self.plugins is not None and name in edit_tools:
@@ -1309,15 +2068,35 @@ class ToolExecutor:
         except PathOutsideWorkspace:
             return []
 
-    def _format_mutated_files(self, name: str, args: dict[str, Any]) -> str:
+    async def _approved_formatters(self, paths: list[Path], config: dict[str, Any], agent_mode: str) -> set[str]:
+        """Formatter names allowed to run on `paths`. Stock built-ins run as before;
+        a formatter whose command comes from the project config is a shell command
+        and goes through the same approval gate as `bash`."""
+        approved: set[str] = set()
+        for definition in build_formatters(config, self.workspace):
+            if not any(path.suffix.lower() in definition.extensions for path in paths):
+                continue
+            if not formatter_is_custom(definition):
+                approved.add(definition.name)
+                continue
+            command_line = " ".join(definition.command)
+            if await self._confirm_shell(command_line, agent_mode) is None:
+                approved.add(definition.name)
+            else:
+                logger.warning("formatter %s from config not approved; skipped", definition.name)
+        return approved
+
+    async def _format_mutated_files(self, name: str, args: dict[str, Any], agent_mode: str = "build") -> str:
         config = self.get_config() if self.get_config is not None else None
         if not formatter_enabled(config):
             return ""
+        paths = [p for p in self._mutation_paths(name, args) if p.is_file()]
+        if not paths:
+            return ""
+        allowed = await self._approved_formatters(paths, config or {}, agent_mode)
         notes: list[str] = []
-        for path in self._mutation_paths(name, args):
-            if not path.is_file():
-                continue
-            result = format_file(path, config, self.workspace)
+        for path in paths:
+            result = await asyncio.to_thread(format_file, path, config, self.workspace, allowed=allowed)
             if not result.ran:
                 continue
             rel = self.rel_display(path)
@@ -1328,10 +2107,18 @@ class ToolExecutor:
                 notes.append(f"{result.name}: {rel} failed (tool output kept unchanged)")
         return "\n".join(notes)
 
+    @staticmethod
+    def _int_arg(value: Any, default: int) -> int:
+        """Tolerant int parsing for model-supplied numbers (None, "abc", floats)."""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
     def _tool_read(self, args: dict[str, Any]) -> ToolResult:
         raw = args.get("filePath") or args.get("path") or "."
-        offset = max(1, int(args.get("offset", 1)))
-        limit = max(1, min(500, int(args.get("limit", 200))))
+        offset = max(1, self._int_arg(args.get("offset"), 1))
+        limit = max(1, min(500, self._int_arg(args.get("limit"), 200)))
         target = self.resolve_path(raw)
         rel = self.rel_display(target)
 
@@ -1360,7 +2147,7 @@ class ToolExecutor:
             size = target.stat().st_size
         except OSError:
             size = 0
-        if size > MAX_READ_BYTES and "offset" not in args and "limit" not in args:
+        if size > MAX_READ_BYTES and args.get("offset") is None and args.get("limit") is None:
             size_kb = size / 1024
             return ToolResult(
                 False,
@@ -1410,22 +2197,13 @@ class ToolExecutor:
         target = self.resolve_path(raw)
         rel = self.rel_display(target)
         existed = target.exists()
-        old_content = target.read_text(encoding="utf-8", errors="replace") if existed else ""
+        old_content, old_bytes = read_text_lossless(target) if existed else ("", None)
 
         target.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(target, content)
         self.invalidate_file_cache()
 
-        self.undo_stack.append(
-            FileSnapshot(
-                step_label=f"write {rel}",
-                path=str(target),
-                existed_before=existed,
-                previous_content=old_content,
-                new_content=content,
-            )
-        )
-        self.redo_stack.clear()
+        self._push_snapshot(f"write {rel}", target, existed, old_content, content, old_bytes)
 
         diff, added, removed = self._compute_diff(old_content, content, rel)
         self._record_file_change(rel, added, removed)
@@ -1435,7 +2213,7 @@ class ToolExecutor:
             rel,
             content,
         )
-        return ToolResult(True, summary, output, diff=diff)
+        return ToolResult(True, summary, output, diff=printable(diff))
 
     @staticmethod
     def _fuzzy_spans(content: str, old: str) -> list[tuple[int, int]]:
@@ -1457,10 +2235,45 @@ class ToolExecutor:
                 spans.append((offsets[start], offsets[start + len(o_lines)]))
         return spans
 
+    @staticmethod
+    def _reindent(new_str: str, old_str: str, matched: str) -> str:
+        """Maps the indentation the model used for `old_str` onto the block actually found in the file."""
+
+        def leading(text: str) -> str:
+            first = text.split("\n", 1)[0]
+            return first[: len(first) - len(first.lstrip(" \t"))]
+
+        file_indent = leading(matched)
+        old_indent = leading(old_str)
+        if file_indent == old_indent:
+            return new_str
+        shifted: list[str] = []
+        for line in new_str.split("\n"):
+            if not line.strip():
+                shifted.append(line)
+            elif line.startswith(old_indent):
+                shifted.append(file_indent + line[len(old_indent):])
+            else:
+                shifted.append(line)
+        return "\n".join(shifted)
+
+    def _apply_fuzzy_spans(self, content: str, spans: list[tuple[int, int]], old_str: str, new_str: str) -> str:
+        """Replaces every span, last first, so earlier offsets stay valid."""
+        result = content
+        for start, end in sorted(spans, reverse=True):
+            matched = result[start:end]
+            addition = self._reindent(new_str, old_str, matched)
+            # The span covers the matched lines including their trailing newline;
+            # keep it, or the replacement glues the next line onto the last one.
+            if matched.endswith("\n") and not addition.endswith("\n"):
+                addition += "\n"
+            result = result[:start] + addition + result[end:]
+        return result
+
     def _tool_edit(self, args: dict[str, Any]) -> ToolResult:
         raw = args.get("filePath") or args.get("path")
-        old_str = str(args.get("oldString", ""))
-        new_str = str(args.get("newString", ""))
+        old_str = str(args.get("oldString", "")).replace("\r\n", "\n")
+        new_str = str(args.get("newString", "")).replace("\r\n", "\n")
         replace_all = bool(args.get("replaceAll", False))
 
         if not raw:
@@ -1478,9 +2291,8 @@ class ToolExecutor:
         if not target.exists():
             return ToolResult(False, f"{rel} not found", f"File does not exist: {rel}")
 
-        old_content = target.read_text(encoding="utf-8", errors="replace")
+        old_content, old_bytes = read_text_lossless(target)
         count = old_content.count(old_str)
-        span: tuple[int, int] | None = None
         notes: list[str] = []
         if count == 0:
             spans = self._fuzzy_spans(old_content, old_str)
@@ -1492,23 +2304,25 @@ class ToolExecutor:
                     f"{len(spans)} ambiguous fuzzy matches",
                     f"Found {len(spans)} whitespace-normalized matches; add context or set replaceAll=true.",
                 )
-            span = spans[0]
-            notes.append("fuzzy match (whitespace normalized) — verify the diff")
+            if not replace_all:
+                spans = spans[:1]
+            else:
+                # Overlapping line windows (a repeated block) cannot all be replaced.
+                kept: list[tuple[int, int]] = []
+                for span in spans:
+                    if not kept or span[0] >= kept[-1][1]:
+                        kept.append(span)
+                spans = kept
+            new_content = self._apply_fuzzy_spans(old_content, spans, old_str, new_str)
+            notes.append(
+                f"fuzzy match (whitespace normalized, {len(spans)} replaced) — verify the diff"
+            )
         elif count > 1 and not replace_all:
             return ToolResult(
                 False,
                 f"{count} ambiguous matches",
                 f"Found {count} matches for oldString; add context or set replaceAll=true.",
             )
-
-        if span is not None:
-            replaced = old_content[span[0] : span[1]]
-            addition = new_str
-            # The span covers the matched lines including their trailing newline;
-            # keep it, or the replacement glues the next line onto the last one.
-            if replaced.endswith("\n") and not addition.endswith("\n"):
-                addition += "\n"
-            new_content = old_content[: span[0]] + addition + old_content[span[1] :]
         else:
             new_content = (
                 old_content.replace(old_str, new_str)
@@ -1518,16 +2332,7 @@ class ToolExecutor:
         atomic_write_text(target, new_content)
         self.invalidate_file_cache()
 
-        self.undo_stack.append(
-            FileSnapshot(
-                step_label=f"edit {rel}",
-                path=str(target),
-                existed_before=True,
-                previous_content=old_content,
-                new_content=new_content,
-            )
-        )
-        self.redo_stack.clear()
+        self._push_snapshot(f"edit {rel}", target, True, old_content, new_content, old_bytes)
 
         diff, added, removed = self._compute_diff(old_content, new_content, rel)
         self._record_file_change(rel, added, removed)
@@ -1538,7 +2343,7 @@ class ToolExecutor:
             rel,
             new_content,
         )
-        return ToolResult(True, summary, output, diff=diff)
+        return ToolResult(True, summary, output, diff=printable(diff))
 
     def _tool_multi_edit(self, args: dict[str, Any]) -> ToolResult:
         raw = args.get("filePath") or args.get("path")
@@ -1550,11 +2355,13 @@ class ToolExecutor:
         if not target.exists():
             return ToolResult(False, f"{rel} not found", f"File does not exist: {rel}")
 
-        original = target.read_text(encoding="utf-8", errors="replace")
+        original, original_bytes = read_text_lossless(target)
         updated = original
         for idx, ed in enumerate(edits, start=1):
-            old_s = str(ed.get("oldString", ""))
-            new_s = str(ed.get("newString", ""))
+            if not isinstance(ed, dict):
+                return ToolResult(False, f"edit #{idx} failed", f"edit #{idx} must be an object.")
+            old_s = str(ed.get("oldString", "")).replace("\r\n", "\n")
+            new_s = str(ed.get("newString", "")).replace("\r\n", "\n")
             rep_all = bool(ed.get("replaceAll", False))
             if not old_s:
                 return ToolResult(False, f"edit #{idx} failed", f"oldString in edit #{idx} must not be empty.")
@@ -1570,16 +2377,7 @@ class ToolExecutor:
 
         atomic_write_text(target, updated)
         self.invalidate_file_cache()
-        self.undo_stack.append(
-            FileSnapshot(
-                step_label=f"multi_edit {rel}",
-                path=str(target),
-                existed_before=True,
-                previous_content=original,
-                new_content=updated,
-            )
-        )
-        self.redo_stack.clear()
+        self._push_snapshot(f"multi_edit {rel}", target, True, original, updated, original_bytes)
 
         diff, added, removed = self._compute_diff(original, updated, rel)
         self._record_file_change(rel, added, removed)
@@ -1589,51 +2387,101 @@ class ToolExecutor:
             rel,
             updated,
         )
-        return ToolResult(True, summary, output, diff=diff)
+        return ToolResult(True, summary, output, diff=printable(diff))
+
+    _HUNK_HEADER = re.compile(r"^@@\s*-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s*@@")
 
     @staticmethod
     def _parse_unified_diff(patch: str) -> tuple[str | None, list[tuple[int, int, list[str]]]]:
-        """Parses a unified diff into (target_path, [(old_start, old_len, hunk_lines)])."""
+        """Parses a unified diff into (target_path, [(old_start, old_len, hunk_lines)]).
+
+        `old_start` is -1 for LLM-style headers without line numbers (`@@ def foo @@`):
+        those hunks are located by their content. Inside a numbered hunk the line
+        counters decide where the hunk ends, so a removed `-- comment` (diff line
+        `--- comment`) or an added `++i` is never mistaken for a file header."""
         target: str | None = None
         hunks: list[tuple[int, int, list[str]]] = []
         cur: list[str] | None = None
         old_start = 0
         old_len = 0
-        for raw in patch.replace("\r\n", "\n").split("\n"):
-            if raw.startswith("--- "):
-                cur = None
+        new_len = 0
+        counted = False
+        old_seen = 0
+        new_seen = 0
+        pending_blank = 0
+        lines = patch.replace("\r\n", "\n").split("\n")
+
+        def finish() -> None:
+            nonlocal cur
+            if cur is not None and not counted:
+                # recompute the true old length for an unnumbered hunk
+                hunks[-1] = (hunks[-1][0], sum(1 for ln in cur if ln[0] in (" ", "-")), cur)
+            cur = None
+
+        skip_next = False
+        for idx, raw in enumerate(lines):
+            if skip_next:
+                skip_next = False
                 continue
-            if raw.startswith("+++ "):
-                cur = None
-                name = raw[4:].strip().split("\t")[0].strip()
+            if raw.startswith("@@"):
+                # A body line starts with ' ', '+', '-' or '\\', so '@@' is always a header.
+                finish()
+                cur = []
+                pending_blank = 0
+                old_seen = new_seen = 0
+                header = ToolExecutor._HUNK_HEADER.match(raw)
+                if header:
+                    counted = True
+                    old_start = int(header.group(1))
+                    old_len = int(header.group(2)) if header.group(2) is not None else 1
+                    new_len = int(header.group(4)) if header.group(4) is not None else 1
+                else:
+                    counted = False
+                    old_start, old_len, new_len = -1, 0, 0
+                hunks.append((old_start, old_len, cur))
+                continue
+            incomplete = cur is not None and counted and (old_seen < old_len or new_seen < new_len)
+            if not incomplete and raw.startswith("--- ") and idx + 1 < len(lines) and lines[idx + 1].startswith("+++ "):
+                finish()
+                name = lines[idx + 1][4:].strip().split("\t")[0].strip()
                 if name.startswith("b/"):
                     name = name[2:]
                 if name and name != "/dev/null":
                     target = name
-                continue
-            if raw.startswith("@@"):
-                cur = []
-                header = raw.split("@@")[1].strip()
-                old_part = header.split()[0] if header else "-0,0"
-                old_start = abs(int(old_part[1:].split(",")[0] or 0))
-                old_len = int(old_part.split(",")[1]) if "," in old_part else 1
-                hunks.append((old_start, old_len, cur))
+                skip_next = True
                 continue
             if cur is None:
                 continue
             if raw.startswith("\\"):
                 continue
             if raw == "":
-                # LLM patches strip the space from empty context lines; treat a
-                # blank line inside an unfinished hunk as an empty context line.
-                old_so_far = sum(1 for ln in cur if ln[0] in (" ", "-"))
-                if old_so_far < old_len:
-                    cur.append(" ")
+                if counted:
+                    # LLM patches strip the space from empty context lines.
+                    if old_seen < old_len:
+                        cur.append(" ")
+                        old_seen += 1
+                        new_seen += 1
+                else:
+                    pending_blank += 1
                 continue
             if raw[0] not in (" ", "+", "-"):
                 continue
+            if pending_blank:
+                cur.extend([" "] * pending_blank)
+                pending_blank = 0
             cur.append(raw)
+            if raw[0] in (" ", "-"):
+                old_seen += 1
+            if raw[0] in (" ", "+"):
+                new_seen += 1
+        finish()
         return target, hunks
+
+    @staticmethod
+    def _lines_match(output: list[str], block: list[str], pos: int) -> bool:
+        if pos < 0 or pos + len(block) > len(output):
+            return False
+        return all(output[pos + i] == line or output[pos + i].rstrip() == line.rstrip() for i, line in enumerate(block))
 
     def _tool_apply_patch(self, args: dict[str, Any]) -> ToolResult:
         patch = str(args.get("patch", "")).strip("\n")
@@ -1651,51 +2499,73 @@ class ToolExecutor:
         target = self.resolve_path(raw)
         rel = self.rel_display(target)
         existed = target.exists()
-        old_content = target.read_text(encoding="utf-8", errors="replace") if existed else ""
+        old_content, old_bytes = read_text_lossless(target) if existed else ("", None)
         lines = old_content.split("\n") if old_content else []
         if lines and lines[-1] == "":
             lines.pop()
 
         output = list(lines)
         cursor = 0
+        delta = 0
         for old_start, old_len, hunk_lines in hunks:
-            start = max(0, old_start - 1) if old_start > 0 else 0
-            if start < cursor:
+            old_block = [ln[1:] for ln in hunk_lines if ln[0] in (" ", "-")]
+            new_block = [ln[1:] for ln in hunk_lines if ln[0] in (" ", "+")]
+            numbered = old_start >= 0
+            if numbered:
+                # `-N,0` means "insert after line N"; otherwise N is the first old line.
+                hint = (old_start if not old_block and old_start > 0 else max(0, old_start - 1)) + delta
+            else:
+                hint = cursor
+            if numbered and hint < cursor:
                 return ToolResult(
                     False,
                     f"overlapping hunk at line {old_start}",
                     f"Hunks are out of order or overlapping near line {old_start}.",
                 )
-            if start > len(output):
-                return ToolResult(
-                    False,
-                    f"hunk out of range at line {old_start}",
-                    f"Hunk targets line {old_start} but the file has {len(output)} lines.",
-                )
-            cursor = start
-            for hline in hunk_lines:
-                op, text = hline[0], hline[1:]
-                if op == "+":
-                    output.insert(cursor, text)
-                    cursor += 1
-                    continue
-                if cursor >= len(output):
+            if not old_block:
+                pos = min(hint, len(output))
+                if numbered and hint > len(output):
                     return ToolResult(
                         False,
-                        f"patch context beyond EOF at line {cursor + 1}",
-                        f"Cannot match `{text}` — file ended at line {cursor}.",
+                        f"hunk out of range at line {old_start}",
+                        f"Hunk targets line {old_start} but the file has {len(output)} lines.",
                     )
-                if output[cursor] != text and output[cursor].rstrip() != text.rstrip():
+            elif self._lines_match(output, old_block, hint):
+                pos = hint
+            else:
+                candidates = [
+                    p for p in range(cursor, len(output) - len(old_block) + 1) if self._lines_match(output, old_block, p)
+                ]
+                if not candidates:
+                    at = min(hint, len(output))
+                    mismatch = 0
+                    while (
+                        mismatch < len(old_block)
+                        and at + mismatch < len(output)
+                        and (
+                            output[at + mismatch] == old_block[mismatch]
+                            or output[at + mismatch].rstrip() == old_block[mismatch].rstrip()
+                        )
+                    ):
+                        mismatch += 1
+                    line_no = at + mismatch + 1
+                    if at + mismatch >= len(output):
+                        return ToolResult(
+                            False,
+                            f"patch context beyond EOF at line {line_no}",
+                            f"Cannot match `{old_block[mismatch] if mismatch < len(old_block) else ''}` "
+                            f"- file ended at line {len(output)}.",
+                        )
                     return ToolResult(
                         False,
-                        f"context mismatch at line {cursor + 1}",
-                        f"Expected `{text}` but found `{output[cursor]}` at line {cursor + 1}. "
+                        f"context mismatch at line {line_no}",
+                        f"Expected `{old_block[mismatch]}` but found `{output[at + mismatch]}` at line {line_no}. "
                         "Re-read the file and regenerate the patch.",
                     )
-                if op == " ":
-                    cursor += 1
-                else:
-                    del output[cursor]
+                pos = min(candidates, key=lambda p: abs(p - hint))
+            output[pos : pos + len(old_block)] = new_block
+            delta += len(new_block) - len(old_block)
+            cursor = pos + len(new_block)
 
         new_content = "\n".join(output)
         if old_content.endswith("\n") or not existed:
@@ -1704,16 +2574,7 @@ class ToolExecutor:
         atomic_write_text(target, new_content)
         self.invalidate_file_cache()
 
-        self.undo_stack.append(
-            FileSnapshot(
-                step_label=f"apply_patch {rel}",
-                path=str(target),
-                existed_before=existed,
-                previous_content=old_content,
-                new_content=new_content,
-            )
-        )
-        self.redo_stack.clear()
+        self._push_snapshot(f"apply_patch {rel}", target, existed, old_content, new_content, old_bytes)
 
         diff, added, removed = self._compute_diff(old_content, new_content, rel)
         self._record_file_change(rel, added, removed)
@@ -1723,24 +2584,70 @@ class ToolExecutor:
             rel,
             new_content,
         )
-        return ToolResult(True, summary, out, diff=diff)
+        return ToolResult(True, summary, out, diff=printable(diff))
+
+    MAX_GLOB_RESULTS = 100
+    MAX_GLOB_SCAN = 50_000
+    MAX_GREP_FILES = 5000
+    MAX_GREP_LINE = 2000
+    GREP_DEADLINE_S = 20.0
 
     def _tool_glob(self, args: dict[str, Any]) -> ToolResult:
-        pattern = str(args.get("pattern", "*"))
-        matches: list[str] = []
+        pattern = str(args.get("pattern", "*")).strip() or "*"
+        normalized = pattern.replace("\\", "/")
+        if (
+            normalized.startswith("/")
+            or re.match(r"^[A-Za-z]:", normalized)
+            or Path(pattern).is_absolute()
+            or ".." in normalized.split("/")
+        ):
+            return ToolResult(
+                False,
+                "invalid glob pattern",
+                "Glob patterns must be relative to the workspace and must not contain `..` "
+                "or absolute paths. Use e.g. `src/**/*.py`.",
+            )
+        regex = _glob_to_regex(normalized)
+        # A bare pattern (`*.py`) matches the file name at any depth, like rglob.
+        by_name = "/" not in normalized
         ignore = self._gitignore_matcher()
-        for p in self.workspace.rglob(pattern if "**" not in pattern else pattern.replace("**/", "")):
-            if any(part in IGNORED_DIRS for part in p.parts):
-                continue
-            if ignore.is_ignored(self.rel_display(p), is_dir=p.is_dir()):
-                continue
-            if p.is_file():
-                matches.append(self.rel_display(p))
-            if len(matches) >= 100:
+        matches: list[str] = []
+        scanned = 0
+        scan_limited = False
+        for root, dirs, files in os.walk(self.workspace):
+            root_rel = self.rel_display(Path(root)).replace("\\", "/")
+            prefix = "" if root_rel == "." else root_rel + "/"
+            # Judge ignored directories by their path relative to the workspace, so a
+            # project that lives inside a directory named `build` is still searched.
+            dirs[:] = sorted(
+                d
+                for d in dirs
+                if d not in IGNORED_DIRS
+                and not ignore.is_ignored(f"{prefix}{d}", is_dir=True)
+                and not self._points_outside(os.path.join(root, d))
+            )
+            for fname in files:
+                scanned += 1
+                if scanned > self.MAX_GLOB_SCAN:
+                    scan_limited = True
+                    break
+                rel = f"{prefix}{fname}"
+                if not (regex.match(fname) if by_name else regex.match(rel)):
+                    continue
+                if ignore.is_ignored(rel):
+                    continue
+                if self._points_outside(os.path.join(root, fname)):
+                    continue
+                matches.append(rel)
+            if scan_limited:
                 break
         matches.sort()
-        out = "\n".join(matches) if matches else "No files matched."
-        return ToolResult(True, f"{len(matches)} matches", out)
+        total = len(matches)
+        shown = matches[: self.MAX_GLOB_RESULTS]
+        out = "\n".join(shown) if shown else "No files matched."
+        if total > len(shown) or scan_limited:
+            out += f"\n[truncated: showing {len(shown)} of {total}{'+' if scan_limited else ''} matches]"
+        return ToolResult(True, f"{len(shown)} matches" + (" (truncated)" if total > len(shown) else ""), out)
 
     def _grep_with_ripgrep(
         self,
@@ -1798,19 +2705,34 @@ class ToolExecutor:
                     continue
                 matched.append(rel)
                 continue
-            path_part = rel.split(":", 1)[0]
-            if is_secret_file(self.workspace / path_part) and not self._secret_reads_allowed():
+            # Context lines look like `.env-12-text`, so the path cannot be cut at the
+            # first colon: test every plausible split point.
+            if not self._secret_reads_allowed() and self._rg_line_is_secret(rel):
                 continue
             lines.append(rel[:200])
         if proc.returncode not in (0, 1):
             # 2+ means rg itself failed (bad regex, IO error); fall back so the
             # caller surfaces a real error instead of a bogus "no matches".
             return None
+        cap = 500
         if files_only:
-            out = "\n".join(matched) if matched else "No matches found."
+            out = "\n".join(matched[:cap]) if matched else "No matches found."
+            if len(matched) > cap:
+                out += f"\n[results truncated: showing {cap} of {len(matched)} files]"
             return ToolResult(True, f"{len(matched)} files (rg)", out)
-        out = "\n".join(lines) if lines else "No matches found."
+        out = "\n".join(lines[:cap]) if lines else "No matches found."
+        if len(lines) > cap:
+            out += f"\n[results truncated: showing {cap} of {len(lines)} lines]"
         return ToolResult(True, f"{len(lines)} lines (rg)", out)
+
+    _RG_SPLIT = re.compile(r"[:\-](\d+)[:\-]")
+
+    def _rg_line_is_secret(self, line: str) -> bool:
+        """True when any plausible path prefix of an rg output line is a secret file."""
+        candidates = {line.split(":", 1)[0]}
+        for match in self._RG_SPLIT.finditer(line):
+            candidates.add(line[: match.start()])
+        return any(c and is_secret_file(self.workspace / c) for c in candidates)
 
     def _tool_grep(self, args: dict[str, Any]) -> ToolResult:
         pattern = str(args.get("pattern", ""))
@@ -1834,9 +2756,24 @@ class ToolExecutor:
             regex = re.compile(pattern, re.IGNORECASE)
         except re.error as exc:
             return ToolResult(False, "invalid regex", f"Invalid regex pattern: {exc}")
+        if _regex_is_risky(pattern):
+            return ToolResult(
+                False,
+                "regex too complex",
+                "The pattern has nested quantifiers (e.g. `(a+)+`) that can hang the built-in matcher. "
+                "Simplify it, or install ripgrep (`rg`) which is safe on such patterns.",
+            )
         hits: list[str] = []
         matched_files: list[str] = []
-        for rel in self.list_workspace_files(limit=300):
+        listed = self.list_workspace_files(limit=self.MAX_GREP_FILES)
+        truncated = self._listing_truncated or len(listed) >= self.MAX_GREP_FILES
+        deadline = time.monotonic() + self.GREP_DEADLINE_S
+        timed_out = False
+        hit_cap = 80
+        for rel in listed:
+            if time.monotonic() > deadline:
+                timed_out = True
+                break
             full = self.workspace / rel
             if not self._secret_reads_allowed() and is_secret_file(full):
                 continue
@@ -1849,6 +2786,8 @@ class ToolExecutor:
             lines = text.splitlines()
             file_hits = 0
             for idx, line in enumerate(lines, start=1):
+                if len(line) > self.MAX_GREP_LINE:
+                    line = line[: self.MAX_GREP_LINE]
                 if not regex.search(line):
                     continue
                 file_hits += 1
@@ -1865,19 +2804,26 @@ class ToolExecutor:
                     hits.append(f"{rel}:{idx}: {line.strip()[:140]}")
                 if max_per_file and file_hits >= max_per_file:
                     break
-                if len(hits) >= 80:
+                if len(hits) >= hit_cap:
                     break
             if file_hits:
                 matched_files.append(rel)
-            if len(hits) >= 80:
+            if len(hits) >= hit_cap:
+                truncated = True
                 break
+        notes: list[str] = []
+        if truncated:
+            notes.append("results truncated (hit result or file limit)")
+        if timed_out:
+            notes.append("results truncated (search time budget exhausted)")
+        suffix = ("\n[" + "; ".join(notes) + "]") if notes else ""
         if files_only:
             out = "\n".join(matched_files) if matched_files else "No matches found."
-            return ToolResult(True, f"{len(matched_files)} files", out)
+            return ToolResult(True, f"{len(matched_files)} files", out + suffix)
         if context and hits and hits[-1] == "--":
             hits.pop()
         out = "\n".join(hits) if hits else "No matches found."
-        return ToolResult(True, f"{len(hits)} lines", out)
+        return ToolResult(True, f"{len(hits)} lines", out + suffix)
 
     @staticmethod
     def _symbols_for_content(rel: str, content: str) -> list[str]:
@@ -1952,28 +2898,34 @@ class ToolExecutor:
             allowed = {".py", ".pyi", ".pyw", ".js", ".jsx", ".ts", ".tsx", ".md", ".markdown"}
             targets = [
                 self.workspace / item
-                for item in self.list_workspace_files(limit=300)
+                for item in self.list_workspace_files(limit=self.MAX_GREP_FILES)
                 if Path(item).suffix.lower() in allowed
             ]
 
         found: list[str] = []
+        truncated = False
         for fpath in targets:
             try:
+                if fpath.stat().st_size > MAX_READ_BYTES * 2:
+                    continue
                 content = fpath.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 continue
             found.extend(self._symbols_for_content(self.rel_display(fpath), content))
             if len(found) >= 300:
                 found = found[:300]
+                truncated = True
                 break
 
         out = "\n".join(found) if found else "No symbols found."
+        if truncated:
+            out += "\n[results truncated at 300 symbols; narrow `path`]"
         return ToolResult(True, f"{len(found)} symbols", out)
 
     async def _tool_git(self, args: dict[str, Any], agent_mode: str = "build") -> ToolResult:
         action = str(args.get("action") or "status").strip().lower()
         raw_path = str(args.get("path") or "").strip()
-        limit = max(1, min(int(args.get("limit", 20) or 20), 100))
+        limit = max(1, min(self._int_arg(args.get("limit"), 20) or 20, 100))
         staged = bool(args.get("staged", False))
 
         path_args: list[str] = []
@@ -2001,7 +2953,8 @@ class ToolExecutor:
         elif action == "blame":
             if not raw_path:
                 return ToolResult(False, "blame needs path", "`path` is required for git blame.")
-            cmd = ["blame", raw_path]
+            # `--` keeps a path like `-L1,5` from being parsed as an option.
+            cmd = ["blame", "--", *path_args[1:]]
         else:
             return ToolResult(
                 False,
@@ -2024,7 +2977,7 @@ class ToolExecutor:
 
         output = out_b.decode("utf-8", errors="replace").strip() or "(no output)"
         ok = proc.returncode == 0
-        summary = f"git {action} Â· {len(output.splitlines())} line(s)"
+        summary = f"git {action} · {len(output.splitlines())} line(s)"
         return ToolResult(ok, summary, output[:6000])
 
     #: Bisect subactions that move HEAD or refs, so they must clear permissions.
@@ -2058,14 +3011,24 @@ class ToolExecutor:
             )
 
         if sub in self._BISECT_MUTATING:
-            allowed_perm, reason = await self._authorize(
-                "shell", f"git bisect {sub} {rev}".strip(), agent_mode
-            )
-            if not allowed_perm:
+            # Bisect moves HEAD and rewrites refs: never in Plan or read-only sessions.
+            if agent_mode == "plan" or self.session_readonly:
+                why = "read-only session" if self.session_readonly else "Plan mode"
                 return ToolResult(
                     False,
-                    f"blocked: git bisect {sub} ({reason})",
-                    f"Permission `{reason}` refused `git bisect {sub}`. Adjust `permissions` "
+                    f"git bisect {sub} blocked: {why}",
+                    f"`git bisect {sub}` changes the checkout and is not allowed in {why}. "
+                    "Use `status` or `log` to inspect a bisect in progress.",
+                )
+            if rev.startswith("-"):
+                return ToolResult(False, "invalid revision", f"`rev` must not start with `-`: {rev}")
+            command_line = f"git bisect {sub} {rev}".strip()
+            blocked = await self._confirm_shell(command_line, agent_mode)
+            if blocked is not None:
+                return ToolResult(
+                    False,
+                    f"blocked: git bisect {sub}",
+                    f"`git bisect {sub}` needs approval ({blocked.output}) Adjust `permissions` "
                     "or the permission mode to allow it.",
                 )
 
@@ -2151,7 +3114,7 @@ class ToolExecutor:
             )
 
         diag = await self._tool_diagnostics(args)
-        note = "ruff/pyflakes not installed â€” ran built-in syntax diagnostics only (pip install ruff)."
+        note = "ruff/pyflakes not installed — ran built-in syntax diagnostics only (pip install ruff)."
         return ToolResult(diag.ok, f"fallback: {diag.summary}", f"{diag.output}\n\n{note}")
 
     async def _tool_diagnostics(self, args: dict[str, Any]) -> ToolResult:
@@ -2165,7 +3128,7 @@ class ToolExecutor:
         if target.is_file():
             targets = [target]
         else:
-            targets = [self.workspace / rel for rel in self.list_workspace_files(limit=300)]
+            targets = [self.workspace / rel for rel in self.list_workspace_files(limit=self.MAX_GREP_FILES)]
 
         if self.lsp is not None and int(getattr(self.lsp, "configured_count", 0) or 0) > 0:
             supported = [path for path in targets if self.lsp.definition_for(path) is not None]
@@ -2200,7 +3163,7 @@ class ToolExecutor:
             return ToolResult(False, f"{rel} not found", f"Path not found: {rel}")
         if targets is None:
             targets = [target] if target.is_file() else [
-                self.workspace / rel for rel in self.list_workspace_files(limit=300)
+                self.workspace / rel for rel in self.list_workspace_files(limit=self.MAX_GREP_FILES)
             ]
         all_issues: list[str] = []
         checked = 0
@@ -2329,7 +3292,11 @@ class ToolExecutor:
         session: BrowserSession = self._browser_session
         try:
             if action == "open":
-                result = await asyncio.to_thread(session.open, str(args.get("url") or ""))
+                page_url = str(args.get("url") or "")
+                problem = await check_url_safe(page_url, allow_private=self._allow_private_fetch())
+                if problem:
+                    return ToolResult(False, "blocked: unsafe URL", f"browser open refused `{page_url}`: {problem}")
+                result = await asyncio.to_thread(session.open, page_url)
             elif action == "click":
                 result = await asyncio.to_thread(session.click, str(args.get("selector") or ""))
             elif action == "fill":
@@ -2514,10 +3481,17 @@ class ToolExecutor:
             return ToolResult(False, "question cancelled", "The user dismissed the question.")
         return ToolResult(True, "answer received", answer)
 
-    async def _tool_terminal(self, args: dict[str, Any]) -> ToolResult:
+    async def _tool_terminal(self, args: dict[str, Any], agent_mode: str = "build") -> ToolResult:
         from .terminal import PersistentShell, TerminalError
 
         action = str(args.get("action") or "run").strip().lower()
+        if action not in ("close", "start", "open"):
+            command_to_run = str(args.get("command") or "").strip()
+            if command_to_run:
+                # Same gate as `bash`: danger list, sandbox, Plan mode, approval.
+                blocked = await self._gate_shell(command_to_run, agent_mode)
+                if blocked is not None:
+                    return blocked
         if self._terminal_shell is None:
             self._terminal_shell = PersistentShell(self.workspace)
         shell: PersistentShell = self._terminal_shell
@@ -2578,11 +3552,18 @@ class ToolExecutor:
             raw = base64.b64decode(data["b64_json"])
         elif data.get("url"):
             url = str(data["url"])
-            if self.http_client is not None:
-                fetched = await self.http_client.get(url)
-            else:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    fetched = await client.get(url)
+            try:
+                if self.http_client is not None:
+                    fetched = await safe_http_get(
+                        self.http_client, url, allow_private=self._allow_private_fetch(), max_bytes=20_000_000
+                    )
+                else:
+                    async with httpx.AsyncClient(timeout=60.0) as client:
+                        fetched = await safe_http_get(
+                            client, url, allow_private=self._allow_private_fetch(), max_bytes=20_000_000
+                        )
+            except UnsafeURL as exc:
+                return ToolResult(False, "image download blocked", f"Refused `{url}`: {exc}")
             if fetched.status_code >= 400:
                 return ToolResult(False, "image download failed", f"HTTP {fetched.status_code}")
             raw = fetched.content
@@ -2660,9 +3641,12 @@ class ToolExecutor:
         if not target.exists():
             return ToolResult(False, f"{rel} not found", f"File does not exist: {rel}")
         try:
-            nb = json.loads(target.read_text(encoding="utf-8"))
+            original, original_bytes = read_text_lossless(target)
+            nb = json.loads(original)
         except (OSError, ValueError) as exc:
             return ToolResult(False, f"{rel} invalid", f"Cannot parse notebook: {exc}")
+        if not isinstance(nb, dict):
+            return ToolResult(False, f"{rel} invalid", "Notebook root must be a JSON object.")
         cells = nb.get("cells")
         if not isinstance(cells, list):
             return ToolResult(False, f"{rel} invalid", "Notebook has no `cells` list.")
@@ -2691,18 +3675,15 @@ class ToolExecutor:
         except (TypeError, ValueError):
             index = -1
 
-        def save_nb(new_content: str, label: str) -> None:
+        def save_nb(label: str) -> str:
+            updated = json.dumps(nb, ensure_ascii=False, indent=1) + "\n"
+            atomic_write_text(target, updated)
             self.invalidate_file_cache()
-            self.undo_stack.append(
-                FileSnapshot(
-                    step_label=label,
-                    path=str(target),
-                    existed_before=True,
-                    previous_content=original,
-                    new_content=new_content,
-                )
-            )
+            self._push_snapshot(label, target, True, original, updated, original_bytes)
             self._record_file_change(rel, 0, 0)
+            return updated
+
+        supports_ids = int(nb.get("nbformat", 4) or 4) == 4 and int(nb.get("nbformat_minor", 0) or 0) >= 5
 
         if action in ("set_cell", "insert_cell"):
             source = str(args.get("source", ""))
@@ -2710,37 +3691,41 @@ class ToolExecutor:
                 return ToolResult(False, "missing source", "`source` is required for this action.")
             if action == "set_cell" and not (0 <= index < len(cells)):
                 return ToolResult(False, "bad index", f"Cell index {index} out of range (0..{len(cells) - 1}).")
-            original = target.read_text(encoding="utf-8", errors="replace")
             if action == "set_cell":
-                cells[index]["source"] = source.splitlines(keepends=True)
-                cells[index]["outputs"] = []
-                cells[index]["execution_count"] = None
-                updated = json.dumps(nb, ensure_ascii=False, indent=1)
-                atomic_write_text(target, updated)
-                save_nb(updated, f"notebook set_cell {rel}#{index}")
+                cell = cells[index]
+                cell["source"] = source.splitlines(keepends=True)
+                if cell.get("cell_type", "code") == "code":
+                    cell["outputs"] = []
+                    cell["execution_count"] = None
+                else:
+                    # markdown/raw cells must not carry code-only fields
+                    cell.pop("outputs", None)
+                    cell.pop("execution_count", None)
+                save_nb(f"notebook set_cell {rel}#{index}")
                 return ToolResult(True, f"cell #{index} replaced", f"Cell #{index} of {rel} updated.")
+            cell_type = str(args.get("cellType") or "code").lower()
+            if cell_type not in ("code", "markdown", "raw"):
+                return ToolResult(False, "bad cellType", "cellType must be code, markdown or raw.")
             if index < 0 or index > len(cells):
                 index = len(cells)
             new_cell: dict[str, Any] = {
-                "cell_type": str(args.get("cellType") or "code"),
+                "cell_type": cell_type,
                 "metadata": {},
                 "source": source.splitlines(keepends=True),
-                "outputs": [],
-                "execution_count": None,
             }
+            if cell_type == "code":
+                new_cell["outputs"] = []
+                new_cell["execution_count"] = None
+            if supports_ids:
+                new_cell["id"] = uuid.uuid4().hex[:8]
             cells.insert(index, new_cell)
-            updated = json.dumps(nb, ensure_ascii=False, indent=1)
-            atomic_write_text(target, updated)
-            save_nb(updated, f"notebook insert {rel}#{index}")
+            save_nb(f"notebook insert {rel}#{index}")
             return ToolResult(True, f"cell inserted at #{index}", f"Cell inserted into {rel} at #{index}.")
         if action == "delete_cell":
             if not (0 <= index < len(cells)):
                 return ToolResult(False, "bad index", f"Cell index {index} out of range (0..{len(cells) - 1}).")
-            original = target.read_text(encoding="utf-8", errors="replace")
             cells.pop(index)
-            updated = json.dumps(nb, ensure_ascii=False, indent=1)
-            atomic_write_text(target, updated)
-            save_nb(updated, f"notebook delete {rel}#{index}")
+            save_nb(f"notebook delete {rel}#{index}")
             return ToolResult(True, f"cell #{index} deleted", f"Cell #{index} removed from {rel}.")
         return ToolResult(False, "unknown action", "action must be read | set_cell | insert_cell | delete_cell.")
 
@@ -2758,6 +3743,13 @@ class ToolExecutor:
 
     def _tool_todowrite(self, args: dict[str, Any]) -> ToolResult:
         raw_todos = args.get("todos", [])
+        if not isinstance(raw_todos, list):
+            # A string/None from a confused model must not wipe the user's list.
+            return ToolResult(
+                False,
+                "invalid todos",
+                "`todos` must be a list of {content, status, priority} objects; the existing list was kept.",
+            )
         items: list[TodoItem] = []
         for raw in raw_todos:
             if isinstance(raw, dict):
@@ -2777,8 +3769,8 @@ class ToolExecutor:
         lines = []
         for t in items:
             icon = {
-                "completed": "[âœ“]",
-                "in_progress": "[â€¢]",
+                "completed": "[✓]",
+                "in_progress": "[•]",
                 "cancelled": "[x]",
             }.get(t.status, "[ ]")
             lines.append(f"{icon} {t.content} ({t.priority})")
@@ -2807,6 +3799,16 @@ class ToolExecutor:
             )
         return fenced
 
+    @staticmethod
+    def _clean_fetched(raw: str) -> str:
+        cleaned = html_to_markdown(raw) if "<" in raw else raw.strip()
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned[:6000] or "(empty response)"
+
+    def _allow_private_fetch(self) -> bool:
+        config = self.get_config() if self.get_config is not None else {}
+        return bool(config.get("webfetch_allow_private", False)) if isinstance(config, dict) else False
+
     async def _tool_webfetch(self, args: dict[str, Any]) -> ToolResult:
         url = str(args.get("url", "")).strip()
         if not url.startswith(("http://", "https://")):
@@ -2815,23 +3817,30 @@ class ToolExecutor:
         if cached and time.time() - cached[0] < 600:
             return ToolResult(
                 True,
-                f"cached · Markdown {len(cached[1])} chars",
+                f"cached \u00b7 Markdown {len(cached[1])} chars",
                 self._fence_untrusted(cached[1], f"webfetch:{url}"),
             )
-        if self.http_client is not None:
-            resp = await self.http_client.get(url, headers={"User-Agent": "rbit-cli/1.2"}, follow_redirects=True)
-        else:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                resp = await client.get(url, headers={"User-Agent": "rbit-cli/1.2"})
-        raw = resp.text
-        cleaned = html_to_markdown(raw) if "<" in raw else raw.strip()
-        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-        cleaned = cleaned[:6000] or "(empty response)"
-        if resp.status_code < 400:
+        headers = {"User-Agent": "rbit-cli/1.2"}
+        allow_private = self._allow_private_fetch()
+        try:
+            if self.http_client is not None:
+                page = await safe_http_get(self.http_client, url, headers=headers, allow_private=allow_private)
+            else:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    page = await safe_http_get(client, url, headers=headers, allow_private=allow_private)
+        except UnsafeURL as exc:
+            return ToolResult(False, "blocked: unsafe URL", f"webfetch refused `{url}`: {exc}")
+        except httpx.HTTPError as exc:
+            return ToolResult(False, "webfetch failed", f"{type(exc).__name__}: {exc}")
+        # Parsing is CPU-bound regex work on untrusted input: keep it off the event loop.
+        cleaned = await asyncio.to_thread(self._clean_fetched, page.text)
+        if page.truncated:
+            cleaned += f"\n[page truncated at {MAX_FETCH_BYTES // 1_000_000} MB]"
+        if page.status_code < 400:
             self._webfetch_cache[url] = (time.time(), cleaned)
         return ToolResult(
-            resp.status_code < 400,
-            f"HTTP {resp.status_code} · Markdown {len(cleaned)} chars",
+            page.status_code < 400,
+            f"HTTP {page.status_code} \u00b7 Markdown {len(cleaned)} chars",
             self._fence_untrusted(cleaned, f"webfetch:{url}"),
         )
 
@@ -3013,18 +4022,68 @@ class ToolExecutor:
         return None
 
     def _prefix_allowed(self, command: str) -> bool:
-        """True when the command starts with a user-approved prefix."""
-        lowered = command.lower()
-        return any(lowered.startswith(p.lower()) for p in self.allowed_bash_prefixes)
+        """True when the command starts with a user-approved prefix.
+
+        Compared token by token (`npm test` allows `npm test --silent`, never
+        `npm testing`) and only for a single plain statement: chaining,
+        redirects, substitution or a newline would let an approved prefix carry
+        an arbitrary second command."""
+        if _SHELL_UNSAFE_CHARS.search(command):
+            return False
+        tokens = [t.lower() for t in command.split()]
+        if not tokens:
+            return False
+        for prefix in self.allowed_bash_prefixes:
+            parts = [t.lower() for t in str(prefix).split()]
+            if parts and tokens[: len(parts)] == parts:
+                return True
+        return False
 
     def _bash_prefix(self, command: str) -> str:
         return " ".join(command.split()[:2])
 
-    async def _tool_bash(self, args: dict[str, Any], agent_mode: str = "build") -> ToolResult:
-        command = str(args.get("command", "")).strip()
-        if not command:
-            return ToolResult(False, "empty command", "command is required.")
+    async def _confirm_shell(
+        self,
+        command: str,
+        agent_mode: str,
+        *,
+        readonly: bool = False,
+        preasked: bool = False,
+        fail_closed: bool = True,
+    ) -> ToolResult | None:
+        """Approval step shared by `bash`, `terminal`, git bisect and project formatters.
 
+        Returns None when the command may run. With nobody to ask (no
+        `permission_cb`) and no standing approval (`always_allow_bash`, an
+        allow rule, an approved prefix, `commands`/`auto` mode) the answer is
+        a refusal: fail closed, exactly like `edit`."""
+        if readonly:
+            return None
+        effect = self.resolve_permission_effect("shell", command, agent_mode)
+        if effect == "deny":
+            return ToolResult(False, f"blocked: {command[:36]}", "Permission denied: `shell` is denied by a permission rule.")
+        if effect == "allow" or self.always_allow_bash or self._prefix_allowed(command):
+            return None
+        if effect == "ask" and preasked:
+            return None  # the permission preflight already asked the user
+        if effect is None and self.mode_allows("shell"):
+            return None
+        if self.permission_cb is None:
+            if not fail_closed:
+                return None  # legacy `bash` behaviour for headless callers without a prompt channel
+            return ToolResult(
+                False,
+                f"blocked: {command[:36]}",
+                "Command requires approval, but no interactive client is attached. "
+                "Allow it with a `shell` permission rule, `always_allow_bash`, or the `commands`/`auto` permission mode.",
+            )
+        if not await self.permission_cb("bash", command):
+            return ToolResult(False, f"rejected: {command[:36]}", "Command execution rejected by user.")
+        return None
+
+    async def _gate_shell(self, command: str, agent_mode: str, *, fail_closed: bool = True) -> ToolResult | None:
+        """The one gate every shell-like tool goes through: danger list, sandbox,
+        Plan mode, then approval. Returns a blocking result or None."""
         danger = is_dangerous_command(command)
         if danger:
             return ToolResult(
@@ -3050,22 +4109,20 @@ class ToolExecutor:
                 f"blocked in Plan mode: {command[:36]}",
                 "Only read-only commands are allowed in Plan mode.",
             )
+        return await self._confirm_shell(
+            command, agent_mode, readonly=is_readonly, preasked=True, fail_closed=fail_closed
+        )
 
-        if (
-            self.resolve_permission_effect("shell", command, agent_mode) is None
-            and not is_readonly
-            and not self.always_allow_bash
-            and not self._prefix_allowed(command)
-            and not self.mode_allows("shell")
-            and self.permission_cb is not None
-        ):
-            allowed = await self.permission_cb("bash", command)
-            if not allowed:
-                return ToolResult(
-                    False,
-                    f"rejected: {command[:36]}",
-                    "Command execution rejected by user.",
-                )
+    async def _tool_bash(self, args: dict[str, Any], agent_mode: str = "build") -> ToolResult:
+        command = str(args.get("command", "")).strip()
+        if not command:
+            return ToolResult(False, "empty command", "command is required.")
+
+        # `bash` keeps its historic no-callback behaviour (headless `rbit run` has no
+        # prompt channel and existing tests rely on it); `terminal` and bisect fail closed.
+        blocked = await self._gate_shell(command, agent_mode, fail_closed=False)
+        if blocked is not None:
+            return blocked
 
         try:
             timeout_s = float(args.get("timeout", 30) or 30)
@@ -3080,25 +4137,31 @@ class ToolExecutor:
         self.invalidate_file_cache()
         return result
 
+    @staticmethod
+    def _shell_argv(command: str) -> list[str] | None:
+        """PowerShell invocation on Windows (UTF-8 output so Cyrillic is not mangled); None elsewhere."""
+        if os.name != "nt":
+            return None
+        prefix = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;$OutputEncoding=[System.Text.Encoding]::UTF8;"
+        return ["powershell", "-NoProfile", "-NonInteractive", "-Command", prefix + command]
+
+    async def _spawn_shell(self, command: str, *, capture: bool) -> asyncio.subprocess.Process:
+        out = asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL
+        err = asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL
+        common: dict[str, Any] = {
+            "cwd": str(self.workspace),
+            "stdin": asyncio.subprocess.DEVNULL,
+            "stdout": out,
+            "stderr": err,
+            "env": sanitized_env(),
+        }
+        argv = self._shell_argv(command)
+        if argv is not None:
+            return await asyncio.create_subprocess_exec(*argv, **common)
+        return await asyncio.create_subprocess_shell(command, start_new_session=True, **common)
+
     async def _run_background(self, command: str) -> ToolResult:
-        if os.name == "nt":
-            proc = await asyncio.create_subprocess_exec(
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                command,
-                cwd=str(self.workspace),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-        else:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                cwd=str(self.workspace),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
+        proc = await self._spawn_shell(command, capture=False)
         self._background_procs.append(proc)
         return ToolResult(
             True,
@@ -3148,38 +4211,25 @@ class ToolExecutor:
         return False
 
     async def _run_subprocess(self, command: str, timeout_s: float = 30.0) -> ToolResult:
-        if os.name == "nt":
-            proc = await asyncio.create_subprocess_exec(
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                command,
-                cwd=str(self.workspace),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        else:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                cwd=str(self.workspace),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+        proc = await self._spawn_shell(command, capture=True)
+
+        async def collect() -> tuple[bytes, bytes]:
+            out, err, _code = await asyncio.gather(_read_capped(proc.stdout), _read_capped(proc.stderr), proc.wait())
+            return out, err
 
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+            stdout_b, stderr_b = await asyncio.wait_for(collect(), timeout=timeout_s)
         except asyncio.TimeoutError:
-            proc.kill()
+            await _kill_process_tree(proc)
             try:
-                await proc.wait()
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
             except Exception:
                 pass
             return ToolResult(
                 False,
                 f"timeout: {command[:36]}",
-                f"Command timed out after {timeout_s:g}s. Increase the `timeout` argument "
-                "(max 600s) or use `background=true` for long-running processes.",
+                f"Command timed out after {timeout_s:g}s (the whole process tree was killed). "
+                "Increase the `timeout` argument (max 600s) or use `background=true` for long-running processes.",
             )
 
         stdout = stdout_b.decode("utf-8", errors="replace").strip()
@@ -3190,7 +4240,7 @@ class ToolExecutor:
         return ToolResult(
             ok,
             f"exit {proc.returncode}",
-            combined[:4000],
+            truncate_middle(combined, 4000),
         )
 
 

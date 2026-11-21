@@ -1123,10 +1123,14 @@ class AutocompletePopup(OptionList):
         self.values: list[str] = []
 
     def show_slash(self, prefix: str, extra: list[tuple[str, str]] | None = None) -> None:
-        pool = list(SLASH_COMMANDS) + list(extra or [])
+        # Deduplicate by command name: a custom command shadows the built-in
+        # one (same ids would raise DuplicateID in the option list).
+        by_name: dict[str, str] = {cmd: desc for cmd, desc in SLASH_COMMANDS}
+        for cmd, desc in extra or []:
+            by_name[cmd] = desc
         matches = [
             (cmd, desc)
-            for cmd, desc in pool
+            for cmd, desc in by_name.items()
             if cmd.startswith(prefix.lower())
         ]
         if not matches:
@@ -1145,7 +1149,7 @@ class AutocompletePopup(OptionList):
 
     def show_files(self, query: str, workspace_files: list[str]) -> None:
         q = query.lower()
-        matches = [f for f in workspace_files if q in f.lower()][:10]
+        matches = list(dict.fromkeys(f for f in workspace_files if q in f.lower()))[:10]
         if not matches:
             self.display = False
             return

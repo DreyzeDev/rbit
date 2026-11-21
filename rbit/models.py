@@ -38,6 +38,13 @@ def short_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 @dataclass
 class TodoItem:
     id: str
@@ -75,7 +82,19 @@ class ToolCallRecord:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ToolCallRecord":
-        return cls(**data)
+        data = data if isinstance(data, dict) else {}
+        args = data.get("arguments")
+        return cls(
+            id=str(data.get("id") or short_id()),
+            name=str(data.get("name") or ""),
+            arguments=args if isinstance(args, dict) else {},
+            status=str(data.get("status") or "success"),
+            summary=str(data.get("summary") or ""),
+            output=str(data.get("output") or ""),
+            diff=str(data.get("diff") or ""),
+            duration_ms=_as_int(data.get("duration_ms")),
+            pid=_as_int(data.get("pid")),
+        )
 
 
 @dataclass
@@ -98,7 +117,11 @@ class ChatMessage:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ChatMessage":
-        tcs = [ToolCallRecord.from_dict(tc) for tc in data.get("tool_calls", [])]
+        tcs = [
+            ToolCallRecord.from_dict(tc)
+            for tc in (data.get("tool_calls") or [])
+            if isinstance(tc, dict)
+        ]
         return cls(
             id=data.get("id") or short_id(),
             role=data.get("role", "user"),
@@ -106,11 +129,12 @@ class ChatMessage:
             agent=data.get("agent", "build"),
             model=data.get("model", ""),
             timestamp=data.get("timestamp", now_iso()),
-            tokens=data.get("tokens", 0),
-            duration_s=data.get("duration_s", 0.0),
-            interrupted=data.get("interrupted", False),
-            attachments=data.get("attachments", []),
+            tokens=_as_int(data.get("tokens")),
+            duration_s=float(data.get("duration_s") or 0.0),
+            interrupted=bool(data.get("interrupted", False)),
+            attachments=list(data.get("attachments") or []),
             tool_calls=tcs,
+            pinned=bool(data.get("pinned", False)),
         )
 
 
@@ -129,7 +153,12 @@ class FileChangeStat:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "FileChangeStat":
-        return cls(**data)
+        data = data if isinstance(data, dict) else {}
+        return cls(
+            path=str(data.get("path") or ""),
+            added=_as_int(data.get("added")),
+            removed=_as_int(data.get("removed")),
+        )
 
 
 @dataclass
@@ -180,13 +209,17 @@ class Session:
 
     @property
     def total_tokens(self) -> int:
-        base = sum(m.tokens or count_tokens(m.content) for m in self.messages)
-        tool_toks = sum(
-            count_tokens(tc.output)
-            for m in self.messages
-            for tc in m.tool_calls
-        )
-        return base + tool_toks
+        # `m.tokens` already covers the turn's tool output, so tool output is only
+        # counted separately for messages that carry no token total of their own.
+        total = 0
+        for m in self.messages:
+            if m.tokens:
+                total += m.tokens
+            else:
+                total += count_tokens(m.content) + sum(
+                    count_tokens(tc.output) for tc in m.tool_calls
+                )
+        return total
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -208,11 +241,11 @@ class Session:
             id=data.get("id") or short_id(),
             title=data.get("title", "Session"),
             created_at=data.get("created_at", ""),
-            messages=[ChatMessage.from_dict(m) for m in data.get("messages", [])],
-            todos=[TodoItem.from_dict(t) for t in data.get("todos", [])],
+            messages=[ChatMessage.from_dict(m) for m in (data.get("messages") or [])],
+            todos=[TodoItem.from_dict(t) for t in (data.get("todos") or [])],
             modified_files={
                 k: FileChangeStat.from_dict(v)
-                for k, v in data.get("modified_files", {}).items()
+                for k, v in (data.get("modified_files") or {}).items()
             },
             finished=data.get("finished", True),
             archived=bool(data.get("archived", False)),
@@ -227,6 +260,8 @@ class ModelInfo:
     context_window: int = 200_000
     cost_per_1k: float = 0.003
     is_local_smart: bool = False
+    #: False when the price is unknown, so no cost may be invented for the model.
+    priced: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -306,7 +341,10 @@ def get_model_info(model_id: str, extra_models: list[ModelInfo] | None = None) -
     if model_id.startswith("ollama/"):
         clean = model_id.split("/", 1)[1]
         return ModelInfo(id=model_id, name=f"{clean} (Local)", provider="Ollama", context_window=32_768, cost_per_1k=0.0)
-    return ModelInfo(id=model_id, name=model_id, provider="Custom")
+    # Unknown model: `priced=False` — the usage ledger must not book a made-up
+    # price for it (the default cost_per_1k stays only as a conservative guard
+    # estimate for per-turn spending caps).
+    return ModelInfo(id=model_id, name=model_id, provider="Custom", priced=False)
 
 def search_session(
     session: Session, query: str, limit: int = 100

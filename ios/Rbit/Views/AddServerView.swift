@@ -39,9 +39,7 @@ struct AddServerView: View {
         .presentationCornerRadius(28)
         .onAppear {
             if url.isEmpty {
-                url = app.settings.serverURL.isEmpty
-                    ? RbitRemoteDefaults.serverURL
-                    : app.settings.serverURL
+                url = app.settings.serverURL
             }
             applyPairing(app.incomingPairing)
         }

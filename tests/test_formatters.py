@@ -31,7 +31,12 @@ def _fail_script(tmp_path: Path) -> Path:
 
 
 def _executor(tmp_path: Path, config: dict[str, Any]) -> ToolExecutor:
-    return ToolExecutor(workspace=tmp_path, session=Session(), get_config=lambda: config)
+    executor = ToolExecutor(workspace=tmp_path, session=Session(), get_config=lambda: config)
+    # A custom formatter command comes from the project config and runs arbitrary
+    # code, so it only runs with the user's standing shell approval. These tests
+    # model a user who has granted it; see test_fix_tools.py for the denied case.
+    executor.always_allow_bash = True
+    return executor
 
 
 def _custom(script: Path, suffix: str = ".foo", **extra: Any) -> dict[str, Any]:

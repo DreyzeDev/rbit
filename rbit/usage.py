@@ -46,6 +46,17 @@ _BUDGET_ALIASES = {
 }
 
 
+def _num(value: Any, default: float = 0.0) -> float:
+    """Tolerant float: None / "abc" / nan / inf all fall back to `default`."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if result != result or result in (float("inf"), float("-inf")):
+        return default
+    return result
+
+
 def normalize_budget_mode(raw: Any, default: str = "warn") -> str:
     if isinstance(raw, str):
         key = raw.strip().lower()
@@ -126,11 +137,16 @@ class BudgetStatus:
     mode: str = "warn"
     unpriced_calls: int = 0
     by_model: dict[str, float] = field(default_factory=dict)
+    #: Per-model cap (`model_budgets`) and what that model alone has spent today.
+    model_limit_usd: float = 0.0
+    model_spent_usd: float = 0.0
 
     @property
     def percent(self) -> float:
         """Fraction of the *binding* limit used (money first, then tokens)."""
         ratios: list[float] = []
+        if self.model_limit_usd > 0:
+            ratios.append(self.model_spent_usd / self.model_limit_usd)
         if self.limit_usd > 0:
             ratios.append(self.spent_usd / self.limit_usd)
         if self.limit_tokens > 0:
@@ -166,7 +182,8 @@ class UsageLedger:
 
     @staticmethod
     def today() -> date:
-        return datetime.now(timezone.utc).date()
+        # The "day" of a daily budget is the user's local day, not the UTC one.
+        return datetime.now().date()
 
     # --- writing -------------------------------------------------------
     def record(
@@ -243,16 +260,16 @@ class UsageLedger:
         records = self.read_day()
         status = BudgetStatus(
             day=self.today().isoformat(),
-            limit_usd=float(config.get("daily_budget_usd") or DEFAULT_DAILY_USD),
-            limit_tokens=int(config.get("daily_token_limit") or DEFAULT_DAILY_TOKENS),
+            limit_usd=max(0.0, _num(config.get("daily_budget_usd"), DEFAULT_DAILY_USD)),
+            limit_tokens=max(0, int(_num(config.get("daily_token_limit"), DEFAULT_DAILY_TOKENS))),
             mode=normalize_budget_mode(config.get("budget_mode")),
         )
-        # A per-model cap overrides the global one when it is tighter.
+        # A per-model cap is checked against that model's own spend, never the total.
         per_model = config.get("model_budgets")
         if model and isinstance(per_model, dict):
-            cap = per_model.get(model)
-            if isinstance(cap, (int, float)) and cap > 0:
-                status.limit_usd = min(status.limit_usd, float(cap)) if status.limit_usd > 0 else float(cap)
+            cap = _num(per_model.get(model), 0.0)
+            if cap > 0:
+                status.model_limit_usd = cap
 
         for rec in records:
             status.spent_usd += rec.cost_usd
@@ -261,12 +278,14 @@ class UsageLedger:
             if not rec.priced:
                 status.unpriced_calls += 1
             status.by_model[rec.model] = status.by_model.get(rec.model, 0.0) + rec.cost_usd
+        if status.model_limit_usd > 0:
+            status.model_spent_usd = status.by_model.get(model, 0.0)
         return status
 
     def forecast(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
         """Burn-rate projection for the rest of the day."""
         status = self.status(config)
-        now = datetime.now(timezone.utc)
+        now = datetime.now()
         elapsed_h = max(now.hour + now.minute / 60.0, 1 / 60.0)
         remaining_h = max(24.0 - (now.hour + now.minute / 60.0), 0.0)
         per_hour = status.spent_usd / elapsed_h
@@ -380,12 +399,25 @@ class BudgetGuard:
 
     def check(self, model: str = "", estimated_usd: float | None = None) -> tuple[bool, str]:
         """Returns (allowed, message). Never raises."""
+        try:
+            return self._check(model, estimated_usd)
+        except Exception as exc:  # noqa: BLE001 - a broken budget must not break a turn
+            return True, f"Budget check skipped: {exc}"
+
+    def _check(self, model: str, estimated_usd: float | None) -> tuple[bool, str]:
         if self.mode == "off":
             return True, ""
         status = self.ledger.status(self.config, model=model)
-        projected = status.spent_usd + self.ledger.reserved_usd + (
-            self.SAFETY_MARGIN_USD if estimated_usd is None else estimated_usd
-        )
+        extra = self.SAFETY_MARGIN_USD if estimated_usd is None else max(0.0, _num(estimated_usd))
+        projected = status.spent_usd + self.ledger.reserved_usd + extra
+        if status.model_limit_usd > 0 and status.model_spent_usd + extra > status.model_limit_usd:
+            text = (
+                f"Budget for `{model}` ${status.model_limit_usd:.4g}/day would be exceeded "
+                f"(spent ${status.model_spent_usd:.4f})."
+            )
+            if self.mode == "strict":
+                return False, text + " Raise `model_budgets` or set `budget_mode: warn`."
+            return True, "Budget warning: " + text
         if status.limit_usd > 0 and projected > status.limit_usd:
             if self.mode == "strict":
                 return False, (

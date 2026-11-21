@@ -9,6 +9,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -38,6 +39,142 @@ def _resolve_workspace(raw_dir: str | None) -> Path:
     return Path(raw_dir).resolve() if raw_dir else Path.cwd().resolve()
 
 
+def _confirm(console: Console, question: str, assume_yes: bool = False) -> bool:
+    """Ask for confirmation; refuse (False) in a non-interactive session without --yes."""
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        console.print(f"[red]Refusing to {markup_escape(question)} without --yes in a non-interactive session.[/]")
+        return False
+    try:
+        answer = input(f"{question}? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in ("y", "yes")
+
+
+def _read_stdin_text(timeout: float | None = None) -> str:
+    """Read all of stdin as UTF-8; with a timeout, return '' when nothing arrives in time."""
+    import threading
+
+    box: list[str] = []
+
+    def _reader() -> None:
+        try:
+            buffer = getattr(sys.stdin, "buffer", None)
+            if buffer is not None:
+                box.append(buffer.read().decode("utf-8", errors="replace"))
+            else:  # text-only stream (e.g. an in-memory replacement)
+                box.append(sys.stdin.read())
+        except Exception:  # noqa: BLE001 - stdin may be closed/odd; treat as empty
+            box.append("")
+
+    if timeout is None:
+        _reader()
+        return box[0].strip() if box else ""
+    thread = threading.Thread(target=_reader, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    return box[0].strip() if box else ""
+
+
+def _nonneg_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0 (got {number})")
+    return number
+
+
+#: Subcommands whose directory is a positional; `-d/--dir DIR` is accepted as an alias.
+_DIR_POSITIONAL_SUBS = frozenset(
+    {"doctor", "watch", "describe", "status", "risk", "sessions", "stats", "map", "lint", "init", "commit", "backup", "test"}
+)
+#: Subcommands with sub-subparsers: `-d DIR` after the verb is hoisted in front of it.
+_DIR_HOIST_SUBS = frozenset({"schedule", "agent", "debug", "session", "plugin", "auth"})
+
+
+def _pop_dir_option(rest: list[str]) -> tuple[str | None, list[str]]:
+    """Remove `-d X` / `--dir X` / `--dir=X` from `rest`; returns (value, remaining)."""
+    value: str | None = None
+    out: list[str] = []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--":
+            out.extend(rest[i:])
+            break
+        if tok in ("-d", "--dir") and i + 1 < len(rest):
+            value = rest[i + 1]
+            i += 2
+            continue
+        if tok.startswith("--dir="):
+            value = tok.split("=", 1)[1]
+            i += 1
+            continue
+        out.append(tok)
+        i += 1
+    return value, out
+
+
+def _normalize_subcommand_args(sub: str, rest: list[str]) -> list[str]:
+    if sub in _DIR_POSITIONAL_SUBS:
+        value, remaining = _pop_dir_option(rest)
+        return remaining + [value] if value is not None else remaining
+    if sub in _DIR_HOIST_SUBS:
+        value, remaining = _pop_dir_option(rest)
+        return ["-d", value, *remaining] if value is not None else remaining
+    if sub == "run":
+        # `-w` / `--title` take an optional value; never let them swallow the prompt.
+        mapping = {"-w": "--worktree=", "--worktree": "--worktree=", "--title": "--title="}
+        return [mapping.get(tok, tok) for tok in rest]
+    return rest
+
+
+def _split_mcp_args(rest: list[str]) -> tuple[list[str], list[str]]:
+    """Split `rbit mcp` args into (own options + action/name, local-server command)."""
+    value_flags = {"--url", "--token", "--header", "--env", "-d", "--dir"}
+    head: list[str] = []
+    positionals = 0
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--":
+            return head, rest[i + 1 :]
+        flag = tok.split("=", 1)[0]
+        if flag in value_flags:
+            head.append(tok)
+            if "=" not in tok and i + 1 < len(rest):
+                head.append(rest[i + 1])
+                i += 2
+            else:
+                i += 1
+            continue
+        if tok in ("-h", "--help"):
+            head.append(tok)
+            i += 1
+            continue
+        if positionals < 2:  # action, name
+            head.append(tok)
+            positionals += 1
+            i += 1
+            continue
+        return head, rest[i:]
+    return head, []
+
+
+def _port_arg(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid port: {value!r}") from None
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"port must be between 0 and 65535 (got {port})")
+    return port
+
+
 def _create_worktree(workspace: Path, name: str = "") -> Path | None:
     """Creates a sibling git worktree for an isolated session."""
     import subprocess
@@ -48,10 +185,11 @@ def _create_worktree(workspace: Path, name: str = "") -> Path | None:
         ["git", "rev-parse", "--show-toplevel"], cwd=str(workspace), capture_output=True, text=True, check=False
     )
     if root.returncode != 0:
-        console.print(f"[red]Not a git repository:[/] {workspace}")
+        console.print(f"[red]Not a git repository:[/] {markup_escape(str(workspace))}")
         return None
     repo = Path(root.stdout.strip())
-    slug = (name or _time.strftime("%Y%m%d-%H%M%S")).strip().replace(" ", "-")
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", (name or "").strip()).strip("-.")
+    slug = re.sub(r"\.\.+", ".", slug) or _time.strftime("%Y%m%d-%H%M%S")
     target = repo.parent / f"{repo.name}-{slug}"
     branch = f"rbit/{slug}"
     cmd = ["git", "worktree", "add", "-b", branch, str(target)]
@@ -63,7 +201,7 @@ def _create_worktree(workspace: Path, name: str = "") -> Path | None:
     if proc.returncode != 0:
         console.print(f"[red]git worktree failed:[/] {markup_escape((proc.stderr or proc.stdout).strip()[:300])}")
         return None
-    console.print(f"[#7fd88f]Worktree:[/] {target} [dim]({branch})[/]")
+    console.print(f"[#7fd88f]Worktree:[/] {markup_escape(str(target))} [dim]({markup_escape(branch)})[/]")
     return target
 
 
@@ -93,7 +231,7 @@ async def _run_headless(args: argparse.Namespace) -> int:
         definitions = load_subagents(workspace, cfg)
         definition = definitions.get(agent_mode)
         if definition is None:
-            console.print(f"[red]Unknown agent:[/] {agent_mode}. Available: build, plan, " + ", ".join(subagent_names(definitions)))
+            console.print(f"[red]Unknown agent:[/] {markup_escape(agent_mode)}. Available: build, plan, " + markup_escape(", ".join(subagent_names(definitions))))
             return 1
         cfg["agent_prompt"] = definition.prompt
         if definition.tools is not None:
@@ -101,20 +239,31 @@ async def _run_headless(args: argparse.Namespace) -> int:
         if definition.model and not args.model:
             model_id = definition.model
 
+    if getattr(args, "fork", False) and not (args.continue_last or args.session):
+        console.print("[red]--fork requires -c or -s.[/]")
+        return 2
     if args.continue_last:
         existing = storage.list_sessions()
-        session = existing[0] if existing else Session()
+        if not existing:
+            console.print("[red]No sessions to continue in this workspace.[/] Run `rbit run \"prompt\"` first.")
+            return 1
+        session = existing[0]
     elif args.session:
-        session = storage.find_session(args.session) or Session()
+        found_session = storage.find_session(args.session)
+        if found_session is None:
+            console.print(f"[red]Session not found:[/] {markup_escape(str(args.session))}")
+            return 1
+        session = found_session
     else:
         session = Session()
 
     prompt_text = " ".join(args.prompt).strip()
     if getattr(args, "stdin", False):
-        stdin_text = sys.stdin.read().strip()
+        stdin_text = _read_stdin_text()
         prompt_text = (prompt_text + "\n\n" + stdin_text).strip()
     elif not prompt_text and not sys.stdin.isatty():
-        prompt_text = sys.stdin.read().strip()
+        # No prompt given: wait only briefly for piped input instead of hanging forever.
+        prompt_text = _read_stdin_text(timeout=float(os.environ.get("RBIT_STDIN_TIMEOUT", "5")))
     if getattr(args, "files", None):
         prompt_text = prompt_text + "".join(" @" + f for f in args.files)
 
@@ -129,7 +278,7 @@ async def _run_headless(args: argparse.Namespace) -> int:
         session = forked
     if getattr(args, "title", None) is not None:
         session.title = args.title or prompt_text[:44]
-    elif len(session.messages) == 0 and session.title == "New Session":
+    elif len(session.messages) == 0 and session.title in ("New Session", "Новая сессия", ""):
         session.title = prompt_text[:44]
     if getattr(args, "archived", False):
         session.archived = True
@@ -207,16 +356,30 @@ async def _run_headless(args: argparse.Namespace) -> int:
         elif show_thinking and not json_mode:
             console.print(piece, end="", style="dim", highlight=False)
 
-    reply = await engine.run_turn(
-        session=session,
-        user_msg=user_msg,
-        agent_mode=agent_mode,
-        model_id=model_id,
-        on_tool_start=on_tool_start,
-        on_tool_end=on_tool_end,
-        on_status=on_status,
-        on_reasoning_chunk=on_reasoning_chunk if (show_thinking or jsonl_mode) else None,
-    )
+    try:
+        reply = await engine.run_turn(
+            session=session,
+            user_msg=user_msg,
+            agent_mode=agent_mode,
+            model_id=model_id,
+            on_tool_start=on_tool_start,
+            on_tool_end=on_tool_end,
+            on_status=on_status,
+            on_reasoning_chunk=on_reasoning_chunk if (show_thinking or jsonl_mode) else None,
+        )
+    except Exception as exc:  # noqa: BLE001 - report as a failed run with a non-zero exit code
+        message = f"{type(exc).__name__}: {exc}"
+        try:
+            storage.save_session(session)
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+        if jsonl_mode:
+            _jsonl({"event": "done", "ok": False, "error": message, "session_id": session.id})
+        elif json_mode:
+            sys.stdout.write(json.dumps({"ok": False, "error": message, "session_id": session.id}, ensure_ascii=False, indent=2) + "\n")
+        else:
+            console.print(f"[bold #e06c75]Run failed:[/] {markup_escape(message)}")
+        return 1
     session.messages.append(reply)
     storage.save_session(session)
 
@@ -335,7 +498,7 @@ def _run_models(workspace: Path, provider: str | None, verbose: bool, refresh: b
                 engine.add_provider_models(fetched)
                 cfg["provider_models"] = [m.to_dict() for m in engine.extra_models]
                 storage.save_config(cfg)
-                console.print(f"[dim]cache refreshed: {message}[/]")
+                console.print(f"[dim]cache refreshed: {markup_escape(str(message))}[/]")
     for m in cfg.get("provider_models") or []:
         try:
             rows.append(ModelInfo.from_dict(m) if isinstance(m, dict) else m)
@@ -358,7 +521,7 @@ def _run_models(workspace: Path, provider: str | None, verbose: bool, refresh: b
         return 0
     for r in sorted(rows, key=lambda x: x.id):
         meta = f"  | {r.context_window:,} ctx | ${r.cost_per_1k}/1k" if verbose else ""
-        console.print(f"{r.id} [dim]({r.provider})[/]{meta}")
+        console.print(f"{markup_escape(str(r.id))} [dim]({markup_escape(str(r.provider))})[/]{meta}")
     return 0
 
 
@@ -439,11 +602,11 @@ def _run_auth(
         table.add_column("Model")
         for entry in entries:
             table.add_row(
-                str(entry["name"]),
+                markup_escape(str(entry["name"])),
                 "*" if entry["active"] else "",
-                str(entry["api_base"] or ""),
-                str(entry["api_key"]),
-                str(entry["model"] or ""),
+                markup_escape(str(entry["api_base"] or "")),
+                markup_escape(str(entry["api_key"])),
+                markup_escape(str(entry["model"] or "")),
             )
         console.print(table)
         return 0
@@ -499,7 +662,7 @@ def _run_auth(
                 cfg["api_key"] = ""
                 storage.delete_secret("api_key")
             storage.save_config(cfg)
-            console.print(f"credential removed: {cred_name}")
+            console.print(f"credential removed: {markup_escape(str(cred_name))}")
             return 0
         if name:
             # An unknown name must not fall through to wiping the active API key.
@@ -515,7 +678,7 @@ def _run_auth(
         target = (name or "").strip()
         credential = credentials.get(target)
         if not isinstance(credential, dict):
-            console.print(f"[red]Unknown credential:[/] {target or '(missing)'}")
+            console.print(f"[red]Unknown credential:[/] {markup_escape(str(target or '(missing)'))}")
             return 1
         cfg["active_credential"] = target
         cfg["api_base"] = credential.get("api_base") or cfg.get("api_base")
@@ -531,7 +694,7 @@ def _run_auth(
         if credential.get("model"):
             cfg["model"] = credential["model"]
         storage.save_config(cfg)
-        console.print(f"active credential: {target}")
+        console.print(f"active credential: {markup_escape(str(target))}")
         return 0
     if cmd == "export":
         resolved_credentials: dict[str, Any] = {}
@@ -544,12 +707,12 @@ def _run_auth(
             resolved_credentials[cred_name] = resolved
         data = {name: resolved_credentials[name]} if name else resolved_credentials
         if name and name not in credentials:
-            console.print(f"[red]Unknown credential:[/] {name}")
+            console.print(f"[red]Unknown credential:[/] {markup_escape(str(name))}")
             return 1
         text = json.dumps(data, ensure_ascii=False, indent=2)
         if file:
             Path(file).write_text(text + "\n", encoding="utf-8")
-            console.print(f"credentials written to {file}")
+            console.print(f"credentials written to {markup_escape(str(file))}")
         else:
             print(text)
         return 0
@@ -582,13 +745,14 @@ def _run_pr(workspace: Path, number: int) -> int:
     def git(*args: str):
         return subprocess.run(["git", *args], cwd=str(workspace), capture_output=True, text=True)
 
-    fetch = git("fetch", "origin", f"pull/{number}/head:pr-{number}")
+    number = int(number)
+    fetch = git("fetch", "origin", f"+pull/{number}/head:pr-{number}")
     if fetch.returncode != 0:
-        Console().print(f"[red]git fetch failed:[/] {fetch.stderr.strip()[:300]}")
+        Console().print(f"[red]git fetch failed:[/] {markup_escape(fetch.stderr.strip()[:300])}")
         return 1
     co = git("checkout", f"pr-{number}")
     if co.returncode != 0:
-        Console().print(f"[red]git checkout failed:[/] {co.stderr.strip()[:300]}")
+        Console().print(f"[red]git checkout failed:[/] {markup_escape(co.stderr.strip()[:300])}")
         return 1
     Console().print(f"[bold #7fd88f]OK[/] Checked out pr-{number}. Run `rbit` here to work on the PR.")
     return 0
@@ -605,7 +769,7 @@ def _run_agent(workspace: Path, cmd: str, name: str | None) -> int:
         found = sorted(skills_dir.glob("*.md")) if skills_dir.exists() else []
         if found:
             for f in found:
-                console.print(f"  - {f.stem}")
+                console.print(f"  - {markup_escape(f.stem)}")
         else:
             console.print("  (none - rbit agent create <name>)")
         return 0
@@ -614,7 +778,7 @@ def _run_agent(workspace: Path, cmd: str, name: str | None) -> int:
         skills_dir.mkdir(parents=True, exist_ok=True)
         target = skills_dir / f"{name}.md"
         if target.exists():
-            console.print(f"[red]Skill already exists:[/] {target}")
+            console.print(f"[red]Skill already exists:[/] {markup_escape(str(target))}")
             return 1
         body_lines = [
             "---",
@@ -626,18 +790,34 @@ def _run_agent(workspace: Path, cmd: str, name: str | None) -> int:
             "Describe the workflow, rules and output format here.",
         ]
         target.write_text(chr(10).join(body_lines) + chr(10), encoding="utf-8")
-        console.print(f"OK Skill agent created: {target}  -> run via /skill {name}")
+        console.print(f"OK Skill agent created: {markup_escape(str(target))}  -> run via /skill {markup_escape(name)}")
         return 0
     return 1
 
 
 def _changed_files(workspace: Path) -> list[str]:
-    proc = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD"], cwd=str(workspace), capture_output=True, text=True, check=False
-    )
+    """Changed (non-deleted) files relative to the workspace directory."""
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--name-only", "--relative", "--diff-filter=d", "HEAD"],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return []
     if proc.returncode != 0:
         return []
-    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    files = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    return [item for item in files if (workspace / item).exists()]
+
+
+def _is_test_path(path: Path) -> bool:
+    stem = path.stem.lower()
+    if stem.startswith("test_") or stem.endswith("_test") or stem in ("test", "tests", "conftest"):
+        return True
+    return bool(path.parts) and path.parts[0] in ("tests", "test")
 
 
 def _impacted_tests(workspace: Path, changed: list[str]) -> list[str]:
@@ -645,7 +825,7 @@ def _impacted_tests(workspace: Path, changed: list[str]) -> list[str]:
     seen: set[str] = set()
     for item in changed:
         path = Path(item)
-        if "test" in path.stem.lower() or path.parts and path.parts[0] in ("tests", "test"):
+        if _is_test_path(path):
             if item not in seen:
                 selected.append(item)
                 seen.add(item)
@@ -685,14 +865,20 @@ def _impacted_tests(workspace: Path, changed: list[str]) -> list[str]:
 
 def _run_test(workspace: Path, changed_only: bool, run: bool, as_json: bool) -> int:
     console = Console()
+    if changed_only and shutil.which("git") is None:
+        console.print("[red]git was not found in PATH; `rbit test --changed` needs git.[/]")
+        return 1
     changed = _changed_files(workspace)
     tests = _impacted_tests(workspace, changed) if changed_only else []
     command = detect_test_command(workspace)
+    argv: list[str] | None = None  # explicit argv (no shell) when file names are involved
     if changed_only and tests:
         if command and command.lower().startswith("pytest"):
-            command = f"{command} " + " ".join(f'"{item}"' for item in tests)
+            argv = [*shlex.split(command, posix=(os.name != "nt")), *tests]
         elif shutil.which("pytest"):
-            command = f'"{sys.executable}" -m pytest ' + " ".join(f'"{item}"' for item in tests)
+            argv = [sys.executable, "-m", "pytest", *tests]
+        if argv:
+            command = subprocess.list2cmdline(argv)
     if as_json:
         print(
             json.dumps(
@@ -708,16 +894,19 @@ def _run_test(workspace: Path, changed_only: bool, run: bool, as_json: bool) -> 
         return 0
     if changed_only:
         console.print("[bold]Changed files[/]")
-        console.print("\n".join(changed) or "(none)")
+        console.print(markup_escape("\n".join(changed)) or "(none)")
         console.print("\n[bold]Impacted tests[/]")
-        console.print("\n".join(tests) or "(none detected)")
+        console.print(markup_escape("\n".join(tests)) or "(none detected)")
     if not run:
         return 0
     if not command:
         console.print("[red]No test command detected.[/]")
         return 1
-    console.print(f"[bold]Running:[/] {command}")
-    proc = subprocess.run(command, cwd=str(workspace), shell=True, check=False)
+    console.print(f"[bold]Running:[/] {markup_escape(command)}")
+    if argv:
+        proc = subprocess.run(argv, cwd=str(workspace), check=False)
+    else:
+        proc = subprocess.run(command, cwd=str(workspace), shell=True, check=False)
     return proc.returncode
 
 
@@ -832,14 +1021,14 @@ def _run_replay(workspace: Path, session_id: str | None = None, as_json: bool = 
     if as_json:
         print(json.dumps(session.to_dict(), ensure_ascii=False, indent=2))
         return 0
-    console.print(f"[bold #fab283]{session.title}[/] [dim]{session.id}[/]")
+    console.print(f"[bold #fab283]{markup_escape(session.title)}[/] [dim]{markup_escape(session.id)}[/]")
     for message in session.messages:
         role = message.role.upper()
-        console.print(f"\n[bold]{role}[/]: {message.content[:2000]}")
+        console.print(f"\n[bold]{role}[/]: {markup_escape(message.content[:2000])}")
         for call in message.tool_calls:
-            console.print(f"  [cyan]→ {call.name}[/] {call.summary} [dim]({call.duration_ms} ms)[/]")
+            console.print(f"  [cyan]→ {markup_escape(str(call.name))}[/] {markup_escape(str(call.summary))} [dim]({call.duration_ms} ms)[/]")
             if call.output:
-                console.print(f"[dim]{call.output[:400]}[/]")
+                console.print(f"[dim]{markup_escape(call.output[:400])}[/]")
     return 0
 
 
@@ -998,7 +1187,7 @@ def _run_sessions_list(
     console = Console()
     storage = StorageManager(workspace)
     sessions = storage.list_sessions(include_archived=include_archived)
-    if max_count:
+    if max_count is not None and max_count >= 0:
         sessions = sessions[:max_count]
     if not sessions:
         if as_json:
@@ -1027,12 +1216,12 @@ def _run_sessions_list(
     tbl.add_column("Tokens", justify="right", style="#808080")
     tbl.add_column("Created", style="#808080")
     for s in sessions:
-        tbl.add_row(s.id, s.title, str(len(s.messages)), f"{s.total_tokens:,}", s.created_at)
+        tbl.add_row(markup_escape(s.id), markup_escape(s.title), str(len(s.messages)), f"{s.total_tokens:,}", markup_escape(s.created_at))
     console.print(tbl)
     return 0
 
 
-def _run_import(workspace: Path, source: str) -> int:
+def _run_import(workspace: Path, source: str, overwrite: bool = False) -> int:
     console = Console()
     storage = StorageManager(workspace)
     if source.startswith(("http://", "https://")):
@@ -1049,7 +1238,7 @@ def _run_import(workspace: Path, source: str) -> int:
     else:
         fpath = Path(source)
         if not fpath.exists():
-            console.print(f"[red]File not found:[/] {fpath}")
+            console.print(f"[red]File not found:[/] {markup_escape(str(fpath))}")
             return 1
         text = fpath.read_text(encoding="utf-8", errors="replace")
     messages = []
@@ -1061,12 +1250,27 @@ def _run_import(workspace: Path, source: str) -> int:
             console.print("[red]Invalid JSON session file.[/]")
             return 1
         if isinstance(data, dict) and "messages" in data:
-            data = _migrate_session_dict(data)
-            sess = Session.from_dict(data)
+            if not isinstance(data.get("messages"), list) or not all(isinstance(m, dict) for m in data["messages"]):
+                console.print("[red]Invalid session file:[/] `messages` must be a list of objects.")
+                return 1
+            try:
+                data = _migrate_session_dict(data)
+                sess = Session.from_dict(data)
+            except Exception as exc:  # noqa: BLE001 - malformed external data
+                console.print(f"[red]Invalid session file:[/] {markup_escape(str(exc))}")
+                return 1
+            if not overwrite and any(existing.id == sess.id for existing in storage.list_sessions(include_archived=True)):
+                console.print(
+                    f"[red]Session `{markup_escape(sess.id)}` already exists.[/] Use --overwrite to replace it."
+                )
+                return 1
             storage.save_session(sess)
             console.print(f"✓ Imported rbit session `{sess.id}` ({len(sess.messages)} messages)")
             return 0
         for m in data if isinstance(data, list) else []:
+            if not isinstance(m, dict):
+                console.print("[red]Invalid message list:[/] every entry must be an object with role/content.")
+                return 1
             role = str(m.get("role") or "user")
             if role in ("system", "user", "assistant"):
                 messages.append(ChatMessage(id=short_id(), role=role, content=str(m.get("content") or "")))
@@ -1107,7 +1311,7 @@ def _run_export(workspace: Path, session_id: str | None, out_file: str | None, f
         return 1
     target = storage.find_session(session_id) if session_id else sessions[0]
     if not target:
-        console.print(f"[bold #e06c75]Session '{session_id}' not found.[/]")
+        console.print(f"[bold #e06c75]Session '{markup_escape(str(session_id))}' not found.[/]")
         return 1
     fmt = str(fmt or "markdown")
     if fmt == "openai":
@@ -1116,7 +1320,7 @@ def _run_export(workspace: Path, session_id: str | None, out_file: str | None, f
         for m in target.messages:
             messages.append({"role": m.role, "content": m.content})
         out.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
-        console.print(f"[bold #7fd88f]✓ OpenAI-format export →[/] {out}")
+        console.print(f"[bold #7fd88f]✓ OpenAI-format export →[/] {markup_escape(str(out))}")
         return 0
     if fmt == "html":
         out = Path(out_file) if out_file else workspace / f"rbit-{target.id}.html"
@@ -1131,7 +1335,7 @@ def _run_export(workspace: Path, session_id: str | None, out_file: str | None, f
             ".diff-add{color:#7fd88f}.diff-del{color:#e06c75}</style>",
         ]
         for m in target.messages:
-            cls = m.role
+            cls = _html.escape(m.role, quote=True)
             parts.append(f"<div class='msg {cls}'><b>{_html.escape(m.role)}</b>")
             body = _html.escape(m.content)
             if m.role == "assistant" and m.tool_calls:
@@ -1147,11 +1351,11 @@ def _run_export(workspace: Path, session_id: str | None, out_file: str | None, f
             parts.append(body + "</div>")
         parts.append("</div>")
         out.write_text("".join(parts), encoding="utf-8")
-        console.print(f"[bold #7fd88f]✓ HTML export →[/] {out}")
+        console.print(f"[bold #7fd88f]✓ HTML export →[/] {markup_escape(str(out))}")
         return 0
     out_path = Path(out_file).resolve() if out_file else None
     saved = storage.export_session_markdown(target, out_path)
-    console.print(f"[bold #7fd88f]✓ Exported session `{target.id}` to:[/] {saved}")
+    console.print(f"[bold #7fd88f]✓ Exported session `{markup_escape(target.id)}` to:[/] {markup_escape(str(saved))}")
     return 0
 
 
@@ -1234,7 +1438,7 @@ def _run_map(workspace: Path, max_tokens: int | None = None, as_json: bool = Fal
         table.add_column("Lang", style="#808080")
         for item in listed[:20]:
             table.add_row(
-                item["path"],
+                markup_escape(item["path"]),
                 f"{item['bytes'] / 1024:,.1f} KB",
                 f"{item['est_tokens']:,}",
                 item["language"],
@@ -1318,11 +1522,21 @@ def _fetch_latest_pypi_version(name: str = "rbit", timeout: float = 4.0) -> str 
         return None
 
 
-def _run_update(check_only: bool = False, as_json: bool = False, target: str | None = None) -> int:
+_VERSION_RE = re.compile(r"\d+(\.\d+){0,3}((a|b|rc)\d+)?(\.post\d+)?(\.dev\d+)?")
+
+
+def _run_update(
+    check_only: bool = False, as_json: bool = False, target: str | None = None, assume_yes: bool = False
+) -> int:
     """Checks PyPI for a newer release and optionally upgrades the installed package."""
     console = Console()
     if target and not check_only:
         version = target.strip().lstrip("v")
+        if not _VERSION_RE.fullmatch(version):
+            console.print(f"[red]Invalid version:[/] {markup_escape(version)} (expected e.g. 1.2.3)")
+            return 2
+        if not _confirm(console, f"install package rbit=={version} from PyPI (runs pip)", assume_yes):
+            return 1
         cmd = [sys.executable, "-m", "pip", "install", f"rbit=={version}"]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         ok = proc.returncode == 0
@@ -1384,6 +1598,9 @@ def _run_update(check_only: bool = False, as_json: bool = False, target: str | N
             )
         return 0
 
+    # Bare `rbit update` is itself the request to upgrade; only an interactive session asks again.
+    if sys.stdin.isatty() and not _confirm(console, f"upgrade package rbit {current} -> {latest} from PyPI (runs pip)", assume_yes):
+        return 1
     cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "rbit"]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     ok = proc.returncode == 0
@@ -1411,7 +1628,18 @@ def _parse_age_spec(spec: str) -> float:
     return float(value * factor)
 
 
-def _run_sessions_prune(workspace: Path, age_spec: str) -> int:
+def _session_last_activity(session: Session) -> float:
+    """Epoch seconds of the newest message (fallback: creation time)."""
+    stamps: list[float] = []
+    for raw in [m.timestamp for m in session.messages[-1:]] + [session.created_at]:
+        try:
+            stamps.append(datetime.fromisoformat(str(raw)).timestamp())
+        except ValueError:
+            continue
+    return max(stamps) if stamps else time.time()
+
+
+def _run_sessions_prune(workspace: Path, age_spec: str, assume_yes: bool = False) -> int:
     console = Console()
     storage = StorageManager(workspace)
     storage.ensure_dirs()
@@ -1421,12 +1649,22 @@ def _run_sessions_prune(workspace: Path, age_spec: str) -> int:
         console.print(f"[bold #e06c75]{markup_escape(str(exc))}[/]")
         return 2
 
+    if seconds == 0 and not _confirm(console, "delete ALL sessions and checkpoints", assume_yes):
+        return 1
     cutoff = time.time() - seconds
     removed_sessions = 0
+    if storage._use_sqlite():
+        # SQLite backend: there are no per-session files; go through the storage API.
+        for session in storage.list_sessions(include_archived=True):
+            if _session_last_activity(session) < cutoff and storage.delete_session(session.id):
+                removed_sessions += 1
     for path in storage.sessions_dir.glob("*.json"):
         try:
             if path.stat().st_mtime < cutoff:
-                path.unlink()
+                if storage._use_sqlite():
+                    path.unlink()
+                elif not storage.delete_session(path.stem):
+                    path.unlink()
                 removed_sessions += 1
         except OSError:
             continue
@@ -1539,6 +1777,15 @@ from .completion import COMMANDS, COMPLETION_SCRIPTS, completion_script as _comp
 
 
 
+_COMMIT_ADD_PATHSPEC = (
+    ".",
+    ":(exclude,glob)**/.env",
+    ":(exclude,glob)**/.env.*",
+    ":(exclude,glob).rbit/**",
+    ":(exclude,glob)**/.rbit/**",
+)
+
+
 def _run_commit(workspace: Path, apply: bool = False, message: str | None = None, as_json: bool = False) -> int:
     console = Console()
 
@@ -1573,7 +1820,7 @@ def _run_commit(workspace: Path, apply: bool = False, message: str | None = None
             console.print(draft)
         return 0
 
-    add = git("add", "-A")
+    add = git("add", "-A", "--", *_COMMIT_ADD_PATHSPEC)
     if add.returncode != 0:
         console.print(f"[bold #e06c75]git add failed:[/] {markup_escape(add.stderr.strip())}")
         return 1
@@ -1586,7 +1833,7 @@ def _run_commit(workspace: Path, apply: bool = False, message: str | None = None
     if as_json:
         print(json.dumps({"ok": True, "applied": True, "message": draft}, ensure_ascii=False, indent=2))
     else:
-        console.print(f"[bold #7fd88f]Committed:[/] {subject}")
+        console.print(f"[bold #7fd88f]Committed:[/] {markup_escape(subject)}")
     return 0
 
 
@@ -1598,7 +1845,7 @@ def main(argv: list[str] | None = None) -> int:
         ("--verbose", logging.INFO),
         ("--trace", logging.DEBUG),
     ):
-        if flag in args_list:
+        if flag in args_list and not (flag == "--verbose" and args_list[:1] == ["models"]):
             args_list = [item for item in args_list if item != flag]
             log_level = level
     if log_level is not None:
@@ -1636,7 +1883,8 @@ def main(argv: list[str] | None = None) -> int:
         args_list = args_list[:idx] + args_list[idx + 2:]
 
     allow_outside = "--allow-outside" in args_list
-    if allow_outside:
+    if allow_outside and args_list[:1] not in (["run"], ["serve"], ["mobile"], ["web"]):
+        # those subcommands parse --allow-outside themselves; stripping it here would lose it
         args_list = [arg for arg in args_list if arg != "--allow-outside"]
 
     auto_approve = any(flag in args_list for flag in ("--auto", "--yolo", "--dangerously-skip-permissions"))
@@ -1663,7 +1911,7 @@ def main(argv: list[str] | None = None) -> int:
     subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "audit", "usage", "selftest", "skill", "migrate", "diag", "status", "test", "gh", "schedule", "risk", "replay", "reload", "pair", "mini"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
-        rest = args_list[1:]
+        rest = _normalize_subcommand_args(sub, args_list[1:])
 
         if sub == "run":
             p = argparse.ArgumentParser(prog="rbit run", description="Run rbit non-interactively in headless mode")
@@ -1685,7 +1933,7 @@ def main(argv: list[str] | None = None) -> int:
                 nargs="?",
                 const="",
                 default=None,
-                help="Run in a new git worktree, optionally with this name",
+                help="Run in a new git worktree; give a name as --worktree=NAME",
             )
             p.add_argument("--archived", action="store_true", help="Create the session archived")
             p.add_argument("--thinking", action="store_true", help="Show reasoning/thinking blocks")
@@ -1741,7 +1989,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if sub == "serve":
             p = argparse.ArgumentParser(prog="rbit serve", description="Local HTTP endpoint exposing rbit turns as NDJSON")
-            p.add_argument("--port", type=int, default=8333)
+            p.add_argument("--port", type=_port_arg, default=8333)
             p.add_argument("--hostname", default="127.0.0.1", help="Hostname to listen on")
             p.add_argument("-d", "--dir", help="Workspace directory")
             p.add_argument("--allow-outside", action="store_true")
@@ -1756,9 +2004,15 @@ def main(argv: list[str] | None = None) -> int:
             if parsed.service:
                 from rbit.service import ServiceManager
 
-                state = ServiceManager().start(
-                    _resolve_workspace(parsed.dir), host=parsed.hostname, port=parsed.port
-                )
+                from rbit.service import ServiceStartError
+
+                try:
+                    state = ServiceManager().start(
+                        _resolve_workspace(parsed.dir), host=parsed.hostname, port=parsed.port
+                    )
+                except ServiceStartError as exc:
+                    Console(stderr=True).print(f"[red]{markup_escape(str(exc))}[/]")
+                    return 1
                 Console().print(f"service started pid={state.pid} url={state.url}")
                 return 0
             return _run_serve(parsed, hostname=parsed.hostname, cors_origins=parsed.cors)
@@ -1768,7 +2022,7 @@ def main(argv: list[str] | None = None) -> int:
                 prog="rbit mobile",
                 description="Start a token-protected rbit server for the rbit iPhone app on your local network",
             )
-            p.add_argument("--port", type=int, default=8333)
+            p.add_argument("--port", type=_port_arg, default=8333)
             p.add_argument("--hostname", default="0.0.0.0", help="Hostname to listen on")
             p.add_argument("-d", "--dir", help="Workspace directory")
             p.add_argument("--allow-outside", action="store_true")
@@ -1938,10 +2192,11 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--day", help="Restrict to YYYY-MM-DD")
             p.add_argument("-n", "--lines", type=int, default=40, help="Entries for `tail`")
             p.add_argument("--json", action="store_true", help="Machine-readable output")
+            p.add_argument("-y", "--yes", action="store_true", help="Confirm `clear` without asking")
             p.add_argument("-d", "--dir", help="Workspace directory")
             parsed = p.parse_args(rest)
             return _run_audit(
-                _resolve_workspace(parsed.dir), parsed.action, parsed.day, parsed.lines, parsed.json
+                _resolve_workspace(parsed.dir), parsed.action, parsed.day, parsed.lines, parsed.json, parsed.yes
             )
 
         if sub == "completion":
@@ -1967,7 +2222,7 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("service_cmd", nargs="?", default="status", choices=["start", "stop", "status", "restart", "get", "set", "unset"])
             p.add_argument("key", nargs="?", help="Setting key (get/set/unset)")
             p.add_argument("value", nargs="?", help="Setting value (set)")
-            p.add_argument("--port", type=int, help="Port for start/restart")
+            p.add_argument("--port", type=_port_arg, help="Port for start/restart")
             p.add_argument("--hostname", default=None, help="Host for start/restart")
             p.add_argument("-d", "--dir", help="Workspace directory")
             parsed = p.parse_args(rest)
@@ -2020,13 +2275,14 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("target", nargs="?", help="Version to install")
             p.add_argument("--check", action="store_true")
             p.add_argument("--json", action="store_true")
+            p.add_argument("-y", "--yes", action="store_true", help="Install without asking for confirmation")
             parsed = p.parse_args(rest)
-            return _run_update(parsed.check, parsed.json, target=parsed.target)
+            return _run_update(parsed.check, parsed.json, target=parsed.target, assume_yes=parsed.yes)
 
         if sub == "uninstall":
             p = argparse.ArgumentParser(prog="rbit uninstall", description="Uninstall rbit, keeping user data")
             p.add_argument("--dry-run", action="store_true")
-            p.add_argument("-f", "--force", action="store_true")
+            p.add_argument("-f", "--force", "-y", "--yes", dest="force", action="store_true", help="Do not ask for confirmation")
             parsed = p.parse_args(rest)
             return _run_uninstall(parsed.dry_run, parsed.force)
 
@@ -2058,21 +2314,24 @@ def main(argv: list[str] | None = None) -> int:
             p = argparse.ArgumentParser(prog="rbit mcp", description="Manage and test MCP servers")
             p.add_argument("action", nargs="?", default="list", choices=["list", "test", "add", "remove", "auth", "logout"])
             p.add_argument("name", nargs="?", default="")
-            p.add_argument("command", nargs=argparse.REMAINDER, help="Command for a local server")
+            p.add_argument("command", nargs="*", help="Command for a local server (put it after `--`)")
             p.add_argument("--url", help="Remote streamable-HTTP endpoint")
             p.add_argument("--token", help="OAuth/bearer token for a remote server")
             p.add_argument("--header", action="append", default=None, help="Header name=value")
             p.add_argument("--env", action="append", default=None, help="Environment name=value for local servers")
             p.add_argument("-d", "--dir", help="Workspace directory")
-            parsed = p.parse_args(rest)
+            mcp_head, mcp_command = _split_mcp_args(rest)
+            parsed = p.parse_args(mcp_head)
+            parsed.command = mcp_command
             return _run_mcp(parsed)
 
         if sub == "import":
             p = argparse.ArgumentParser(prog="rbit import", description="Import a session from JSON (rbit or OpenAI messages), Markdown, or a URL")
             p.add_argument("file", help="Path or URL to .json/.md")
+            p.add_argument("--overwrite", action="store_true", help="Replace an existing session with the same id")
             p.add_argument("-d", "--dir", help="Workspace directory")
             parsed = p.parse_args(rest)
-            return _run_import(_resolve_workspace(parsed.dir), parsed.file)
+            return _run_import(_resolve_workspace(parsed.dir), parsed.file, parsed.overwrite)
 
         if sub == "test":
             p = argparse.ArgumentParser(prog="rbit test", description="Detect and optionally run tests")
@@ -2142,27 +2401,28 @@ def main(argv: list[str] | None = None) -> int:
             del_p.add_argument("session_id", help="Session id or prefix")
             imp_p = sub2.add_parser("import", help="Import a session from JSON/Markdown/URL")
             imp_p.add_argument("file", help="Path or URL")
+            imp_p.add_argument("--overwrite", action="store_true", help="Replace an existing session with the same id")
             exp_p = sub2.add_parser("export", help="Export a session")
             exp_p.add_argument("session", nargs="?", help="Session id (defaults to latest)")
             exp_p.add_argument("-o", "--output", help="Output path")
             p.add_argument("-d", "--dir", help="Workspace directory")
-            p.add_argument("-n", "--max-count", type=int, default=None, help="Limit to N sessions")
+            p.add_argument("-n", "--max-count", type=_nonneg_int, default=None, help="Limit to N sessions")
             p.add_argument("--json", action="store_true", help="Output JSON")
             p.add_argument("--all", action="store_true", help="Include archived sessions")
             parsed = p.parse_args(rest)
             workspace = _resolve_workspace(parsed.dir)
             if parsed.session_cmd == "import":
-                return _run_import(workspace, parsed.file)
+                return _run_import(workspace, parsed.file, getattr(parsed, "overwrite", False))
             if parsed.session_cmd == "export":
                 return _run_export(workspace, parsed.session, parsed.output)
             if parsed.session_cmd == "delete":
                 storage = StorageManager(workspace)
                 target = storage.find_session(parsed.session_id)
                 if not target:
-                    Console().print(f"[red]Session not found:[/] {parsed.session_id}")
+                    Console().print(f"[red]Session not found:[/] {markup_escape(parsed.session_id)}")
                     return 1
                 storage.delete_session(target.id)
-                Console().print(f"OK Deleted session `{target.id}` ({target.title})")
+                Console().print(f"OK Deleted session `{markup_escape(target.id)}` ({markup_escape(target.title)})")
                 return 0
             return _run_sessions_list(
                 workspace,
@@ -2173,7 +2433,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if sub == "web":
             p = argparse.ArgumentParser(prog="rbit web", description="Start the rbit backend and open the desktop UI in a browser")
-            p.add_argument("--port", type=int, default=8333)
+            p.add_argument("--port", type=_port_arg, default=8333)
             p.add_argument("-d", "--dir", help="Workspace directory")
             p.add_argument("--allow-outside", action="store_true")
             parsed = p.parse_args(rest)
@@ -2214,7 +2474,7 @@ def main(argv: list[str] | None = None) -> int:
                 for f in sorted(state_dir.rglob("*")):
                     if f.is_file():
                         zf.write(f, f.relative_to(workspace))
-            Console().print(f"Backed up .rbit → {out}")
+            Console().print(f"Backed up .rbit → {markup_escape(str(out))}")
             return 0
 
         if sub == "describe":
@@ -2300,13 +2560,14 @@ def main(argv: list[str] | None = None) -> int:
             p = argparse.ArgumentParser(prog="rbit sessions")
             p.add_argument("dir", nargs="?", help="Workspace directory")
             p.add_argument("--prune", metavar="AGE", help="Delete sessions/checkpoints older than e.g. 30d, 12h, 2w")
-            p.add_argument("-n", "--max-count", type=int, default=None, help="Limit to N most recent sessions")
+            p.add_argument("-y", "--yes", action="store_true", help="Do not ask for confirmation (needed for --prune 0)")
+            p.add_argument("-n", "--max-count", type=_nonneg_int, default=None, help="Limit to N most recent sessions")
             p.add_argument("--json", action="store_true", help="Output JSON")
             p.add_argument("--all", action="store_true", help="Include archived sessions")
             parsed = p.parse_args(rest)
             workspace = _resolve_workspace(parsed.dir)
             if parsed.prune:
-                return _run_sessions_prune(workspace, parsed.prune)
+                return _run_sessions_prune(workspace, parsed.prune, parsed.yes)
             return _run_sessions_list(
                 workspace,
                 max_count=parsed.max_count,
@@ -2424,6 +2685,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"rbit v{__version__}")
         return 0
 
+    if parsed.target and not Path(parsed.target).expanduser().is_dir():
+        Console(stderr=True).print(
+            f"[red]Unknown command or directory:[/] {markup_escape(parsed.target)}. Run `rbit --help` for the list of commands."
+        )
+        return 2
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        Console(stderr=True).print(
+            "[red]The interactive UI needs a terminal.[/] Use `rbit run \"prompt\"` for non-interactive use."
+        )
+        return 2
     workspace = _resolve_workspace(parsed.target)
     storage = StorageManager(workspace)
 
@@ -2474,7 +2745,7 @@ def _run_mcp(args: argparse.Namespace) -> int:
         if args.url:
             configs[name] = {"type": "remote", "url": args.url}
         else:
-            command = " ".join(args.command).strip()
+            command = [part for part in args.command if part != "--"]
             if not command:
                 console.print("[bold #e06c75]Missing command or --url.[/]")
                 return 2
@@ -2487,7 +2758,7 @@ def _run_mcp(args: argparse.Namespace) -> int:
             configs[name]["environment"] = environment
         cfg["mcp"] = configs
         storage.save_config(cfg)
-        console.print(f"[bold #7fd88f]✓[/] MCP server added: {name}")
+        console.print(f"[bold #7fd88f]✓[/] MCP server added: {markup_escape(name)}")
         return 0
 
     if action == "auth":
@@ -2509,7 +2780,7 @@ def _run_mcp(args: argparse.Namespace) -> int:
         tokens[name] = token
         cfg["mcp_oauth"] = tokens
         storage.save_config(cfg)
-        console.print(f"stored MCP token for {name}")
+        console.print(f"stored MCP token for {markup_escape(name)}")
         return 0
 
     if action == "logout":
@@ -2552,19 +2823,19 @@ def _run_mcp(args: argparse.Namespace) -> int:
             table.add_column("Status")
             for name, status in manager.status.items():
                 if status.get("connected"):
-                    table.add_row(name, str(status.get("transport")), str(status.get("tools")), "[#7fd88f]connected[/]")
+                    table.add_row(markup_escape(name), str(status.get("transport")), str(status.get("tools")), "[#7fd88f]connected[/]")
                 else:
                     table.add_row(
-                        name,
+                        markup_escape(name),
                         str(status.get("transport")),
                         "0",
-                        f"[#e06c75]{status.get('error') or 'not connected'}[/]",
+                        f"[#e06c75]{markup_escape(str(status.get('error') or 'not connected'))}[/]",
                     )
             console.print(table)
             if action == "test" and manager.tools:
                 console.print("\n[bold]Tools[/]")
                 for exposed, tool in manager.tools.items():
-                    console.print(f"  • [bold]{exposed}[/] — {tool.description[:100]}")
+                    console.print(f"  • [bold]{markup_escape(exposed)}[/] — {markup_escape(tool.description[:100])}")
             failed = [name for name, status in manager.status.items() if not status.get("connected")]
             return 1 if failed else 0
         finally:
@@ -2616,7 +2887,7 @@ def _parse_pairs(values: list[str] | None) -> dict[str, str]:
 
 
 def _run_service(args: argparse.Namespace) -> int:
-    from rbit.service import ServiceManager
+    from rbit.service import ServiceManager, ServiceStartError
 
     console = Console()
     manager = ServiceManager()
@@ -2626,8 +2897,12 @@ def _run_service(args: argparse.Namespace) -> int:
     host = getattr(args, "hostname", None) or str(settings.get("host") or "127.0.0.1")
     port = getattr(args, "port", None) or (int(settings["port"]) if str(settings.get("port") or "").isdigit() else None)
     if cmd == "start":
-        state = manager.start(workspace, host=host, port=port)
-        console.print(f"[#7fd88f]service started[/] pid={state.pid} url={state.url} log={state.log}")
+        try:
+            state = manager.start(workspace, host=host, port=port)
+        except ServiceStartError as exc:
+            console.print(f"[red]{markup_escape(str(exc))}[/]")
+            return 1
+        console.print(f"[#7fd88f]service started[/] pid={state.pid} url={state.url} log={markup_escape(state.log)}")
         return 0
     if cmd == "stop":
         stopped = manager.stop()
@@ -2656,11 +2931,11 @@ def _run_service(args: argparse.Namespace) -> int:
         return 0
     if cmd == "set":
         manager.set_setting(args.key, args.value)
-        console.print(f"service setting saved: {args.key}={args.value}")
+        console.print(f"service setting saved: {markup_escape(str(args.key))}={markup_escape(str(args.value))}")
         return 0
     if cmd == "unset":
         removed = manager.unset_setting(args.key)
-        console.print(f"service setting removed: {args.key}" if removed else f"not set: {args.key}")
+        console.print(f"service setting removed: {markup_escape(str(args.key))}" if removed else f"not set: {markup_escape(str(args.key))}")
         return 0 if removed else 1
     console.print(f"unknown service command: {cmd}")
     return 2
@@ -2685,7 +2960,7 @@ def _run_api(args: argparse.Namespace) -> int:
         elif needle in API_OPERATIONS:
             method, path = API_OPERATIONS[needle]
         else:
-            console.print(f"[red]Unknown operation:[/] {needle}")
+            console.print(f"[red]Unknown operation:[/] {markup_escape(str(needle))}")
             console.print("Operations: " + ", ".join(sorted(API_OPERATIONS)))
             return 2
     else:
@@ -2748,7 +3023,7 @@ def _run_plugin(args: argparse.Namespace) -> int:
         table.add_column("Source")
         table.add_column("Status")
         for entry in entries:
-            table.add_row(entry["target"], entry["source"], entry.get("status") or "configured")
+            table.add_row(markup_escape(str(entry["target"])), markup_escape(str(entry["source"])), markup_escape(str(entry.get("status") or "configured")))
         console.print(table)
         return 0
     if cmd == "add":
@@ -2761,7 +3036,7 @@ def _run_plugin(args: argparse.Namespace) -> int:
             console.print("No updates available.")
             return 0
         for item in updates:
-            console.print(f"{item['target']}: {item.get('current') or '?'} -> {item.get('latest') or '?'}")
+            console.print(markup_escape(f"{item['target']}: {item.get('current') or '?'} -> {item.get('latest') or '?'}"))
         return 0
     if cmd == "update":
         result = manager.update(args.target)
@@ -2790,12 +3065,12 @@ def _run_debug(args: argparse.Namespace) -> int:
         console.print("  - plan: read-only planning")
         console.print("[bold #eeeeee]Subagents[/]")
         for name, definition in sorted(agents.items()):
-            console.print(f"  - {name}: {definition.description or '(no description)'}")
+            console.print(f"  - {markup_escape(str(name))}: {markup_escape(str(definition.description or '(no description)'))}")
         skills = load_skills(workspace)
         if skills:
             console.print("[bold #eeeeee]Skills[/]")
             for name, meta in sorted(skills.items()):
-                console.print(f"  - {name}: {meta.get('description') or '(no description)'}")
+                console.print(f"  - {markup_escape(str(name))}: {markup_escape(str(meta.get('description') or '(no description)'))}")
         return 0
     if cmd == "config":
         cfg = storage.load_config()
@@ -2805,9 +3080,9 @@ def _run_debug(args: argparse.Namespace) -> int:
         for profile in (redacted.get("profiles") or {}).values():
             if isinstance(profile, dict) and profile.get("api_key"):
                 profile["api_key"] = "***"
-        console.print(f"[bold]Config file:[/] {storage.config_path}")
-        console.print(f"[bold]Workspace:[/] {workspace}")
-        console.print(f"[bold]Profile env:[/] {os.environ.get('RBIT_PROFILE') or '(none)'}")
+        console.print(f"[bold]Config file:[/] {markup_escape(str(storage.config_path))}")
+        console.print(f"[bold]Workspace:[/] {markup_escape(str(workspace))}")
+        console.print(f"[bold]Profile env:[/] {markup_escape(os.environ.get('RBIT_PROFILE') or '(none)')}")
         console.print_json(data=redacted)
         return 0
     if cmd == "paths":
@@ -2857,11 +3132,9 @@ def _run_uninstall(dry_run: bool = False, force: bool = False) -> int:
     if dry_run:
         console.print("[dim]dry run - nothing removed[/]")
         return 0
-    if not force and sys.stdin.isatty():
-        answer = input("Uninstall rbit? [y/N] ").strip().lower()
-        if answer not in ("y", "yes"):
-            console.print("cancelled")
-            return 1
+    if not _confirm(console, "Uninstall rbit", force):
+        console.print("cancelled")
+        return 1
     proc = subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "rbit"], capture_output=True, text=True)
     if proc.returncode == 0:
         console.print("[#7fd88f]rbit uninstalled. Session data was kept in ~/.rbit.[/]")
@@ -2876,6 +3149,7 @@ def _run_reload(server: str | None = None) -> int:
     from rbit.service import ServiceManager
 
     console = Console()
+    token = os.environ.get("RBIT_SERVER_TOKEN", "")
     if server:
         url = server.rstrip("/")
     else:
@@ -2884,8 +3158,10 @@ def _run_reload(server: str | None = None) -> int:
             console.print("[red]No running service.[/] Start one with `rbit service start`.")
             return 1
         url = state.url
+        token = state.token
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
     try:
-        response = httpx.post(f"{url}/v1/reload", timeout=10.0)
+        response = httpx.post(f"{url}/v1/reload", headers=headers, timeout=10.0)
     except httpx.HTTPError as exc:
         console.print(f"[red]reload failed:[/] {markup_escape(str(exc))}")
         return 1
@@ -3007,7 +3283,7 @@ def _run_schedule(args: argparse.Namespace) -> int:
     cmd = args.schedule_cmd or "list"
     if cmd == "list":
         rows = scheduler.describe()
-        console.print("\n".join(rows) if rows else "No schedules.")
+        console.print(markup_escape("\n".join(rows)) if rows else "No schedules.")
         return 0
     if cmd == "add":
         entry, error = scheduler.add(
@@ -3018,13 +3294,13 @@ def _run_schedule(args: argparse.Namespace) -> int:
             agent=args.agent or "build",
         )
         if entry is None:
-            console.print(f"[red]schedule:[/] {error}")
+            console.print(f"[red]schedule:[/] {markup_escape(str(error))}")
             return 1
-        console.print(f"created {entry['id']} ({entry['schedule']})")
+        console.print(f"created {entry['id']} ({markup_escape(str(entry['schedule']))})")
         return 0
     if cmd == "remove":
         removed = scheduler.remove(args.target)
-        console.print(("removed " if removed else "not found: ") + args.target)
+        console.print(("removed " if removed else "not found: ") + markup_escape(args.target))
         return 0 if removed else 1
     if cmd == "run-due":
         return asyncio.run(_run_schedule_due(workspace))
@@ -3032,21 +3308,50 @@ def _run_schedule(args: argparse.Namespace) -> int:
     return 2
 
 
+async def _execute_schedule_entry(
+    workspace: Path, storage: StorageManager, cfg: dict[str, Any], entry: dict[str, Any]
+) -> str:
+    """Run one scheduled prompt as an agent turn; returns the reply text."""
+    session = Session(title=f"Schedule: {entry.get('name') or entry.get('id')}")
+    executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=lambda: cfg)
+    executor.always_allow_bash = True
+    engine = AgentEngine(workspace=workspace, executor=executor, get_config=lambda: cfg, storage=storage)
+    user = ChatMessage(id=short_id(), role="user", content=str(entry.get("prompt") or ""))
+    session.messages.append(user)
+
+    async def _noop(_record: Any) -> None:
+        return None
+
+    async def _status(_text: str) -> None:
+        return None
+
+    model_id = str(entry.get("model") or cfg.get("model", "rbit/smart-local"))
+    reply = await engine.run_turn(
+        session=session,
+        user_msg=user,
+        agent_mode=str(entry.get("agent") or "build"),
+        model_id=model_id,
+        on_tool_start=_noop,
+        on_tool_end=_noop,
+        on_status=_status,
+    )
+    session.messages.append(reply)
+    storage.save_session(session)
+    return reply.content
+
+
 async def _run_schedule_due(workspace: Path) -> int:
     from rbit.scheduler import Scheduler
 
     console = Console()
     scheduler = Scheduler(workspace)
+    from rbit.scheduler import acquire_lock
+
     lock_path = workspace / ".rbit" / "schedules.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
+    if not acquire_lock(lock_path):
         console.print("Another schedule runner is active.")
         return 1
     try:
-        os.write(lock_fd, str(os.getpid()).encode())
-        os.close(lock_fd)
         entries = scheduler.due()
         if not entries:
             console.print("No scheduled prompts are due.")
@@ -3055,38 +3360,21 @@ async def _run_schedule_due(workspace: Path) -> int:
         cfg = storage.load_config()
         ran = 0
         for entry in entries:
-            session = Session(title=f"Schedule: {entry.get('name') or entry.get('id')}")
-            executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=lambda: cfg)
-            executor.always_allow_bash = True
-            engine = AgentEngine(workspace=workspace, executor=executor, get_config=lambda: cfg, storage=storage)
-            user = ChatMessage(id=short_id(), role="user", content=str(entry.get("prompt") or ""))
-            session.messages.append(user)
-
-            async def _noop(_record: Any) -> None:
-                return None
-
-            async def _status(_text: str) -> None:
-                return None
-
-            model_id = str(entry.get("model") or cfg.get("model", "rbit/smart-local"))
-            reply = await engine.run_turn(
-                session=session,
-                user_msg=user,
-                agent_mode=str(entry.get("agent") or "build"),
-                model_id=model_id,
-                on_tool_start=_noop,
-                on_tool_end=_noop,
-                on_status=_status,
-            )
-            session.messages.append(reply)
-            storage.save_session(session)
+            label = markup_escape(str(entry.get("name") or entry.get("id")))
             recurring = str(entry.get("schedule") or "").lower().startswith(("every", "daily")) or len(
                 str(entry.get("schedule") or "").split()
             ) == 5
             next_run = scheduler.next_run(str(entry.get("schedule") or ""), after=time.time() + 1) if recurring else None
-            scheduler.mark_run(str(entry.get("id")), next_run=next_run)
-            console.print(f"ran {entry.get('name')}: {reply.content[:200]}")
-            ran += 1
+            try:
+                reply_text = await _execute_schedule_entry(workspace, storage, cfg, entry)
+                console.print(f"ran {label}: {markup_escape(reply_text[:200])}")
+                ran += 1
+            except Exception as exc:  # noqa: BLE001 - one failing schedule must not stop the others
+                console.print(f"[red]schedule {label} failed:[/] {markup_escape(f'{type(exc).__name__}: {exc}')}")
+            try:
+                scheduler.mark_run(str(entry.get("id")), next_run=next_run)
+            except Exception as exc:  # noqa: BLE001 - never crash the runner on a bookkeeping write
+                console.print(f"[red]could not record run for {label}:[/] {markup_escape(str(exc))}")
         return 0 if ran else 1
     finally:
         try:
@@ -3130,6 +3418,42 @@ def _config_set(cfg: dict[str, Any], dotted: str, value: Any) -> None:
     current[parts[-1]] = value
 
 
+#: (min, max) bounds for numeric top-level keys (None = unbounded).
+CONFIG_RANGES: dict[str, tuple[float | None, float | None]] = {
+    "max_tokens": (1, None),
+    "auto_compact_at": (1, 100),
+    "budget_usd": (0, None),
+}
+CONFIG_ENUMS: dict[str, tuple[str, ...]] = {"effort": ("auto", "low", "medium", "high")}
+
+
+def _config_value_error(key: str, value: Any) -> str | None:
+    """Validate a top-level config value against the schema; returns an error or None."""
+    expected = CONFIG_TYPES.get(key)
+    if expected is not None and (
+        not isinstance(value, expected) or (isinstance(value, bool) and bool not in _as_tuple(expected))
+    ):
+        names = "/".join(t.__name__ for t in _as_tuple(expected))
+        return f"{key}: expected {names}, got {type(value).__name__}"
+    if key in ("model", "api_base") and isinstance(value, str) and not value.strip():
+        return f"{key}: must not be empty"
+    if key in CONFIG_ENUMS and value not in CONFIG_ENUMS[key]:
+        return f"{key}: must be one of {', '.join(CONFIG_ENUMS[key])}"
+    if key in CONFIG_RANGES:
+        low, high = CONFIG_RANGES[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return f"{key}: expected a number, got {type(value).__name__}"
+        if low is not None and value < low:
+            return f"{key}: must be >= {low}"
+        if high is not None and value > high:
+            return f"{key}: must be <= {high}"
+    return None
+
+
+def _as_tuple(expected: type | tuple[type, ...]) -> tuple[type, ...]:
+    return expected if isinstance(expected, tuple) else (expected,)
+
+
 CONFIG_TYPES: dict[str, type | tuple[type, ...]] = {
     "model": str,
     "api_base": str,
@@ -3166,7 +3490,7 @@ def _run_config(
             return 2
         found, item = _config_get(cfg, key)
         if not found:
-            console.print(f"[red]Unknown key:[/] {key}")
+            console.print(f"[red]Unknown key:[/] {markup_escape(str(key))}")
             return 1
         if key in ("api_key", "token", "server_token"):
             item = "***" if item else ""
@@ -3176,13 +3500,28 @@ def _run_config(
         if not key or value is None:
             console.print("[red]config set requires KEY VALUE[/]")
             return 2
-        try:
-            parsed = json.loads(value)
-        except ValueError:
-            parsed = value
+        root = key.split(".")[0]
+        if CONFIG_TYPES.get(root) is str and "." not in key and not value.lstrip().startswith('"'):
+            parsed = value  # string-typed key: never reinterpret `123`/`true` as JSON
+        else:
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                parsed = value
+        if "." in key:
+            root_type = CONFIG_TYPES.get(root)
+            if root_type is not None and dict not in _as_tuple(root_type):
+                console.print(f"[red]Invalid value:[/] {markup_escape(root)} does not accept nested keys")
+                return 2
+            problem = _config_value_error(key, parsed) if key in CONFIG_RANGES else None
+        else:
+            problem = _config_value_error(key, parsed)
+        if problem:
+            console.print(f"[red]Invalid value:[/] {markup_escape(problem)}")
+            return 2
         _config_set(cfg, key, parsed)
         storage.save_config(cfg)
-        console.print(f"config updated: {key}")
+        console.print(f"config updated: {markup_escape(str(key))}")
         return 0
     if action == "unset":
         if not key:
@@ -3193,25 +3532,26 @@ def _run_config(
         for part in parts[:-1]:
             current = current.get(part) if isinstance(current, dict) else None
         if not isinstance(current, dict) or parts[-1] not in current:
-            console.print(f"[red]Unknown key:[/] {key}")
+            console.print(f"[red]Unknown key:[/] {markup_escape(str(key))}")
             return 1
         del current[parts[-1]]
         storage.save_config(cfg)
-        console.print(f"config removed: {key}")
+        console.print(f"config removed: {markup_escape(str(key))}")
         return 0
     if action == "validate":
         errors: list[str] = []
-        for key_name, expected in CONFIG_TYPES.items():
+        for key_name in {*CONFIG_TYPES, *CONFIG_RANGES, *CONFIG_ENUMS}:
             if key_name not in cfg:
                 continue
-            if not isinstance(cfg[key_name], expected):
-                errors.append(f"{key_name}: expected {getattr(expected, '__name__', expected)}")
+            problem = _config_value_error(key_name, cfg[key_name])
+            if problem:
+                errors.append(problem)
         if isinstance(cfg.get("permissions"), list):
             for index, rule in enumerate(cfg["permissions"]):
                 if not isinstance(rule, dict) or not {"action", "resource", "effect"} <= set(rule):
                     errors.append(f"permissions[{index}]: action/resource/effect required")
         for message in errors:
-            console.print(f"[red]✗[/] {message}")
+            console.print(f"[red]✗[/] {markup_escape(str(message))}")
         if not errors:
             console.print("[#7fd88f]✓ config is valid[/]")
         return 1 if errors else 0
@@ -3236,11 +3576,16 @@ def _run_config(
         }
         print(json.dumps(schema, ensure_ascii=False, indent=2))
         return 0
+    if action == "edit":
         editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or ("notepad" if os.name == "nt" else "vi")
         storage.state_dir.mkdir(parents=True, exist_ok=True)
         if not storage.config_path.exists():
             storage.save_config(cfg)
-        return subprocess.run([editor, str(storage.config_path)], check=False).returncode
+        try:
+            return subprocess.run([*shlex.split(editor, posix=(os.name != "nt")), str(storage.config_path)], check=False).returncode
+        except OSError as exc:
+            console.print(f"[red]Cannot start editor:[/] {markup_escape(str(exc))}")
+            return 1
     console.print(f"[red]Unknown config action:[/] {action}")
     return 2
 
@@ -3303,7 +3648,7 @@ def _run_skill(
             console.print("All installed skills match their recorded source.")
             return 0
         for warning in warnings:
-            console.print(f"[yellow]![/] {warning}")
+            console.print(f"[yellow]![/] {markup_escape(str(warning))}")
         return 0
 
     rows = [r for r in list_installed(workspace) if r["kind"] == "skill"]
@@ -3318,7 +3663,7 @@ def _run_skill(
     table.add_column("Source")
     table.add_column("Remote")
     for row in rows:
-        table.add_row(row["name"], str(row["source"])[:60], "yes" if row["remote"] else "no")
+        table.add_row(markup_escape(str(row["name"])), markup_escape(str(row["source"])[:60]), "yes" if row["remote"] else "no")
     console.print(table)
     return 0
 
@@ -3396,7 +3741,7 @@ def _run_plugin(
     table.add_column("Source")
     table.add_column("Remote")
     for row in rows:
-        table.add_row(row["name"], str(row["source"])[:60], "yes" if row["remote"] else "no")
+        table.add_row(markup_escape(str(row["name"])), markup_escape(str(row["source"])[:60]), "yes" if row["remote"] else "no")
     console.print(table)
     return 0
 
@@ -3411,7 +3756,7 @@ def _run_migrate(workspace: Path, dry_run: bool) -> int:
         console.print(result.summary())
         return 0
     for change in result.changes:
-        console.print(f"  - {change}")
+        console.print(f"  - {markup_escape(str(change))}")
     if result.backup is not None:
         console.print(f"backup: {result.backup}")
     console.print(result.summary())
@@ -3538,6 +3883,7 @@ def _run_audit(
     day: str | None,
     lines: int,
     as_json: bool,
+    assume_yes: bool = False,
 ) -> int:
     """Reads the append-only agent action log (`.rbit/audit/*.jsonl`)."""
     from rbit.audit import AuditLog
@@ -3556,6 +3902,8 @@ def _run_audit(
         return 0
 
     if action == "clear":
+        if not _confirm(console, f"delete the audit log in {log.dir}", assume_yes):
+            return 1
         removed = 0
         for path in log.dir.glob("*.jsonl"):
             try:
@@ -3587,11 +3935,11 @@ def _run_audit(
                 colour = "green" if entry.get("decision") == "allow" else "red"
                 console.print(
                     f"{ts} perm [{colour}]{entry.get('decision')}[/] "
-                    f"{entry.get('action')} {str(entry.get('resource') or '')[:60]} "
-                    f"({entry.get('reason')})"
+                    f"{markup_escape(str(entry.get('action')))} {markup_escape(str(entry.get('resource') or '')[:60])} "
+                    f"({markup_escape(str(entry.get('reason')))})"
                 )
             else:
-                console.print(f"{ts} {event} {json.dumps({k: v for k, v in entry.items() if k not in ('ts', 'event')}, ensure_ascii=False)[:120]}")
+                console.print(markup_escape(f"{ts} {event} {json.dumps({k: v for k, v in entry.items() if k not in ('ts', 'event')}, ensure_ascii=False)[:120]}"))
         return 0
 
     summary = log.summary(day)
@@ -3640,17 +3988,17 @@ def _run_permissions(workspace: Path, action: str, resource: str | None = None) 
             for mode_id, _label, description, cmd_auto, edit_auto in mode_table():
                 marker = "-> " if mode_id == current else "   "
                 table.add_row(
-                    f"{marker}{mode_id}",
+                    markup_escape(f"{marker}{mode_id}"),
                     "auto" if cmd_auto else "ask",
                     "auto" if edit_auto else "ask",
-                    description,
+                    markup_escape(str(description)),
                 )
             console.print(table)
             console.print(f"Current: [bold]{current}[/]")
             return 0
         requested = normalize_permission_mode(resource, default="")
         if not requested:
-            console.print(f"[red]Unknown mode:[/] {resource}. Use: {', '.join(MODE_IDS)}")
+            console.print(f"[red]Unknown mode:[/] {markup_escape(str(resource))}. Use: {markup_escape(', '.join(MODE_IDS))}")
             return 2
         storage.save_config({**cfg, "permission_mode": requested})
         console.print(f"permission mode -> [bold]{requested}[/]")
@@ -3666,7 +4014,7 @@ def _run_permissions(workspace: Path, action: str, resource: str | None = None) 
         table.add_column("Effect")
         for rule in rules if isinstance(rules, list) else []:
             if isinstance(rule, dict):
-                table.add_row(str(rule.get("action")), str(rule.get("resource")), str(rule.get("effect")))
+                table.add_row(markup_escape(str(rule.get("action"))), markup_escape(str(rule.get("resource"))), markup_escape(str(rule.get("effect"))))
         console.print(table)
         return 0
     if action in ("explain", "check"):
@@ -3679,7 +4027,7 @@ def _run_permissions(workspace: Path, action: str, resource: str | None = None) 
             return 2
         action_name, resource_name = parts
         effect = executor.resolve_permission_effect(action_name, resource_name, "build")
-        console.print(f"{action_name} {resource_name} -> {effect or 'no-rule (allow)'}")
+        console.print(markup_escape(f"{action_name} {resource_name} -> {effect or 'no-rule (allow)'}"))
         return 0
     console.print(f"[red]Unknown permissions action:[/] {action}")
     return 2
@@ -3722,14 +4070,14 @@ def _run_logs(workspace: Path, lines: int = 200, as_json: bool = False) -> int:
     state = manager.read()
     path = Path(state.log) if state and state.log else (workspace / ".rbit" / "service.log")
     if not path.exists():
-        console.print(f"[yellow]No log file:[/] {path}")
+        console.print(f"[yellow]No log file:[/] {markup_escape(str(path))}")
         return 1
     content = path.read_text(encoding="utf-8", errors="replace").splitlines()
     tail = content[-max(1, lines) :]
     if as_json:
         print(json.dumps({"path": str(path), "lines": tail}, ensure_ascii=False, indent=2))
     else:
-        console.print(f"[dim]{path}[/]")
+        console.print(f"[dim]{markup_escape(str(path))}[/]")
         console.print("\n".join(tail))
     return 0
 
@@ -4103,8 +4451,9 @@ def _run_serve(
     ):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        turn_cfg = dict(cfg)  # per-turn copy: an `effort` override must not leak into other turns
         try:
-            executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=lambda: cfg)
+            executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=lambda: turn_cfg)
             approvals_on = os.environ.get("RBIT_APPROVALS") == "1"
             executor.always_allow_bash = not approvals_on
 
@@ -4137,7 +4486,7 @@ def _run_serve(
             if approvals_on:
                 executor.permission_cb = _permission
             executor.allow_outside_paths = bool(getattr(args, "allow_outside", False))
-            engine = AgentEngine(workspace=workspace, executor=executor, storage=storage, get_config=lambda: cfg)
+            engine = AgentEngine(workspace=workspace, executor=executor, storage=storage, get_config=lambda: turn_cfg)
 
             async def on_status(text: str) -> None:
                 if text:
@@ -4194,7 +4543,7 @@ def _run_serve(
                     }
                 )
                 if effort_override in EFFORT_LEVELS:
-                    cfg["effort"] = effort_override
+                    turn_cfg["effort"] = effort_override
                 agent_mode = agent_override if agent_override in ("build", "plan") else "build"
                 reply = await engine.run_turn(
                     session=session,
@@ -4254,6 +4603,10 @@ def _run_serve(
             sink.put(None)
             loop.close()
 
+    MAX_REQUEST_BODY = 10 * 1024 * 1024
+    HEARTBEAT_SECONDS = 15.0
+    BODY_READ_TIMEOUT = 30.0
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a) -> None:  # quiet
             return
@@ -4312,6 +4665,72 @@ def _run_serve(
                         return True
             return False
 
+        def _begin(self) -> bool:
+            """Authorize, then normalise `self.path` (query string stripped) once."""
+            if not self._authorized():
+                self._deny()
+                return False
+            from urllib.parse import urlsplit
+
+            self.raw_path = self.path
+            self.path = urlsplit(self.path).path or "/"
+            return True
+
+        def _read_json(self) -> dict[str, Any] | None:
+            """Read the request body as a JSON object; on failure send a JSON error and return None."""
+            raw_length = self.headers.get("Content-Length")
+            try:
+                length = int(raw_length) if raw_length not in (None, "") else 0
+            except ValueError:
+                self._send_json({"error": "invalid Content-Length"}, 400)
+                return None
+            if length < 0:
+                self._send_json({"error": "invalid Content-Length"}, 400)
+                return None
+            if length > MAX_REQUEST_BODY:
+                self.close_connection = True  # the oversized body is left unread
+                self._send_json({"error": "request body too large", "limit": MAX_REQUEST_BODY}, 413)
+                return None
+            try:
+                self.connection.settimeout(BODY_READ_TIMEOUT)
+                data = self.rfile.read(length) if length else b""
+                self.connection.settimeout(None)
+            except (OSError, TimeoutError):
+                self.close_connection = True
+                self._send_json({"error": "timed out reading request body"}, 408)
+                return None
+            if not data.strip():
+                return {}
+            try:
+                obj = _json.loads(data)
+            except (ValueError, UnicodeDecodeError):
+                self._send_json({"error": "invalid JSON body"}, 400)
+                return None
+            if not isinstance(obj, dict):
+                self._send_json({"error": "JSON body must be an object"}, 400)
+                return None
+            return obj
+
+        def _not_found(self) -> None:
+            self._send_json({"error": "not found", "path": self.path}, 404)
+
+        def _method_not_allowed(self) -> None:
+            if not self._begin():
+                return
+            body = _json.dumps({"error": "method not allowed", "method": self.command}).encode("utf-8")
+            self.send_response(405)
+            self._cors()
+            self.send_header("Allow", "GET, POST, DELETE, OPTIONS")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        do_PUT = _method_not_allowed  # noqa: N815
+        do_PATCH = _method_not_allowed  # noqa: N815
+        do_HEAD = _method_not_allowed  # noqa: N815
+
         def _deny(self) -> None:
             self.send_response(401)
             self._cors()
@@ -4347,8 +4766,7 @@ def _run_serve(
             self.end_headers()
 
         def do_GET(self) -> None:  # noqa: N802
-            if not self._authorized():
-                self._deny()
+            if not self._begin():
                 return
             if self.path == "/health":
                 self._send_json(
@@ -4438,8 +4856,8 @@ def _run_serve(
             elif self.path.startswith("/v1/fs"):
                 from urllib.parse import parse_qs, unquote, urlparse
 
-                query = parse_qs(urlparse(self.path).query)
-                raw = unquote((query.get("path") or ["."])[0])
+                query = parse_qs(urlparse(self.raw_path).query)
+                raw = (query.get("path") or ["."])[0]  # parse_qs already decoded it once
                 try:
                     target = (workspace / raw).resolve() if not Path(raw).is_absolute() else Path(raw).resolve()
                     rel_parts = target.relative_to(workspace.resolve()).parts
@@ -4581,18 +4999,16 @@ def _run_serve(
 
                 sid = unquote(urlparse(self.path).path.rsplit("/", 1)[-1])
                 with session_lock:
-                    sess = storage.find_session(sid)
+                    sess = storage.find_session(sid) if sid else None
                 if not sess:
                     self._send_json({"error": "session not found", "id": sid}, 404)
                     return
                 self._send_json(_session_payload(sess))
             else:
-                self.send_response(404)
-                self.end_headers()
+                self._not_found()
 
         def do_POST(self) -> None:  # noqa: N802
-            if not self._authorized():
-                self._deny()
+            if not self._begin():
                 return
             if self.path == "/v1/reload":
                 nonlocal cfg, model_id, pair_token
@@ -4612,49 +5028,56 @@ def _run_serve(
                 self.wfile.write(body)
                 return
             if self.path == "/v1/artifacts":
-                length = int(self.headers.get("Content-Length") or 0)
-                try:
-                    req = _json.loads(self.rfile.read(length) or b"{}")
-                except ValueError:
-                    req = {}
+                req = self._read_json()
+                if req is None:
+                    return
                 name = str(req.get("name") or "").strip()
                 if not name:
                     self._send_json({"error": "name is required"}, 422)
                     return
-                safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or "artifact"
+                # \w keeps non-ASCII letters (so "отчёт" and "план" stay distinct); a name
+                # with no usable characters falls back to a hash of the original.
+                safe = re.sub(r"[^\w.-]+", "-", name).strip("-.")
+                if not safe:
+                    import hashlib
+
+                    safe = "artifact-" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
                 if not Path(safe).suffix:
                     safe += ".md"
                 directory = storage.state_dir / "artifacts"
                 directory.mkdir(parents=True, exist_ok=True)
+                if (directory / safe).exists() and not req.get("overwrite"):
+                    self._send_json({"error": "artifact already exists", "name": safe, "hint": "pass overwrite: true"}, 409)
+                    return
                 (directory / safe).write_text(str(req.get("content") or ""), encoding="utf-8")
                 self._send_json({"name": safe, "size": (directory / safe).stat().st_size}, 201)
                 return
             if self.path == "/v1/schedules":
-                length = int(self.headers.get("Content-Length") or 0)
-                try:
-                    req = _json.loads(self.rfile.read(length) or b"{}")
-                except ValueError:
-                    req = {}
+                req = self._read_json()
+                if req is None:
+                    return
                 from rbit.scheduler import Scheduler
 
-                entry, error = Scheduler(workspace).add(
-                    str(req.get("prompt") or ""),
-                    str(req.get("schedule") or ""),
-                    name=str(req.get("name") or ""),
-                    model=str(req.get("model") or ""),
-                    agent=str(req.get("agent") or "build"),
-                )
+                try:
+                    entry, error = Scheduler(workspace).add(
+                        str(req.get("prompt") or ""),
+                        str(req.get("schedule") or ""),
+                        name=str(req.get("name") or ""),
+                        model=str(req.get("model") or ""),
+                        agent=str(req.get("agent") or "build"),
+                    )
+                except Exception as exc:  # noqa: BLE001 - always answer with JSON, never drop the connection
+                    self._send_json({"error": f"cannot create schedule: {exc}"}, 422)
+                    return
                 if entry is None:
                     self._send_json({"error": error}, 422)
                 else:
                     self._send_json({"schedule": entry}, 201)
                 return
             if self.path == "/v1/sessions":
-                length = int(self.headers.get("Content-Length") or 0)
-                try:
-                    req = _json.loads(self.rfile.read(length) or b"{}")
-                except ValueError:
-                    req = {}
+                req = self._read_json()
+                if req is None:
+                    return
                 s = Session()
                 s.title = (str(req.get("title") or "").strip()[:80] or "Новая сессия")
                 s.archived = bool(req.get("archived"))
@@ -4664,23 +5087,27 @@ def _run_serve(
                 self._send_json(_session_payload(s), 201)
                 return
             if self.path.startswith("/v1/sessions/") and self.path.endswith("/rename"):
-                sid = self.path[len("/v1/sessions/") : -len("/rename")]
-                length = int(self.headers.get("Content-Length") or 0)
-                try:
-                    req = _json.loads(self.rfile.read(length) or b"{}")
-                except ValueError:
-                    self.send_response(400)
-                    self.end_headers()
+                from urllib.parse import unquote
+
+                sid = unquote(self.path[len("/v1/sessions/") : -len("/rename")])
+                req = self._read_json()
+                if req is None:
                     return
                 title = str(req.get("title") or "").strip()[:80]
-                sess = storage.find_session(sid)
-                if not sess or not title:
-                    self.send_response(404)
-                    self.end_headers()
+                if not title:
+                    self._send_json({"error": "title is required"}, 422)
                     return
-                sess.title = title
                 with session_lock:
-                    storage.save_session(sess)
+                    sess = storage.find_session(sid) if sid else None
+                    if sess:
+                        sess.title = title
+                        storage.save_session(sess)
+                        cached = sessions.get(sess.id)
+                        if cached is not None:
+                            cached.title = title
+                if not sess:
+                    self._send_json({"error": "session not found", "id": sid}, 404)
+                    return
                 self._send_json({"ok": True, "id": sess.id, "title": title})
                 return
             if self.path.startswith("/v1/sessions/") and self.path.split("?", 1)[0].endswith("/abort"):
@@ -4690,7 +5117,7 @@ def _run_serve(
                 with active_lock:
                     entry = active_turns.get(sid)
                 aborted = False
-                if entry is not None:
+                if entry is not None and entry.get("loop") is not None and entry.get("task") is not None:
                     try:
                         entry["loop"].call_soon_threadsafe(entry["task"].cancel)
                         aborted = True
@@ -4699,12 +5126,8 @@ def _run_serve(
                 self._send_json({"ok": True, "aborted": aborted, "id": sid})
                 return
             if self.path == "/v1/approvals":
-                length = int(self.headers.get("Content-Length") or 0)
-                try:
-                    req = _json.loads(self.rfile.read(length) or b"{}")
-                except ValueError:
-                    self.send_response(400)
-                    self.end_headers()
+                req = self._read_json()
+                if req is None:
                     return
                 aid = str(req.get("id") or "")
                 entry = approvals.pop(aid, None) if aid else None
@@ -4728,29 +5151,35 @@ def _run_serve(
                 self.wfile.write(body)
                 return
             if self.path != "/v1/turns":
-                self.send_response(404)
-                self.end_headers()
+                self._not_found()
                 return
-            length = int(self.headers.get("Content-Length") or 0)
-            try:
-                req = _json.loads(self.rfile.read(length) or b"{}")
-            except ValueError:
-                self.send_response(400)
-                self.end_headers()
+            req = self._read_json()
+            if req is None:
                 return
             prompt_text = str(req.get("prompt") or "").strip()
             if not prompt_text:
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"error": "prompt is required"}')
+                self._send_json({"error": "prompt is required"}, 400)
                 return
-            sid = str(req.get("session_id") or "")
+            raw_sid = req.get("session_id")
+            sid = "" if raw_sid is None else str(raw_sid).strip()
+            if raw_sid is not None and not sid:
+                self._send_json({"error": "session not found", "id": ""}, 404)
+                return
             with session_lock:
-                session = sessions.get(sid) or (storage.find_session(sid) if sid else None) or Session()
+                if sid:
+                    session = sessions.get(sid) or storage.find_session(sid)
+                    if session is None:
+                        self._send_json({"error": "session not found", "id": sid}, 404)
+                        return
+                else:
+                    session = Session()
                 sessions[session.id] = session
+            # Check-and-register atomically: two concurrent POSTs for one session
+            # must not both start a turn (the loser gets 409).
             with active_lock:
                 busy = session.id in active_turns
+                if not busy:
+                    active_turns[session.id] = {"loop": None, "task": None, "started": _time.time()}
             if busy:
                 self._send_json(
                     {
@@ -4768,12 +5197,6 @@ def _run_serve(
             agent_req = str(req.get("agent") or req.get("mode") or "").strip()
             effort_req = str(req.get("effort") or "").strip().lower()
 
-            self.send_response(200)
-            self._cors()
-            self.send_header("Content-Type", "application/x-ndjson")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
             events: _queue.Queue = _queue.Queue()
             worker = _threading.Thread(
                 target=run_turn_events,
@@ -4781,10 +5204,27 @@ def _run_serve(
                 daemon=True,
                 name=f"rbit-turn-{session.id}",
             )
-            worker.start()
+            try:
+                worker.start()
+            except Exception:
+                with active_lock:
+                    active_turns.pop(session.id, None)
+                raise
             disconnected = False
+            try:
+                self.send_response(200)
+                self._cors()
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                disconnected = True
             while True:
-                item = events.get()
+                try:
+                    item = events.get(timeout=HEARTBEAT_SECONDS)
+                except _queue.Empty:
+                    item = {"type": "ping"}  # keepalive: also detects a vanished client
                 if item is None:
                     break
                 if disconnected:
@@ -4794,16 +5234,25 @@ def _run_serve(
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     disconnected = True
+                    if cfg.get("cancel_on_disconnect"):
+                        with active_lock:
+                            running = active_turns.get(session.id)
+                        if running and running.get("loop") is not None and running.get("task") is not None:
+                            try:
+                                running["loop"].call_soon_threadsafe(running["task"].cancel)
+                            except RuntimeError:
+                                pass
 
         def do_DELETE(self) -> None:  # noqa: N802
-            if not self._authorized():
-                self._deny()
+            if not self._begin():
                 return
             if self.path.startswith("/v1/schedules/"):
                 from rbit.scheduler import Scheduler
 
-                target = self.path.rsplit("/", 1)[-1]
-                ok = Scheduler(workspace).remove(target)
+                from urllib.parse import unquote
+
+                target = unquote(self.path.rsplit("/", 1)[-1])
+                ok = bool(target) and Scheduler(workspace).remove(target)
                 self._send_json({"deleted": ok, "id": target}, 200 if ok else 404)
                 return
             if self.path.startswith("/v1/artifacts/"):
@@ -4817,12 +5266,17 @@ def _run_serve(
                 self._send_json({"deleted": ok, "name": name}, 200 if ok else 404)
                 return
             if not self.path.startswith("/v1/sessions/"):
-                self.send_response(404)
-                self.end_headers()
+                self._not_found()
                 return
-            sid = self.path.rsplit("/", 1)[-1]
-            ok = bool(storage.find_session(sid)) and storage.delete_session(sid)
-            body = _json.dumps({"deleted": bool(ok), "id": sid}).encode("utf-8")
+            from urllib.parse import unquote
+
+            sid = unquote(self.path[len("/v1/sessions/") :].strip("/"))
+            with session_lock:
+                found = storage.find_session(sid) if sid else None
+                ok = bool(found) and storage.delete_session(found.id)
+                if found is not None:
+                    sessions.pop(found.id, None)  # drop it from the in-memory cache too
+            body = _json.dumps({"deleted": bool(ok), "id": found.id if found else sid}).encode("utf-8")
             self.send_response(200 if ok else 404)
             self._cors()
             self.send_header("Content-Type", "application/json")
@@ -4830,7 +5284,15 @@ def _run_serve(
             self.end_headers()
             self.wfile.write(body)
 
-    server = ThreadingHTTPServer((hostname, args.port), Handler)
+    try:
+        server = ThreadingHTTPServer((hostname, args.port), Handler)
+    except OSError as exc:
+        Console(stderr=True).print(
+            f"[red]Cannot listen on {markup_escape(hostname)}:{args.port}:[/] {markup_escape(str(exc))}. "
+            "The port may already be in use; pick another with --port."
+        )
+        return 1
+    args.port = server.server_address[1]  # resolves --port 0
     if open_browser:
         import webbrowser
         import threading as _threading2
@@ -4853,7 +5315,7 @@ def _run_serve(
             links = _mobile_links(args.port, server_token or "")
         console.print()
         console.print("[bold #fab283]rbit mobile[/]  [dim]сервер для iPhone[/]")
-        console.print(f"[#808080]Проект:[/] {workspace}")
+        console.print(f"[#808080]Проект:[/] {markup_escape(str(workspace))}")
         console.print(f"[#808080]Адрес:[/]  http://{hostname}:{args.port}")
         console.print(f"[#808080]Токен:[/]  {server_token or '(без токена)'}")
         if links:
@@ -4891,8 +5353,26 @@ def _run_serve(
     return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+def _scan_tree(workspace: Path, snapshot: dict[str, float], report: bool = True) -> list[str]:
+    """Update `snapshot` with file mtimes and return new/modified files.
+
+    Walks the tree pruning heavy directories (never descends into .git/node_modules).
+    """
+    skip = {".rbit", ".git", ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache"}
+    changed: list[str] = []
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for name in files:
+            full = Path(root) / name
+            try:
+                mtime = full.stat().st_mtime
+            except OSError:
+                continue
+            rel = str(full.relative_to(workspace))
+            if report and snapshot.get(rel) != mtime:
+                changed.append(rel)
+            snapshot[rel] = mtime
+    return changed
 
 
 def _run_watch(workspace: Path, run_prompt: str | None, interval: float) -> int:
@@ -4901,7 +5381,7 @@ def _run_watch(workspace: Path, run_prompt: str | None, interval: float) -> int:
 
     snapshot: dict[str, float] = {}
     console = Console()
-    console.print(f"[bold #7fd88f]Watching[/] {workspace} (Ctrl+C to stop)")
+    console.print(f"[bold #7fd88f]Watching[/] {markup_escape(str(workspace))} (Ctrl+C to stop)")
     storage = StorageManager(workspace)
     cfg = storage.load_config()
     engine_holder: dict[str, object] = {}
@@ -4930,30 +5410,24 @@ def _run_watch(workspace: Path, run_prompt: str | None, interval: float) -> int:
         )
         console.print(f"[bold #7fd88f]rbit[/] {markup_escape(reply.content[:600])}")
 
-    def scan() -> list[str]:
-        changed: list[str] = []
-        for f in workspace.rglob("*"):
-            if not f.is_file() or any(part in (".rbit", ".git", ".venv", "node_modules", "__pycache__") for part in f.parts):
-                continue
-            try:
-                mtime = f.stat().st_mtime
-            except OSError:
-                continue
-            rel = str(f.relative_to(workspace))
-            if snapshot.get(rel, mtime) != mtime:
-                changed.append(rel)
-            snapshot[rel] = mtime
-        return changed
+    def scan(report: bool = True) -> list[str]:
+        return _scan_tree(workspace, snapshot, report)
 
-    scan()  # baseline
+    scan(report=False)  # baseline
     try:
         while True:
             time.sleep(interval)
             changed = scan()
             if changed:
-                console.print("[bold #fab283]changed:[/]", ", ".join(changed[:8]))
+                time.sleep(min(max(interval, 0.2), 1.0))  # debounce: let a burst of saves settle
+                changed = sorted(set(changed) | set(scan()))
+                console.print("[bold #fab283]changed:[/]", markup_escape(", ".join(changed[:8])))
                 if run_prompt:
-                    asyncio.run(react(changed))
+                    try:
+                        asyncio.run(react(changed))
+                    except Exception as exc:  # noqa: BLE001 - keep watching after a failed turn
+                        console.print(f"[bold #e06c75]watch turn failed:[/] {markup_escape(str(exc))}")
+                    scan(report=False)  # ignore edits made by the agent itself
     except KeyboardInterrupt:
         console.print("\nStopped.")
     return 0
@@ -4987,7 +5461,7 @@ def _run_voice(seconds: float, model_size: str) -> int:
     console.print("Transcribing…")
     result = whisper.load_model(model_size).transcribe(np.squeeze(audio))
     text = str(result.get("text") or "").strip()
-    console.print(f"[bold #7fd88f]Prompt:[/] {text}")
+    console.print(f"[bold #7fd88f]Prompt:[/] {markup_escape(text)}")
     try:
         import pyperclip
 
@@ -4997,3 +5471,7 @@ def _run_voice(seconds: float, model_size: str) -> int:
         pass
     return 0
 
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -35,5 +35,8 @@ USER rbit
 
 WORKDIR /workspace
 
+# The image is a CLI, so the health check verifies the installed entrypoint runs.
+HEALTHCHECK --interval=60s --timeout=10s --retries=3 CMD ["rbit", "--help"]
+
 ENTRYPOINT ["rbit"]
 CMD ["--help"]

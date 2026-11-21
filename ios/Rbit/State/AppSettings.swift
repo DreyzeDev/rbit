@@ -51,10 +51,6 @@ struct AppSettings: Codable, Equatable {
     }
 }
 
-enum RbitRemoteDefaults {
-    static let serverURL = "https://31.77.11.16/rbit"
-}
-
 struct EffortOption: Identifiable {
     let id: String
     let title: String

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from rich.table import Table
 from rich.text import Text
 from textual import on
@@ -126,8 +128,10 @@ class PromptHistoryModal(ModalScreen[str | None]):
 
     def __init__(self, history: list[str]) -> None:
         super().__init__()
-        self._all = list(dict.fromkeys(history))  # newest first, deduped
+        # History is stored oldest-first; show newest first, deduped.
+        self._all = list(dict.fromkeys(reversed(history)))
         self._query = ""
+        self._prompts: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="oc-modal"):
@@ -143,9 +147,13 @@ class PromptHistoryModal(ModalScreen[str | None]):
     def _refresh_list(self) -> None:
         ol = self.query_one("#history-list", OptionList)
         ol.clear_options()
+        self._prompts = {}
         for item in self._all:
             if self._query.lower() in item.lower():
-                ol.add_option(Option(item[:160], id=str(abs(hash(item)))))
+                option_id = f"h{len(self._prompts)}"
+                self._prompts[option_id] = item
+                # Text, not str: prompts may contain "[...]" which is markup.
+                ol.add_option(Option(Text(item[:160].replace("\n", " ")), id=option_id))
         if ol.option_count:
             ol.highlighted = 0
 
@@ -155,8 +163,9 @@ class PromptHistoryModal(ModalScreen[str | None]):
             self._refresh_list()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        if event.option is not None and event.option.prompt is not None:
-            self.dismiss(str(event.option.prompt))
+        full = self._prompts.get(event.option_id or "")
+        if full is not None:
+            self.dismiss(full)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -523,7 +532,7 @@ class EffortSelectorModal(ModalScreen[str | None]):
             yield Static(_modal_header("Reasoning effort"), classes="oc-modal-header")
             if self.model_id:
                 yield Static(
-                    f"[#808080]Model:[/] [bold #fab283]{self.model_id}[/]",
+                    Text.assemble(("Model: ", "#808080"), (self.model_id, "bold #fab283")),
                     classes="oc-perm-body",
                 )
             yield OptionList(id="effort-list", classes="oc-modal-list")
@@ -566,6 +575,7 @@ class SessionPickerModal(ModalScreen[tuple[str, str] | None]):
         super().__init__()
         self.sessions = sessions
         self.current_id = current_id
+        self._delete_armed: tuple[str, float] | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="oc-modal"):
@@ -597,11 +607,30 @@ class SessionPickerModal(ModalScreen[tuple[str, str] | None]):
         elif event.option_id:
             self.dismiss(("switch", event.option_id))
 
+    #: Seconds within which a second Ctrl+D confirms the deletion.
+    DELETE_CONFIRM_WINDOW = 3.0
+
     def action_del_sess(self) -> None:
         olist = self.query_one("#session-list", OptionList)
-        if olist.highlighted is not None and olist.highlighted > 0:
-            target = self.sessions[olist.highlighted - 1]
+        if olist.highlighted is None or olist.highlighted <= 0:
+            return
+        if olist.highlighted - 1 >= len(self.sessions):
+            return
+        target = self.sessions[olist.highlighted - 1]
+        now = time.monotonic()
+        armed = self._delete_armed
+        if armed is not None and armed[0] == target.id and now - armed[1] <= self.DELETE_CONFIRM_WINDOW:
+            self._delete_armed = None
             self.dismiss(("delete", target.id))
+            return
+        # First press only arms the deletion: it is irreversible.
+        self._delete_armed = (target.id, now)
+        self.notify(
+            f"Press ctrl+d again within {self.DELETE_CONFIRM_WINDOW:.0f}s to delete "
+            f"“{target.title[:30]}”.",
+            severity="warning",
+            timeout=self.DELETE_CONFIRM_WINDOW,
+        )
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -682,9 +711,10 @@ class TodoManagerModal(ModalScreen[list[TodoItem] | None]):
     def _refresh_list(self, keep_idx: int = 0) -> None:
         olist = self.query_one("#todo-modal-list", OptionList)
         olist.clear_options()
-        for t in self.todos:
+        for idx, t in enumerate(self.todos):
             mark = "[✓]" if t.status == "completed" else ("[•]" if t.status == "in_progress" else "[ ]")
-            olist.add_option(Option(_two_col_option(f"{mark} {t.content}", t.priority), id=t.id))
+            # Index as id: todo ids may repeat (hand-edited or legacy sessions).
+            olist.add_option(Option(_two_col_option(f"{mark} {t.content}", t.priority), id=f"todo-{idx}"))
         if self.todos:
             olist.highlighted = min(max(0, keep_idx), len(self.todos) - 1)
 
@@ -787,6 +817,7 @@ class SearchResultsModal(ModalScreen[str | None]):
         self._sessions = [session] + [s for s in (all_sessions or []) if s.id != session.id]
         self._query = query
         self._hits: list[tuple[str, str, str]] = []
+        self._hit_targets: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="oc-modal"):
@@ -819,8 +850,12 @@ class SearchResultsModal(ModalScreen[str | None]):
         if not query.strip():
             self.query_one("#search-session-foot", Label).update("type to search messages and tool output")
             return
-        for mid, label, snippet in self._hits:
-            olist.add_option(Option(_two_col_option(f"{label} · {snippet}", "") , id=mid))
+        self._hit_targets = {}
+        for i, (mid, label, snippet) in enumerate(self._hits):
+            # Several hits can fall into one message: option ids must stay unique.
+            option_id = f"{mid}#{i}"
+            self._hit_targets[option_id] = mid
+            olist.add_option(Option(_two_col_option(f"{label} · {snippet}", ""), id=option_id))
         foot = self.query_one("#search-session-foot", Label)
         count = len(self._hits)
         foot.update(f"{count} match{'es' if count != 1 else ''} · enter jump · esc close")
@@ -840,8 +875,9 @@ class SearchResultsModal(ModalScreen[str | None]):
 
     @on(OptionList.OptionSelected, "#search-session-list")
     def _on_selected(self, event: OptionList.OptionSelected) -> None:
-        if event.option_id:
-            self.dismiss(event.option_id)
+        target = self._hit_targets.get(event.option_id or "")
+        if target:
+            self.dismiss(target)
 
     def action_cancel(self) -> None:
         self.dismiss(None)

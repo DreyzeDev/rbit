@@ -45,6 +45,37 @@ class MigrationResult:
         return f"{verb} {len(self.changes)} setting(s)"
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Temp file in the same folder + fsync + os.replace (with a Windows retry)."""
+    import os
+    import tempfile
+    import time
+
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        for attempt in range(8):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def _backup_path(path: Path) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return path.with_name(f"{path.stem}.backup-{stamp}{path.suffix}")
@@ -60,14 +91,26 @@ def _migrate_values(config: dict[str, Any]) -> list[str]:
         changes.append("auto_approve -> permission_mode: auto")
 
     # A bare `budget_usd` was per-session; map it to a daily cap + mode.
-    legacy_budget = config.pop("budget_usd", None)
-    if isinstance(legacy_budget, (int, float)) and legacy_budget > 0:
-        config.setdefault("daily_budget_usd", float(legacy_budget))
-        config.setdefault("budget_mode", "strict")
-        changes.append(
-            f"budget_usd: {legacy_budget} -> daily_budget_usd: {float(legacy_budget)} "
-            "+ budget_mode: strict"
-        )
+    legacy_raw = config.get("budget_usd")
+    try:
+        legacy_budget = float(legacy_raw) if legacy_raw not in (None, "", True, False) else 0.0
+    except (TypeError, ValueError):
+        legacy_budget = 0.0
+    if legacy_budget > 0:
+        if config.get("daily_budget_usd"):
+            # Both exist: keep the legacy value instead of silently dropping it.
+            changes.append(
+                f"budget_usd: {legacy_raw} kept (daily_budget_usd already set to "
+                f"{config['daily_budget_usd']})"
+            )
+        else:
+            config.pop("budget_usd", None)
+            config["daily_budget_usd"] = legacy_budget
+            config.setdefault("budget_mode", "strict")
+            changes.append(
+                f"budget_usd: {legacy_raw} -> daily_budget_usd: {legacy_budget} "
+                "+ budget_mode: strict"
+            )
 
     # The old `permission` mapping is still honoured, but a mode is clearer.
     legacy_perm = config.get("permission")
@@ -114,7 +157,7 @@ def migrate_config(workspace: Path, *, dry_run: bool = False) -> MigrationResult
     if not path.is_file():
         return result
     try:
-        config = json.loads(path.read_text(encoding="utf-8"))
+        config = json.loads(path.read_text(encoding="utf-8-sig"))
     except (json.JSONDecodeError, OSError):
         return result
     if not isinstance(config, dict):
@@ -128,7 +171,7 @@ def migrate_config(workspace: Path, *, dry_run: bool = False) -> MigrationResult
         backup = _backup_path(path)
         shutil.copy2(path, backup)
         result.backup = backup
-        path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_text(path, json.dumps(config, ensure_ascii=False, indent=2))
     except OSError:
         result.changes = []
     return result

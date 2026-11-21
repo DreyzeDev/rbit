@@ -6,8 +6,11 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -39,6 +42,12 @@ MAX_PARALLEL_TOOLS = 4
 HISTORY_UNITS = 24
 TOOL_HISTORY_CHARS = 2000
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
+#: Upper bound for a server-requested `Retry-After` wait, in seconds.
+RETRY_AFTER_CAP = 60.0
+#: Safety ceiling for history units; the real limit is the model's token window.
+MAX_HISTORY_UNITS = 400
+#: Rough token cost of one attached image (its base64 text is never counted).
+IMAGE_TOKENS = 800
 logger = logging.getLogger("rbit.agent")
 HTTP_LIMITS = httpx.Limits(max_keepalive_connections=10, max_connections=20)
 
@@ -298,6 +307,11 @@ class AgentEngine:
         self._active_profile_tools: set[str] | None = None
         self._active_profile_readonly: bool = False
         self._active_variant: str | None = None
+        #: Provider-reported usage of the latest chat step (None when absent).
+        self._step_usage: dict[str, Any] | None = None
+        #: Token accounting of the running turn (provider usage, else estimates).
+        self._turn_in = 0
+        self._turn_out = 0
         self._auto_design_section = ""
         self._opencode_session = ""
 
@@ -358,15 +372,116 @@ class AgentEngine:
         }
         return cached
 
+    @staticmethod
+    def _parse_retry_after(raw: Any) -> float | None:
+        """Seconds from a `Retry-After` header: delta-seconds or an HTTP-date."""
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            try:
+                when = parsedate_to_datetime(text)
+            except (TypeError, ValueError, IndexError):
+                return None
+            if when is None:
+                return None
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            value = (when - datetime.now(timezone.utc)).total_seconds()
+        if value != value or value in (float("inf"), float("-inf")):  # nan / inf
+            return None
+        return max(value, 0.0)
+
     def _retry_delay(self, attempt: int, resp: httpx.Response | None = None) -> float:
         if resp is not None:
-            raw = resp.headers.get("retry-after")
-            if raw:
-                try:
-                    return min(max(float(raw), 0.0), self.retry_max_delay)
-                except ValueError:
-                    pass
-        return min(self.retry_base_delay * (2 ** (attempt - 1)), self.retry_max_delay)
+            parsed = self._parse_retry_after(resp.headers.get("retry-after"))
+            if parsed is not None:
+                jitter = random.uniform(0.0, min(1.0, parsed * 0.1))
+                return min(parsed + jitter, RETRY_AFTER_CAP)
+        base = min(self.retry_base_delay * (2 ** (max(attempt, 1) - 1)), self.retry_max_delay)
+        return min(base * (1.0 + random.uniform(0.0, 0.25)), self.retry_max_delay)
+
+    async def _post_with_retry(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        on_status: StatusHook | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """POST with the same 429/5xx + network retry policy as the OpenAI path."""
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                resp = await client.post(url, **kwargs)
+            except httpx.HTTPError as exc:
+                if attempt >= self.retry_attempts:
+                    raise
+                delay = self._retry_delay(attempt)
+                if on_status is not None:
+                    await on_status(f"Сеть недоступна ({exc}) — повтор {attempt}/{self.retry_attempts - 1} через {delay:.1f}s...")
+                await asyncio.sleep(delay)
+                continue
+            if resp.status_code in RETRYABLE_STATUS and attempt < self.retry_attempts:
+                delay = self._retry_delay(attempt, resp)
+                if on_status is not None:
+                    await on_status(f"HTTP {resp.status_code} — повтор {attempt}/{self.retry_attempts - 1} через {delay:.1f}s...")
+                await asyncio.sleep(delay)
+                continue
+            return resp
+        raise httpx.ConnectError("retry attempts exhausted")
+
+    def _key_allowed(self, cfg: dict[str, Any], api_key: str, api_base: str) -> bool:
+        """An API key taken from the environment is only sent to its own provider."""
+        if not api_key or str(cfg.get("api_key") or "").strip() == "keyring":
+            return True
+        if getattr(self.storage, "api_key_source", "") == "config":
+            return True
+        return StorageManager.env_key_allowed(api_key, api_base)
+
+    @staticmethod
+    def _message_tokens(message: dict[str, Any]) -> int:
+        """Token estimate for one API message; image payloads count as a flat cost."""
+        total = 4
+        content = message.get("content")
+        if isinstance(content, str):
+            total += count_tokens(content)
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    total += count_tokens(str(part.get("text") or ""))
+                elif part.get("type") in ("image_url", "image"):
+                    total += IMAGE_TOKENS
+        for call in message.get("tool_calls") or []:
+            fn = (call or {}).get("function") or {}
+            total += count_tokens(str(fn.get("name") or "")) + count_tokens(str(fn.get("arguments") or ""))
+        return total
+
+    def _account_step(self, api_messages: list[dict[str, Any]], content: str, tool_calls: list[dict[str, Any]]) -> None:
+        """Books input/output tokens of the step just finished into the turn totals."""
+        usage = split_usage(self._step_usage) if self._step_usage else None
+        self._step_usage = None
+        if usage and (usage["input"] or usage["output"]):
+            self._turn_in += usage["input"]
+            self._turn_out += usage["output"]
+            return
+        self._turn_in += sum(self._message_tokens(m) for m in api_messages)
+        self._turn_out += count_tokens(content or "") + sum(
+            count_tokens(str(((tc or {}).get("function") or {}).get("arguments") or ""))
+            for tc in tool_calls
+        )
+
+    @staticmethod
+    def _ensure_call_ids(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Gives every tool call exactly one id, shared by the assistant and tool messages."""
+        for tc in tool_calls:
+            if isinstance(tc, dict) and not tc.get("id"):
+                tc["id"] = f"call_{short_id()}"
+        return tool_calls
 
     async def refresh_ollama_models(self) -> list[ModelInfo]:
         self.extra_models = await discover_ollama_models()
@@ -596,11 +711,14 @@ class AgentEngine:
         t0 = time.perf_counter()
         cfg = self.get_config()
         budget = float(cfg.get("budget_usd") or 0)
-        budget_mode = str(cfg.get("budget_mode") or "strict").lower()
+        # One parser for the mode everywhere ("none"/"off" disable it); a bare
+        # per-session `budget_usd` without a mode stays strict, as it always was.
+        budget_mode = normalize_budget_mode(cfg.get("budget_mode"), default="strict")
         spent_before = 0.0
         if budget > 0:
             spent_before = sum(
-                (message.tokens / 1000.0) * get_model_info(message.model or model_id).cost_per_1k
+                (message.tokens / 1000.0)
+                * get_model_info(message.model or model_id, self.extra_models).cost_per_1k
                 for message in session.messages
                 if message.role == "assistant"
             )
@@ -636,11 +754,17 @@ class AgentEngine:
                     await on_status(f"роутинг: {routed}")
                 model_id = routed
         self.executor.begin_turn()
+        self._turn_in = 0
+        self._turn_out = 0
+        self._step_usage = None
         model_info = get_model_info(model_id, self.extra_models)
         api_key = self.storage.resolve_api_key(cfg).strip()
         api_base = (cfg.get("api_base") or "https://openrouter.ai/api/v1").rstrip("/")
         if api_base.endswith("/chat/completions"):
             api_base = api_base[: -len("/chat/completions")]
+        if api_key and not self._key_allowed(cfg, api_key, api_base):
+            logger.warning("API key from the environment is not sent to %s", api_base)
+            api_key = ""
 
         is_ollama = (
             model_id.startswith("ollama/")
@@ -670,25 +794,42 @@ class AgentEngine:
             )
             tool_records.append(rec)
             await on_tool_start(rec)
-            await asyncio.sleep(0.05)
-            if name == "subagent":
-                res = await self._run_subagent(
-                    args,
-                    model_id=remote_model_id if use_remote else "",
-                    api_base=effective_base if use_remote else "",
-                    api_key=api_key or "ollama",
-                    session=session,
-                )
+            try:
+                await asyncio.sleep(0.05)
+                if name == "subagent":
+                    res = await self._run_subagent(
+                        args,
+                        model_id=remote_model_id if use_remote else "",
+                        api_base=effective_base if use_remote else "",
+                        api_key=api_key or "ollama",
+                        session=session,
+                    )
+                else:
+                    res = await self.executor.execute(name, args, agent_mode=agent_mode)
+            except asyncio.CancelledError:
+                rec.status = "cancelled"
+                rec.summary = f"{name} cancelled"
+                raise
+            except Exception as exc:
+                rec.status = "error"
+                rec.summary = f"{name} crashed: {type(exc).__name__}"
+                rec.output = f"{type(exc).__name__}: {exc}"
+                raise
             else:
-                res = await self.executor.execute(name, args, agent_mode=agent_mode)
-            rec.status = "success" if res.ok else "error"
-            rec.summary = res.summary
-            rec.output = res.output
-            rec.diff = res.diff
-            rec.duration_ms = res.duration_ms
-            rec.pid = res.pid
-            await on_tool_end(rec)
-            return res
+                rec.status = "success" if res.ok else "error"
+                rec.summary = res.summary
+                rec.output = res.output
+                rec.diff = res.diff
+                rec.duration_ms = res.duration_ms
+                rec.pid = res.pid
+                return res
+            finally:
+                if rec.status == "running":
+                    rec.status = "error"
+                try:
+                    await on_tool_end(rec)
+                except Exception:
+                    logger.debug("tool end hook failed", exc_info=True)
 
         protocol = str(cfg.get("protocol") or "").lower()
         native_anthropic = use_remote and (
@@ -754,13 +895,20 @@ class AgentEngine:
                 "multi_edit",
                 "apply_patch",
             }
-            already_wrote = any(rec.name in mutated for rec in tool_records)
-            await on_status("Модель недоступна (401/404) — fallback на rbit/smart-local...")
+            # bash can change files too, so any executed bash call also blocks the fallback.
+            already_wrote = any(
+                rec.name in mutated or (rec.name == "bash" and rec.status != "denied")
+                for rec in tool_records
+            )
+            api_error = content.strip().splitlines()[0][:240] if content.strip() else ""
+            is_401 = content.startswith("Ошибка API (401")
+            reason = "401: ключ недействителен или не подходит к этому API" if is_401 else "404"
+            await on_status(f"Модель недоступна ({reason}) — fallback на rbit/smart-local...")
             if already_wrote:
                 # The turn already modified files; letting the built-in agent run
                 # would overwrite the model's real work with synthesized stubs.
                 content = (
-                    f"**[Fallback]** `{model_id}` стал недоступен (401/404) после того, как часть "
+                    f"**[Fallback]** `{model_id}` стал недоступен ({reason}) после того, как часть "
                     "инструментов уже изменила файлы. Встроенный Smart-агент не запускался, чтобы не "
                     "перезаписать эти правки. Нажмите `Ctrl+R` для повтора хода или продолжите другим промптом."
                 )
@@ -773,8 +921,9 @@ class AgentEngine:
                     on_status=on_status,
                 )
                 content = (
-                    f"**[Fallback]** `{model_id}` недоступна — выполнен встроенный Smart-агент "
-                    "без обращения к API.\n\n" + fallback_text
+                    f"**[Fallback]** `{model_id}` недоступна ({reason}) — выполнен встроенный "
+                    "Smart-агент без обращения к API.\n\n"
+                    f"> Ошибка провайдера: {api_error}\n\n" + fallback_text
                 )
 
         elapsed = round(time.perf_counter() - t0, 2)
@@ -782,7 +931,9 @@ class AgentEngine:
             12, count_tokens(content) + sum(count_tokens(tc.output) for tc in tool_records)
         )
         if budget > 0 and budget_mode != "off":
-            spent_after = spent_before + (tokens_est / 1000.0) * get_model_info(model_id).cost_per_1k
+            spent_after = spent_before + (tokens_est / 1000.0) * get_model_info(
+                model_id, self.extra_models
+            ).cost_per_1k
             old_pct = spent_before / budget
             new_pct = spent_after / budget
             crossed = max(
@@ -824,13 +975,20 @@ class AgentEngine:
         # Split the estimate proportionally: rbit only has a total, so the whole
         # amount is booked as output, which is the part the model generated.
         usage["output"] = max(0, int(total_tokens))
-        cost, priced = estimate_cost(usage, info.cost_per_1k, self.get_config())
+        if self._turn_in or self._turn_out:
+            # Real accounting: provider usage when reported, else an estimate of
+            # what was actually sent (system prompt + history + tool results).
+            usage["input"] = int(self._turn_in)
+            usage["output"] = int(self._turn_out)
+        cost, priced = estimate_cost(
+            usage, info.cost_per_1k if info.priced else 0.0, self.get_config()
+        )
         try:
             ledger.record(
                 model_id,
                 provider=info.provider or "",
                 session=getattr(session, "id", "") or "",
-                input_tokens=0,
+                input_tokens=usage["input"],
                 output_tokens=usage["output"],
                 reasoning_tokens=0,
                 cost_usd=cost,
@@ -998,7 +1156,20 @@ class AgentEngine:
                         )
                     assistant_msg["tool_calls"] = calls
                 units.append([assistant_msg] + tool_messages)
-        for unit in units[-HISTORY_UNITS:]:
+        # Trim history by the model's context window (in tokens), not by a
+        # fixed number of turns; the newest unit is always kept.
+        window = int(get_model_info(model_id, self.extra_models).context_window or 128_000)
+        reserve = int(cfg_prompt.get("max_tokens") or 4096)
+        room = max(2000, int(window * 0.8) - reserve - self._message_tokens(api_messages[0]))
+        picked: list[list[dict[str, Any]]] = []
+        used_tokens = 0
+        for unit in reversed(units[-MAX_HISTORY_UNITS:]):
+            unit_tokens = sum(self._message_tokens(m) for m in unit)
+            if picked and used_tokens + unit_tokens > room:
+                break
+            picked.append(unit)
+            used_tokens += unit_tokens
+        for unit in reversed(picked):
             api_messages.extend(unit)
 
         headers = self._build_headers(api_key)
@@ -1022,6 +1193,7 @@ class AgentEngine:
                 await on_stream_chunk("\n\n".join(p for p in parts if p))
 
             for _step in range(max_steps):
+                self._step_usage = None
                 if on_thinking is not None:
                     await on_thinking(True)
                 try:
@@ -1054,6 +1226,7 @@ class AgentEngine:
                     if on_thinking is not None:
                         await on_thinking(False)
 
+                self._account_step(api_messages, content, tool_calls)
                 if _step == 0 and content and tool_calls and on_status is not None:
                     first_line = next((ln.strip() for ln in content.splitlines() if ln.strip()), "")
                     if first_line:
@@ -1072,11 +1245,16 @@ class AgentEngine:
                 if content and content.strip():
                     step_texts.append(content)
 
+                self._ensure_call_ids(tool_calls)
                 api_messages.append(
                     {
                         "role": "assistant",
                         "content": content or "",
-                        "tool_calls": tool_calls,
+                        # Internal flags (length_truncated) never go back to the provider.
+                        "tool_calls": [
+                            {k: v for k, v in tc.items() if k != "length_truncated"}
+                            for tc in tool_calls
+                        ],
                     }
                 )
                 await self._dispatch_tool_calls(
@@ -1118,6 +1296,18 @@ class AgentEngine:
                 pass
         return {}
 
+    @staticmethod
+    def _tool_args_invalid(raw_args: Any) -> bool:
+        """True when arguments are present but are not a valid JSON object."""
+        if isinstance(raw_args, dict) or raw_args is None:
+            return False
+        if not isinstance(raw_args, str) or not raw_args.strip():
+            return False
+        try:
+            return not isinstance(json.loads(raw_args), dict)
+        except json.JSONDecodeError:
+            return True
+
     def _format_tool_message(self, tc_id: str, fn_name: str, res: ToolResult) -> dict[str, Any]:
         out_payload = res.output
         if res.diff:
@@ -1145,6 +1335,7 @@ class AgentEngine:
         api_messages: list[dict[str, Any]],
         invoke_tool: Callable[[str, dict[str, Any]], Awaitable[ToolResult]],
         on_status: StatusHook,
+        results_sink: dict[str, ToolResult] | None = None,
     ) -> None:
         """Runs contiguous read-only tool calls in parallel (Semaphore=4), keeping mutating tools as barriers."""
 
@@ -1175,22 +1366,40 @@ class AgentEngine:
                     f"Tool `{name}` failed with an internal error: {type(exc).__name__}: {exc}",
                 )
 
+        def _emit(tc: dict[str, Any], fn_name: str, res: ToolResult) -> None:
+            tc_id = tc.get("id") or f"call_{short_id()}"
+            tc["id"] = tc_id
+            if results_sink is not None:
+                results_sink[tc_id] = res
+            api_messages.append(self._format_tool_message(tc_id, fn_name, res))
+
         batches: list[list[tuple[dict[str, Any], str, dict[str, Any]]]] = []
         for tc in tool_calls:
             fn = tc.get("function") or {}
             fn_name = fn.get("name", "")
             parsed_args = self._parse_tool_args(fn.get("arguments"))
             if tc.get("length_truncated") and not parsed_args and fn.get("arguments"):
-                api_messages.append(
-                    self._format_tool_message(
-                        tc.get("id") or f"call_{short_id()}",
-                        fn_name,
-                        ToolResult(
-                            False,
-                            "response truncated",
-                            "The model's tool-call arguments were cut off by max_tokens; the tool was not run.",
-                        ),
-                    )
+                _emit(
+                    tc,
+                    fn_name,
+                    ToolResult(
+                        False,
+                        "response truncated",
+                        "The model's tool-call arguments were cut off by max_tokens; the tool was not run.",
+                    ),
+                )
+                continue
+            if self._tool_args_invalid(fn.get("arguments")):
+                _emit(
+                    tc,
+                    fn_name,
+                    ToolResult(
+                        False,
+                        "invalid JSON arguments",
+                        "invalid JSON arguments: the tool-call arguments are not a complete JSON "
+                        "object (the response was probably cut off); the tool was not run. "
+                        "Resend the call with valid JSON arguments.",
+                    ),
                 )
                 continue
             item = (tc, fn_name, parsed_args)
@@ -1202,10 +1411,7 @@ class AgentEngine:
         for batch in batches:
             if len(batch) == 1:
                 tc, fn_name, parsed_args = batch[0]
-                res = await _safe_invoke(fn_name, parsed_args)
-                api_messages.append(
-                    self._format_tool_message(tc.get("id") or f"call_{short_id()}", fn_name, res)
-                )
+                _emit(tc, fn_name, await _safe_invoke(fn_name, parsed_args))
             else:
                 await on_status(f"Параллельный вызов ({len(batch)} read-only инструментов)...")
                 sem = asyncio.Semaphore(MAX_PARALLEL_TOOLS)
@@ -1218,11 +1424,7 @@ class AgentEngine:
                     *(_bounded_call(fn_name, parsed_args) for _, fn_name, parsed_args in batch)
                 )
                 for (tc, fn_name, _), res in zip(batch, results):
-                    api_messages.append(
-                        self._format_tool_message(
-                            tc.get("id") or f"call_{short_id()}", fn_name, res
-                        )
-                    )
+                    _emit(tc, fn_name, res)
 
     async def _apply_chat_params(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
         plugins = getattr(self.executor, "plugins", None)
@@ -1234,6 +1436,55 @@ class AgentEngine:
         )
         updated = context.get("payload")
         return updated if isinstance(updated, dict) else payload
+
+    def _activate_profile(self, cfg: dict[str, Any]) -> dict[str, Any]:
+        """Loads the prompt profile / custom tool list into the engine state."""
+        profile = PROMPT_PROFILES.get(
+            str(cfg.get("prompt_profile", "default")).lower(), PROMPT_PROFILES["default"]
+        )
+        self._active_profile_tools = profile.get("allowed_tools")
+        self._active_profile_readonly = bool(profile.get("read_only"))
+        custom_agent_tools = cfg.get("agent_tools")
+        if isinstance(custom_agent_tools, list):
+            self._active_profile_tools = {str(tool) for tool in custom_agent_tools}
+        return profile
+
+    def _account_native(self, usage: dict[str, Any] | None, request_text: str, response_text: str) -> int:
+        """Books one native-protocol call into the turn totals; returns its token total."""
+        split = split_usage(usage) if usage else None
+        if split and (split["input"] or split["output"]):
+            tokens_in, tokens_out = split["input"], split["output"]
+        else:
+            tokens_in, tokens_out = count_tokens(request_text), count_tokens(response_text)
+        self._turn_in += tokens_in
+        self._turn_out += tokens_out
+        return tokens_in + tokens_out
+
+    async def _run_native_calls(
+        self,
+        calls: list[tuple[str, str, dict[str, Any]]],
+        invoke_tool: Callable[[str, dict[str, Any]], Awaitable[ToolResult]],
+        on_status: StatusHook,
+    ) -> list[tuple[str, ToolResult, str]]:
+        """Runs `(id, name, args)` calls through the shared dispatcher (profiles,
+        read-only batching, crash isolation) and returns `(id, result, text)` in order.
+        `text` is never empty so a tool result is always written back."""
+        tool_calls = [
+            {
+                "id": cid,
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+            }
+            for cid, name, args in calls
+        ]
+        sink: dict[str, ToolResult] = {}
+        await self._dispatch_tool_calls(tool_calls, [], invoke_tool, on_status, results_sink=sink)
+        out: list[tuple[str, ToolResult, str]] = []
+        for cid, name, _ in calls:
+            res = sink.get(cid) or ToolResult(False, "no result", "Tool produced no result.")
+            body = self._format_tool_message(cid, name, res)["content"]
+            out.append((cid, res, body or res.summary or "(no output)"))
+        return out
 
     async def _run_gemini_compatible(
         self,
@@ -1262,6 +1513,9 @@ class AgentEngine:
         )
         if self._auto_design_section:
             system_text += self._auto_design_section
+        profile = self._activate_profile(cfg)
+        if profile.get("prompt"):
+            system_text += f"\n\n{profile['prompt']}"
         contents: list[dict[str, Any]] = []
         for message in session.messages:
             if message.role == "user":
@@ -1274,21 +1528,19 @@ class AgentEngine:
                     parts.append({"functionCall": {"name": call.name, "args": call.arguments}})
                 if parts:
                     contents.append({"role": "model", "parts": parts})
-                for call in message.tool_calls:
-                    if call.output:
-                        contents.append(
-                            {
-                                "role": "user",
-                                "parts": [
-                                    {
-                                        "functionResponse": {
-                                            "name": call.name,
-                                            "response": {"content": call.output[:8000]},
-                                        }
-                                    }
-                                ],
-                            }
-                        )
+                # Every functionResponse of the turn goes into ONE user message,
+                # including calls whose output was empty.
+                responses = [
+                    {
+                        "functionResponse": {
+                            "name": call.name,
+                            "response": {"content": (call.output or "(no output)")[:8000]},
+                        }
+                    }
+                    for call in message.tool_calls
+                ]
+                if responses:
+                    contents.append({"role": "user", "parts": responses})
         tools = []
         for schema in self._tools_for_payload():
             function = schema.get("function") or {}
@@ -1301,8 +1553,18 @@ class AgentEngine:
             )
         endpoint = f"{base}/models/{model}:generateContent"
         client_ctx = self.http_client or _http_client(120.0)
+        max_steps = max(1, int(cfg.get("max_steps", 50) or 50))
+        raw_max_cost = cfg.get("max_cost_usd")
+        max_cost = float(raw_max_cost) if raw_max_cost not in (None, "", 0, "0") else None
+        cost_per_1k = get_model_info(model_id, self.extra_models).cost_per_1k
+        spent = 0.0
+        step_texts: list[str] = []
+
+        def _joined(extra: str = "") -> str:
+            return "\n\n".join(p for p in [*step_texts, extra] if p and p.strip())
+
         try:
-            for _ in range(10):
+            for _ in range(max_steps):
                 payload: dict[str, Any] = {
                     "contents": contents,
                     "systemInstruction": {"parts": [{"text": system_text}]},
@@ -1311,45 +1573,75 @@ class AgentEngine:
                 if tools and agent_mode != "plan":
                     payload["tools"] = [{"functionDeclarations": tools}]
                 try:
-                    response = await client_ctx.post(
+                    response = await self._post_with_retry(
+                        client_ctx,
                         endpoint,
+                        on_status,
                         params={"key": api_key},
                         headers={"Content-Type": "application/json"},
                         json=payload,
                     )
                 except httpx.HTTPError as exc:
-                    return f"Gemini network error: {exc}"
+                    return _joined(f"Gemini network error: {exc}")
                 if response.status_code >= 400:
-                    return f"Gemini API error ({response.status_code}): {response.text[:300]}"
+                    return _joined(f"Gemini API error ({response.status_code}): {response.text[:300]}")
                 try:
-                    candidate = response.json()["candidates"][0]["content"]
+                    body = response.json()
+                    candidate = body["candidates"][0]["content"]
                 except (ValueError, KeyError, IndexError, TypeError):
-                    return "Gemini error: malformed response"
+                    return _joined("Gemini error: malformed response")
                 parts = candidate.get("parts") or []
                 text = "".join(str(part.get("text", "")) for part in parts if "text" in part)
                 calls = [part["functionCall"] for part in parts if "functionCall" in part]
+                meta = body.get("usageMetadata") if isinstance(body, dict) else None
+                usage = (
+                    {
+                        "prompt_tokens": meta.get("promptTokenCount") or 0,
+                        "completion_tokens": meta.get("candidatesTokenCount") or 0,
+                    }
+                    if isinstance(meta, dict)
+                    else None
+                )
+                step_tokens = self._account_native(
+                    usage, json.dumps(payload, ensure_ascii=False), json.dumps(parts, ensure_ascii=False)
+                )
                 if not calls:
-                    if on_stream_chunk is not None and text:
-                        await on_stream_chunk(text)
-                    return text
+                    full = _joined(text)
+                    if on_stream_chunk is not None and full:
+                        await on_stream_chunk(full)
+                    return full
+                if text.strip():
+                    step_texts.append(text)
                 contents.append({"role": "model", "parts": parts})
-                responses = []
-                for call in calls:
-                    name = str(call.get("name") or "")
-                    if on_status is not None:
-                        await on_status(f"tool: {name}")
-                    result = await invoke_tool(name, dict(call.get("args") or {}))
-                    responses.append(
-                        {
-                            "functionResponse": {
-                                "name": name,
-                                "response": {"content": (result.output or result.summary)[:8000]},
+                results = await self._run_native_calls(
+                    [
+                        (f"g{index}", str(call.get("name") or ""), dict(call.get("args") or {}))
+                        for index, call in enumerate(calls)
+                    ],
+                    invoke_tool,
+                    on_status,
+                )
+                contents.append(
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "functionResponse": {
+                                    "name": str(call.get("name") or ""),
+                                    "response": {"content": body_text[:8000] or "(no output)"},
+                                }
                             }
-                        }
-                    )
-                contents.append({"role": "user", "parts": responses})
-            return "Gemini turn stopped: too many tool iterations."
+                            for call, (_cid, _res, body_text) in zip(calls, results)
+                        ],
+                    }
+                )
+                spent += step_tokens / 1000.0 * cost_per_1k
+                if max_cost is not None and spent >= max_cost:
+                    return _joined(f"Достигнут лимит стоимости (${max_cost:.2f}, оценка ${spent:.2f}).")
+            return _joined(f"Gemini turn stopped: step limit ({max_steps}) reached.")
         finally:
+            self._active_profile_tools = None
+            self._active_profile_readonly = False
             if self.http_client is None:
                 await client_ctx.aclose()
 
@@ -1389,6 +1681,9 @@ class AgentEngine:
         )
         if self._auto_design_section:
             system_text += self._auto_design_section
+        profile = self._activate_profile(cfg)
+        if profile.get("prompt"):
+            system_text += f"\n\n{profile['prompt']}"
         messages: list[dict[str, Any]] = []
         for message in session.messages:
             if message.role == "user":
@@ -1403,20 +1698,18 @@ class AgentEngine:
                     )
                 if blocks:
                     messages.append({"role": "assistant", "content": blocks})
-                for call in message.tool_calls:
-                    if call.output:
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "tool_result",
-                                        "tool_use_id": call.id,
-                                        "content": call.output[:8000],
-                                    }
-                                ],
-                            }
-                        )
+                # A tool_use must always be answered by a tool_result — even when
+                # the recorded output is empty.
+                results = [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call.id,
+                        "content": (call.output or "(no output)")[:8000],
+                    }
+                    for call in message.tool_calls
+                ]
+                if results:
+                    messages.append({"role": "user", "content": results})
         if user_msg.attachments:
             blocks = []
             for rel in user_msg.attachments:
@@ -1442,8 +1735,18 @@ class AgentEngine:
         }
         max_tokens = int(cfg.get("max_tokens") or 4096)
         client_ctx = self.http_client or _http_client(120.0)
+        max_steps = max(1, int(cfg.get("max_steps", 50) or 50))
+        raw_max_cost = cfg.get("max_cost_usd")
+        max_cost = float(raw_max_cost) if raw_max_cost not in (None, "", 0, "0") else None
+        cost_per_1k = get_model_info(model_id, self.extra_models).cost_per_1k
+        spent = 0.0
+        step_texts: list[str] = []
+
+        def _joined(extra: str = "") -> str:
+            return "\n\n".join(p for p in [*step_texts, extra] if p and p.strip())
+
         try:
-            for _ in range(10):
+            for _ in range(max_steps):
                 payload: dict[str, Any] = {
                     "model": model,
                     "max_tokens": max_tokens,
@@ -1453,40 +1756,64 @@ class AgentEngine:
                 if tools and agent_mode != "plan":
                     payload["tools"] = tools
                 try:
-                    response = await client_ctx.post(endpoint, headers=headers, json=payload)
+                    response = await self._post_with_retry(
+                        client_ctx, endpoint, on_status, headers=headers, json=payload
+                    )
                 except httpx.HTTPError as exc:
-                    return f"Anthropic network error: {exc}"
+                    return _joined(f"Anthropic network error: {exc}")
                 if response.status_code >= 400:
-                    return f"Anthropic API error ({response.status_code}): {response.text[:300]}"
+                    return _joined(f"Anthropic API error ({response.status_code}): {response.text[:300]}")
                 try:
                     data = response.json()
                 except ValueError:
-                    return "Anthropic error: malformed JSON response"
+                    return _joined("Anthropic error: malformed JSON response")
                 blocks = data.get("content") or []
                 text_parts = [block.get("text", "") for block in blocks if block.get("type") == "text"]
                 text = "".join(text_parts)
                 tool_calls = [block for block in blocks if block.get("type") == "tool_use"]
+                step_tokens = self._account_native(
+                    data.get("usage") if isinstance(data.get("usage"), dict) else None,
+                    json.dumps(payload, ensure_ascii=False),
+                    json.dumps(blocks, ensure_ascii=False),
+                )
                 if not tool_calls:
-                    if on_stream_chunk is not None and text:
-                        await on_stream_chunk(text)
-                    return text
+                    full = _joined(text)
+                    if on_stream_chunk is not None and full:
+                        await on_stream_chunk(full)
+                    return full
+                if text.strip():
+                    step_texts.append(text)
                 messages.append({"role": "assistant", "content": blocks})
-                results = []
-                for call in tool_calls:
-                    if on_status is not None:
-                        await on_status(f"tool: {call.get('name')}")
-                    result = await invoke_tool(str(call.get("name")), dict(call.get("input") or {}))
-                    results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": call.get("id"),
-                            "content": (result.output or result.summary)[:8000],
-                            **({"is_error": True} if not result.ok else {}),
-                        }
+                calls = [
+                    (
+                        str(call.get("id") or f"call_{short_id()}"),
+                        str(call.get("name") or ""),
+                        dict(call.get("input") or {}),
                     )
-                messages.append({"role": "user", "content": results})
-            return "Anthropic turn stopped: too many tool iterations."
+                    for call in tool_calls
+                ]
+                results = await self._run_native_calls(calls, invoke_tool, on_status)
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": cid,
+                                "content": body_text[:8000] or "(no output)",
+                                **({"is_error": True} if not res.ok else {}),
+                            }
+                            for cid, res, body_text in results
+                        ],
+                    }
+                )
+                spent += step_tokens / 1000.0 * cost_per_1k
+                if max_cost is not None and spent >= max_cost:
+                    return _joined(f"Достигнут лимит стоимости (${max_cost:.2f}, оценка ${spent:.2f}).")
+            return _joined(f"Anthropic turn stopped: step limit ({max_steps}) reached.")
         finally:
+            self._active_profile_tools = None
+            self._active_profile_readonly = False
             if self.http_client is None:
                 await client_ctx.aclose()
 
@@ -1515,6 +1842,8 @@ class AgentEngine:
             payload["tools"] = self._tools_for_payload()
             payload["tool_choice"] = "auto"
         payload["stream"] = True
+        # Ask OpenAI-compatible providers for a final usage chunk (real input tokens).
+        payload["stream_options"] = {"include_usage": True}
         effort = self._reasoning_effort(model_id)
         if effort is not None:
             payload["reasoning_effort"] = effort
@@ -1537,6 +1866,11 @@ class AgentEngine:
             last_tc_key = 0
             finish_reason = None
             args_progress: dict[int, tuple[str, int]] = {}
+            idx_map: dict[int, int] = {}
+            real_ids: set[int] = set()
+            stream_error: str | None = None
+            saw_done = False
+            usage_chunk: dict[str, Any] | None = None
             try:
                 _t_req = time.perf_counter()
                 async with client.stream("POST", url, headers=headers, json=payload) as resp:
@@ -1567,11 +1901,23 @@ class AgentEngine:
                             continue
                         raw_data = line[5:].strip()
                         if raw_data == "[DONE]":
+                            saw_done = True
                             break
                         try:
                             chunk = json.loads(raw_data)
                         except json.JSONDecodeError:
                             continue
+                        if not isinstance(chunk, dict):
+                            continue
+                        if chunk.get("error"):
+                            # Some providers report failures as an SSE event inside a 200.
+                            err = chunk["error"]
+                            stream_error = (
+                                str(err.get("message") or err) if isinstance(err, dict) else str(err)
+                            )
+                            break
+                        if isinstance(chunk.get("usage"), dict):
+                            usage_chunk = chunk["usage"]
                         choices = chunk.get("choices") or []
                         if not choices:
                             continue
@@ -1596,11 +1942,24 @@ class AgentEngine:
 
                         for tc_delta in delta.get("tool_calls") or []:
                             raw_idx = tc_delta.get("index")
+                            new_id = tc_delta.get("id")
                             if raw_idx is not None:
                                 try:
-                                    last_tc_key = int(raw_idx)
+                                    raw_key = int(raw_idx)
                                 except (TypeError, ValueError):
-                                    last_tc_key = 0
+                                    raw_key = 0
+                                key = idx_map.get(raw_key, raw_key)
+                                known = tc_acc.get(key)
+                                if (
+                                    known is not None
+                                    and new_id
+                                    and key in real_ids
+                                    and known["id"] != new_id
+                                ):
+                                    # Same index, different id: a NEW call, not a continuation.
+                                    key = max(tc_acc.keys(), default=-1) + 1
+                                idx_map[raw_key] = key
+                                last_tc_key = key
                             elif tc_delta.get("id"):
                                 # Providers that omit `index`: segment by tool-call id
                                 # instead of merging parallel calls into one.
@@ -1621,8 +1980,10 @@ class AgentEngine:
                             )
                             if tc_delta.get("id"):
                                 entry["id"] = tc_delta["id"]
+                                real_ids.add(last_tc_key)
                             fn = tc_delta.get("function") or {}
-                            if fn.get("name"):
+                            if fn.get("name") and entry["function"]["name"] != fn["name"]:
+                                # A name resent in full is an assignment, not more text.
                                 entry["function"]["name"] += fn["name"]
                             if fn.get("arguments"):
                                 entry["function"]["arguments"] += fn["arguments"]
@@ -1639,6 +2000,29 @@ class AgentEngine:
                                         await on_status(f"стрим аргументов: {label}")
                                     except Exception:
                                         logger.debug("status hook failed", exc_info=True)
+                if stream_error is not None:
+                    if attempt < self.retry_attempts and not full_text and not tc_acc:
+                        delay = self._retry_delay(attempt)
+                        if on_status is not None:
+                            await on_status(
+                                f"Ошибка провайдера в потоке: {stream_error[:120]} — повтор "
+                                f"{attempt}/{self.retry_attempts - 1} через {delay:.1f}s..."
+                            )
+                        await asyncio.sleep(delay)
+                        continue
+                    if full_text:
+                        return (
+                            True,
+                            "".join(full_text)
+                            + f"\n\n[⚠ поток прерван ошибкой провайдера: {stream_error[:200]}]",
+                            [],
+                        )
+                    return (
+                        False,
+                        f"Ошибка API (поток): `{stream_error[:300]}`\n\n"
+                        "Проверьте модель и ключ через `/connect` или `/models`.",
+                        [],
+                    )
                 if args_progress and on_status is not None:
                     # Clear the "streaming arguments" hint once the response ends.
                     try:
@@ -1653,6 +2037,13 @@ class AgentEngine:
                 text = "".join(full_text)
                 if not text and not ordered_tcs:
                     text = "".join(reasoning_text)
+                if (
+                    not finish_reason
+                    and not saw_done
+                    and any(self._tool_args_invalid(tc["function"]["arguments"]) for tc in ordered_tcs)
+                ):
+                    text += "\n\n[⚠ поток оборван до завершения: часть вызовов инструментов неполная]"
+                self._step_usage = usage_chunk
                 return True, text, ordered_tcs
             except httpx.HTTPError as exc:
                 if attempt < self.retry_attempts and not full_text and not tc_acc:
@@ -1663,6 +2054,16 @@ class AgentEngine:
                         )
                     await asyncio.sleep(delay)
                     continue
+                if full_text or tc_acc:
+                    # Broken stream after partial output: hand back what arrived, marked.
+                    # Calls with incomplete JSON arguments are rejected by the dispatcher.
+                    partial = "".join(full_text)
+                    note = f"[⚠ ответ оборван: {type(exc).__name__}]"
+                    return (
+                        True,
+                        (partial + "\n\n" + note) if partial else note,
+                        [tc_acc[k] for k in sorted(tc_acc.keys())],
+                    )
                 return (
                     False,
                     f"Не удалось подключиться к `{url}`: **{exc}**.\n\n"
@@ -1761,6 +2162,7 @@ class AgentEngine:
             choice = choices[0].get("message") or {}
             content = choice.get("content") or ""
             tool_calls = choice.get("tool_calls") or []
+            self._step_usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
             for tc in tool_calls:
                 if isinstance(tc, dict) and not tc.get("id"):
                     tc["id"] = f"call_{short_id()}"
@@ -1782,6 +2184,24 @@ class AgentEngine:
     @staticmethod
     def _ollama_url(url: str) -> str:
         return url.split("/chat/completions")[0].rstrip("/") + "/api/chat"
+
+    @staticmethod
+    def _split_content_parts(content: Any) -> tuple[str, list[str]]:
+        """Splits OpenAI-style content into (text, [raw base64 images])."""
+        if isinstance(content, str) or content is None:
+            return str(content or ""), []
+        texts: list[str] = []
+        images: list[str] = []
+        for part in content if isinstance(content, list) else []:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                texts.append(str(part.get("text") or ""))
+            elif part.get("type") == "image_url":
+                url = str((part.get("image_url") or {}).get("url") or "")
+                if url.startswith("data:") and "," in url:
+                    images.append(url.split(",", 1)[1])
+        return "\n".join(texts), images
 
     def _ollama_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -1806,10 +2226,59 @@ class AgentEngine:
                     "tool_calls": calls,
                 })
             else:
-                out.append({"role": role, "content": m.get("content") or ""})
+                text, images = self._split_content_parts(m.get("content"))
+                item: dict[str, Any] = {"role": role, "content": text}
+                if images:
+                    item["images"] = images  # Ollama takes raw base64, not image_url parts
+                out.append(item)
         return out
 
+    def _ollama_num_ctx(self, model_id: str) -> int:
+        """Context size passed as `options.num_ctx` (Ollama defaults to a tiny 2-4k window)."""
+        configured = (self.get_config() or {}).get("num_ctx")
+        try:
+            if configured:
+                return max(2048, int(configured))
+        except (TypeError, ValueError):
+            pass
+        info = get_model_info(model_id, self.extra_models)
+        window = 32_768 if info.provider == "Custom" else int(info.context_window or 32_768)
+        return max(2048, min(window, 131_072))
+
+    @staticmethod
+    def _ollama_transient(message: str) -> bool:
+        return message.startswith("Ollama недоступна") or bool(
+            re.match(r"Ollama error \((408|425|429|5\d\d)\)", message)
+        )
+
     async def _ollama_chat_step(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        model_id: str,
+        messages: list[dict[str, Any]],
+        on_stream_chunk: StreamHook | None = None,
+        on_status: StatusHook | None = None,
+        on_reasoning_chunk: StreamHook | None = None,
+        stream: bool = False,
+    ) -> tuple[bool, str, list[dict[str, Any]]]:
+        """Ollama step with the same retry policy as the OpenAI-compatible path."""
+        result: tuple[bool, str, list[dict[str, Any]]] = (False, "", [])
+        for attempt in range(1, self.retry_attempts + 1):
+            result = await self._ollama_chat_once(
+                client, url, model_id, messages,
+                on_stream_chunk=on_stream_chunk, on_status=on_status,
+                on_reasoning_chunk=on_reasoning_chunk, stream=stream,
+            )
+            if result[0] or attempt >= self.retry_attempts or not self._ollama_transient(result[1]):
+                return result
+            delay = self._retry_delay(attempt)
+            if on_status is not None:
+                await on_status(f"Ollama: повтор {attempt}/{self.retry_attempts - 1} через {delay:.1f}s...")
+            await asyncio.sleep(delay)
+        return result
+
+    async def _ollama_chat_once(
         self,
         client: httpx.AsyncClient,
         url: str,
@@ -1826,6 +2295,7 @@ class AgentEngine:
             "model": model_id,
             "messages": self._ollama_messages(messages),
             "stream": stream,
+            "options": {"num_ctx": self._ollama_num_ctx(model_id)},
         }
         if model_supports_tools(model_id, self.get_config()) and self._tools_for_payload():
             payload["tools"] = self._tools_for_payload()
@@ -1974,6 +2444,44 @@ class AgentEngine:
             lines.append(f"\n`{kw}`:\n{head}")
         return "\n".join(lines)
 
+    def _record_call(
+        self,
+        model_id: str,
+        usage: dict[str, Any] | None,
+        request_text: str,
+        response_text: str,
+        kind: str,
+    ) -> None:
+        """Books one auxiliary model call (subagent, summary...) in the usage ledger."""
+        ledger = getattr(self, "usage", None)
+        if ledger is None:
+            return
+        split = split_usage(usage) if usage else None
+        if not split or not (split["input"] or split["output"]):
+            split = {
+                "input": count_tokens(request_text),
+                "output": count_tokens(response_text),
+                "reasoning": 0,
+                "cached": 0,
+            }
+        info = get_model_info(model_id, self.extra_models)
+        cost, priced = estimate_cost(
+            split, info.cost_per_1k if info.priced else 0.0, self.get_config()
+        )
+        try:
+            ledger.record(
+                model_id,
+                provider=info.provider or "",
+                input_tokens=split["input"],
+                output_tokens=split["output"],
+                reasoning_tokens=0,
+                cost_usd=cost,
+                priced=priced,
+                kind=kind,
+            )
+        except Exception:
+            logger.debug("usage record failed", exc_info=True)
+
     async def _explore_with_llm(
         self,
         goal: str,
@@ -1994,6 +2502,7 @@ class AgentEngine:
             {"role": "user", "content": goal},
         ]
         steps = 0
+        finished = False
         last_content = ""
         used: list[str] = []
         client_ctx = self.http_client or _http_client(75.0)
@@ -2010,8 +2519,10 @@ class AgentEngine:
             for _ in range(max_steps):
                 steps += 1
                 try:
-                    resp = await client_ctx.post(
+                    resp = await self._post_with_retry(
+                        client_ctx,
                         f"{api_base}/chat/completions",
+                        None,
                         headers=headers,
                         json={
                             "model": model_id,
@@ -2034,6 +2545,13 @@ class AgentEngine:
                     usage = resp.json().get("usage") or {}
                 except (ValueError, AttributeError):
                     usage = {}
+                self._record_call(
+                    model_id,
+                    usage if isinstance(usage, dict) else None,
+                    json.dumps(messages, ensure_ascii=False, default=str),
+                    last_content + json.dumps(tool_calls, ensure_ascii=False, default=str),
+                    "subagent",
+                )
                 if isinstance(usage, dict):
                     tokens = int(usage.get("total_tokens") or 0)
                     if not tokens:
@@ -2046,8 +2564,10 @@ class AgentEngine:
                         (last_content or "Subagent stopped.")
                         + f"\n\n(subagent budget cap ${max_cost:.4f} reached after {steps} step(s))"
                     )
+                    finished = True
                     break
                 if not tool_calls:
+                    finished = True
                     break
                 messages.append(
                     {"role": "assistant", "content": last_content, "tool_calls": tool_calls}
@@ -2066,6 +2586,16 @@ class AgentEngine:
                             }
                         )
                         continue
+                    if self._tool_args_invalid(fn.get("arguments")):
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "name": fn_name,
+                                "content": "invalid JSON arguments: the tool was not run; resend valid JSON.",
+                            }
+                        )
+                        continue
                     used.append(fn_name)
                     res = await self.executor.execute(
                         fn_name,
@@ -2080,6 +2610,40 @@ class AgentEngine:
                             "content": res.output[:4000],
                         }
                     )
+            if not finished:
+                # Step limit hit while still calling tools: ask once, WITHOUT tools,
+                # for a summary instead of returning the last half-finished thought.
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Step limit reached. Do not call any more tools: summarise what you "
+                            "found so far (concise, with file:line references)."
+                        ),
+                    }
+                )
+                try:
+                    final = await self._post_with_retry(
+                        client_ctx,
+                        f"{api_base}/chat/completions",
+                        None,
+                        headers=headers,
+                        json={"model": model_id, "messages": messages},
+                    )
+                    if final.status_code < 400:
+                        body = final.json()
+                        summary = (body["choices"][0]["message"].get("content") or "").strip()
+                        self._record_call(
+                            model_id,
+                            body.get("usage") if isinstance(body.get("usage"), dict) else None,
+                            json.dumps(messages, ensure_ascii=False, default=str),
+                            summary,
+                            "subagent",
+                        )
+                        if summary:
+                            last_content = summary
+                except Exception:
+                    logger.debug("subagent final summary failed", exc_info=True)
         finally:
             if self.http_client is None:
                 await client_ctx.aclose()
@@ -2209,7 +2773,14 @@ class AgentEngine:
                 lines.append(f"TOOL {tc.name}: {tc.summary}")
             if m.content:
                 lines.append(f"ASSISTANT: {m.content[:1200]}")
-        return "\n".join(lines)[:14000]
+        text = "\n".join(lines)
+        limit = 14000
+        if len(text) <= limit:
+            return text
+        # Keep the TAIL: the latest decisions matter more than the oldest chatter.
+        tail = text[-limit:]
+        nl = tail.find("\n")
+        return "[... earlier history omitted ...]\n" + (tail[nl + 1 :] if nl >= 0 else tail)
 
     @staticmethod
     def _heuristic_summary(messages: list[ChatMessage]) -> str:
@@ -2498,7 +3069,9 @@ class AgentEngine:
             return f"Содержимое `{url}` ({res.summary}):\n\n```text\n{res.output[:1800]}\n```"
 
         # 3. Explicit bash run request
-        cmd_match = re.search(r"(?:выполни|запусти команду|run)\s+`?([^`]+)`?$", text, re.IGNORECASE)
+        cmd_match = re.search(
+            r"(?<!\w)(?:выполни|запусти команду|run)(?!\w)\s+`?([^`]+)`?$", text, re.IGNORECASE
+        )
         if cmd_match:
             cmd = cmd_match.group(1).strip()
             await on_status(f"Выполнение команды: {cmd}...")

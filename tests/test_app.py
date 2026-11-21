@@ -3729,6 +3729,9 @@ async def test_test_gate_feeds_failures_to_fix_round(tmp_path: Path) -> None:
     )
     app = RbitApp(workspace=tmp_path)
     app.config_data["model"] = "rbit/smart-local"
+    # The gate runs the project's detected test command; running it is a shell
+    # action that needs the user's approval (no dialog is answered in this test).
+    app.executor.always_allow_bash = True
     calls = {"n": 0}
 
     async def fake_run_turn(**kwargs):

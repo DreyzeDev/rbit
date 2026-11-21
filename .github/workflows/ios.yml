@@ -7,6 +7,9 @@ on:
       - "ios/**"
       - ".github/workflows/ios.yml"
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build unsigned IPA

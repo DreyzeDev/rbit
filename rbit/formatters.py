@@ -207,10 +207,35 @@ def detect_formatter(path: Path, config: dict[str, Any] | None, workspace: Path)
     return None
 
 
-def format_file(path: Path, config: dict[str, Any] | None, workspace: Path) -> FormatResult:
-    """Runs matching formatters in order until one succeeds; failures are non-fatal."""
+def formatter_is_custom(definition: FormatterDef) -> bool:
+    """True when the definition runs a command the user configured (not a stock built-in).
+
+    Such commands execute arbitrary code from the project config, so the tool
+    layer asks for approval before running them."""
+    base = BUILTIN_FORMATTERS.get(definition.name)
+    if base is None:
+        return True
+    stock = [str(part) for part in base["command"]]
+    return definition.command != stock or bool(definition.environment)
+
+
+def format_file(
+    path: Path,
+    config: dict[str, Any] | None,
+    workspace: Path,
+    *,
+    allowed: set[str] | None = None,
+) -> FormatResult:
+    """Runs matching formatters in order until one succeeds; failures are non-fatal.
+
+    `allowed` restricts the run to formatters with those names (the tool layer
+    passes only the ones it has cleared, e.g. custom commands after approval)."""
     suffix = path.suffix.lower()
-    candidates = [d for d in build_formatters(config, workspace) if suffix in d.extensions]
+    candidates = [
+        d
+        for d in build_formatters(config, workspace)
+        if suffix in d.extensions and (allowed is None or d.name in allowed)
+    ]
     if not candidates:
         return FormatResult(ran=False, ok=True)
     last = FormatResult(ran=False, ok=True)
@@ -238,7 +263,10 @@ def _run_formatter(path: Path, definition: FormatterDef, workspace: Path) -> For
             cwd=str(workspace),
             env=env,
             capture_output=True,
-            text=True,
+            # Formatters print UTF-8 regardless of the console code page; never let
+            # a Cyrillic path or message crash the edit (cp1251 on Windows).
+            encoding="utf-8",
+            errors="replace",
             timeout=FORMAT_TIMEOUT_SECONDS,
             check=False,
         )

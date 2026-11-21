@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from . import __version__
 from .agent import AgentEngine
 from .models import ChatMessage, Session, short_id
 from .storage import StorageManager
@@ -46,14 +48,29 @@ class ACPServer:
         session = self.sessions[session_id]
         workspace = self.session_workspaces.get(session_id, self.workspace)
         storage = StorageManager(workspace)
-        executor = ToolExecutor(workspace=workspace, session=session, storage=storage)
-        executor.always_allow_bash = True
+        cfg = storage.load_config()
 
-        async def _allow(_tool: str, _detail: str) -> bool:
-            return True
+        def get_cfg() -> dict[str, Any]:
+            return cfg
 
-        executor.permission_cb = _allow
-        engine = AgentEngine(workspace=workspace, executor=executor, storage=storage)
+        executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=get_cfg)
+        # Permissions are NOT granted silently: only an explicit opt-in
+        # (RBIT_ACP_ALLOW_ALL=1 or config acp_allow_all) auto-approves tools.
+        allow_all = bool(cfg.get("acp_allow_all")) or os.environ.get("RBIT_ACP_ALLOW_ALL") == "1"
+        if allow_all:
+            executor.always_allow_bash = True
+
+            async def _allow(_tool: str, _detail: str) -> bool:
+                return True
+
+            executor.permission_cb = _allow
+        else:
+
+            async def _deny(_tool: str, _detail: str) -> bool:
+                return False
+
+            executor.permission_cb = _deny
+        engine = AgentEngine(workspace=workspace, executor=executor, get_config=get_cfg, storage=storage)
         user_msg = ChatMessage(id=short_id(), role="user", content=prompt)
         session.messages.append(user_msg)
 
@@ -77,21 +94,57 @@ class ACPServer:
             on_status=_status,
             on_stream_chunk=_chunk,
         )
+        session.messages.append(reply)
         storage.save_session(session)
-        if not reply.content and reply.content != "":
-            return "end_turn"
+        if getattr(reply, "interrupted", False):
+            return "cancelled"
+        content = reply.content or ""
+        if content.startswith("Ошибка API") or content.startswith("**Budget guard"):
+            return "refusal"
+        if "max_tokens" in content[:200] and "cut off" in content[:400]:
+            return "max_tokens"
         return "end_turn"
 
     async def handle(self, message: dict[str, Any], notify: Callable[[dict[str, Any]], Awaitable[None]]) -> dict[str, Any] | None:
+        request_id = message.get("id")
+        try:
+            return await self._handle(message, notify)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # never crash the server on one bad request
+            logger.exception("acp handler failed")
+            if request_id is None:
+                return None
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": f"internal error: {type(exc).__name__}: {exc}"},
+            }
+
+    async def _handle(self, message: dict[str, Any], notify: Callable[[dict[str, Any]], Awaitable[None]]) -> dict[str, Any] | None:
         method = message.get("method")
         request_id = message.get("id")
-        params = message.get("params") or {}
+        params = message.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            if request_id is None:
+                return None
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32602, "message": "params must be an object"},
+            }
         if method == "initialize":
+            try:
+                protocol_version = int(params.get("protocolVersion") or 1)
+            except (TypeError, ValueError):
+                protocol_version = 1
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
-                    "protocolVersion": int(params.get("protocolVersion") or 1),
+                    "protocolVersion": protocol_version,
                     "agentCapabilities": {
                         "loadSession": False,
                         "promptCapabilities": {
@@ -100,7 +153,7 @@ class ACPServer:
                             "embeddedContext": True,
                         },
                     },
-                    "agentInfo": {"name": "rbit", "version": "1.3.1"},
+                    "agentInfo": {"name": "rbit", "version": __version__},
                 },
             }
         if method == "session/new":
@@ -237,6 +290,18 @@ class ACPServer:
                 writer.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 writer.flush()
 
+        prompt_tasks: dict[str, asyncio.Task[Any]] = {}
+        all_tasks: set[asyncio.Task[Any]] = set()
+
+        async def _run_request(message: dict[str, Any], sid: str) -> None:
+            request_id = message.get("id")
+            try:
+                response = await self.handle(message, notify)
+            except asyncio.CancelledError:
+                response = {"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "cancelled"}}
+            if response is not None:
+                await _write(response)
+
         while True:
             line = await asyncio.to_thread(reader.readline)
             if not line:
@@ -250,13 +315,47 @@ class ACPServer:
                 await _write({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
                 continue
             if not isinstance(message, dict):
+                await _write({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}})
+                continue
+            method = message.get("method")
+            params = message.get("params")
+            if method == "session/cancel" and isinstance(params, dict):
+                sid = str(params.get("sessionId") or "")
+                self.cancelled.add(sid)
+                running = prompt_tasks.get(sid)
+                if running is not None and not running.done():
+                    running.cancel()
+                continue
+            if method == "session/prompt" and isinstance(params, dict):
+                sid = str(params.get("sessionId") or "")
+                previous = prompt_tasks.get(sid)
+                if previous is not None and not previous.done():
+                    await _write(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": message.get("id"),
+                            "error": {"code": -32602, "message": "a prompt is already running for this session"},
+                        }
+                    )
+                    continue
+                task = asyncio.create_task(_run_request(message, sid))
+                prompt_tasks[sid] = task
+                all_tasks.add(task)
+                task.add_done_callback(all_tasks.discard)
                 continue
             response = await self.handle(message, notify)
             if response is not None:
                 await _write(response)
+        if all_tasks:
+            await asyncio.gather(*list(all_tasks), return_exceptions=True)
 
 
 async def run_acp(workspace: Path | None = None) -> int:
+    for stream in (sys.stdin, sys.stdout):
+        try:
+            stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        except Exception:
+            pass
     server = ACPServer(workspace=workspace)
     await server.serve()
     return 0

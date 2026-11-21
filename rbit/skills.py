@@ -56,20 +56,40 @@ def _read_skill(path: Path) -> dict[str, str] | None:
     }
 
 
-def _collect(directory: Path, skills: dict[str, dict[str, str]]) -> None:
+def _collect(directory: Path, skills: dict[str, dict[str, str]], *, override: bool = False) -> None:
+    """Reads skills from `directory`. Later layers pass `override=True` so that
+    project skills replace global ones; within one directory the first wins."""
     if not directory.is_dir():
         return
+    seen: set[str] = set()
     for entry in sorted(directory.iterdir()):
+        skill: dict[str, str] | None = None
         if entry.is_file() and entry.suffix.lower() == ".md":
             skill = _read_skill(entry)
-            if skill is not None:
-                skills.setdefault(skill["name"], skill)
         elif entry.is_dir():
-            nested = entry / "SKILL.md"
-            if nested.is_file():
+            nested = next(
+                (c for c in sorted(entry.iterdir()) if c.is_file() and c.name.lower() == "skill.md"),
+                None,
+            )
+            if nested is not None:
                 skill = _read_skill(nested)
-                if skill is not None:
-                    skills.setdefault(skill["name"], skill)
+        if skill is None:
+            continue
+        name = skill["name"]
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        _store(skills, name, skill, override=override)
+
+
+def _store(skills: dict[str, dict[str, str]], name: str, skill: dict[str, str], *, override: bool) -> None:
+    """Skill names match case-insensitively: `Deploy` and `deploy` are one skill."""
+    existing = next((key for key in skills if key.lower() == name.lower()), None)
+    if existing is not None:
+        if not override:
+            return
+        del skills[existing]
+    skills[name] = skill
 
 
 def global_skill_dirs() -> list[Path]:
@@ -87,13 +107,13 @@ def load_skills(workspace: Path, *, include_global: bool = True) -> dict[str, di
     if include_global:
         for directory in global_skill_dirs():
             _collect(directory, skills)
-    _collect(workspace / ".rbit" / "skills", skills)
+    _collect(workspace / ".rbit" / "skills", skills, override=True)
     builtin_dir = Path(__file__).resolve().parent / "builtin_skills"
     if builtin_dir.is_dir():
         builtin: dict[str, dict[str, str]] = {}
         _collect(builtin_dir, builtin)
         for name, skill in builtin.items():
-            skills.setdefault(name, skill)
+            _store(skills, name, skill, override=False)
     return skills
 
 
