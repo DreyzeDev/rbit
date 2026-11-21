@@ -5402,7 +5402,10 @@ def _run_watch(workspace: Path, run_prompt: str | None, interval: float) -> int:
         session = Session(title=f"watch {changed[0]}")
         executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=lambda: cfg)
         engine = AgentEngine(workspace=workspace, executor=executor, storage=storage, get_config=lambda: cfg)
-        user = ChatMessage(id=short_id(), role="user", content=run_prompt)
+        # Tell the agent WHAT changed: with a fixed prompt alone it has to rediscover the change.
+        shown = [name.replace("\\", "/") for name in changed[:20]]
+        listing = "\n".join(f"- {name}" for name in shown) + ("\n- ..." if len(changed) > len(shown) else "")
+        user = ChatMessage(id=short_id(), role="user", content=f"{run_prompt}\n\nChanged files:\n{listing}")
         session.messages.append(user)
 
         async def _noop(_rec) -> None:
@@ -5411,11 +5414,18 @@ def _run_watch(workspace: Path, run_prompt: str | None, interval: float) -> int:
         async def _noop_s(_s: str) -> None:
             return None
 
-        reply = await engine.run_turn(
-            session=session, user_msg=user, agent_mode="build",
-            model_id=str(cfg.get("model", "rbit/smart-local")),
-            on_tool_start=_noop, on_tool_end=_noop, on_status=_noop_s,
-        )
+        try:
+            reply = await engine.run_turn(
+                session=session, user_msg=user, agent_mode="build",
+                model_id=str(cfg.get("model", "rbit/smart-local")),
+                on_tool_start=_noop, on_tool_end=_noop, on_status=_noop_s,
+            )
+        except BaseException:
+            storage.save_session(session)  # keep what was asked even if the turn failed
+            raise
+        # run_turn returns the reply without appending it: persist it, or the run leaves no trace.
+        session.messages.append(reply)
+        storage.save_session(session)
         console.print(f"[bold #7fd88f]rbit[/] {markup_escape(reply.content[:600])}")
 
     def scan(report: bool = True) -> list[str]:
