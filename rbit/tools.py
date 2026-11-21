@@ -851,6 +851,84 @@ async def safe_http_get(
     raise UnsafeURL(f"too many redirects (more than {max_redirects})")
 
 
+async def _resolve_pinned_ips(host: str) -> list[str]:
+    """Resolves `host` ONCE and returns its addresses, refusing the host if any is non-public.
+
+    Raises UnsafeURL for loopback/private/link-local targets and httpx.ConnectError when
+    the name does not resolve (so callers see the same error as a failed connection).
+    """
+    lowered = host.lower().rstrip(".")
+    if lowered == "localhost" or lowered.endswith(".localhost"):
+        raise UnsafeURL(f"blocked: {host} is a loopback host")
+    literal = _parse_ip_literal(host)
+    if literal is not None:
+        if _is_blocked_ip(literal):
+            raise UnsafeURL(f"blocked: {host} is a private, loopback or link-local address")
+        return [str(literal)]
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, None, 0, socket.SOCK_STREAM)
+    except (socket.gaierror, UnicodeError, OSError) as exc:
+        raise httpx.ConnectError(f"cannot resolve {host}: {exc}") from exc
+    addresses: list[str] = []
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+        except ValueError:
+            continue
+        if _is_blocked_ip(ip):
+            raise UnsafeURL(f"blocked: {host} resolves to a private, loopback or link-local address ({ip})")
+        if str(ip) not in addresses:
+            addresses.append(str(ip))
+    if not addresses:
+        raise httpx.ConnectError(f"cannot resolve {host}: no usable address")
+    return addresses
+
+
+class PinnedIPTransport(httpx.AsyncBaseTransport):
+    """httpx transport that connects to the exact address it validated (anti DNS-rebinding).
+
+    A separate "check the name, then let httpx connect" has a gap: the name is resolved a
+    second time at connect time, and an attacker-controlled DNS server can answer a public
+    address to the check and 127.0.0.1 (or a cloud metadata address) to the connection.
+    Here the name is resolved once per request, every address must be public, and the
+    request is sent to that IP. The `Host` header and the TLS server name (SNI and
+    certificate verification) keep the original host name.
+
+    Limit: with an HTTP proxy configured (environment), the proxy resolves the name itself.
+    """
+
+    def __init__(self, inner: httpx.AsyncBaseTransport | None = None, resolver: Any = None) -> None:
+        self._inner = inner if inner is not None else httpx.AsyncHTTPTransport()
+        self._resolve = resolver or _resolve_pinned_ips
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.raw_host.decode("ascii")
+        addresses = await self._resolve(host)
+        original_url = request.url
+        original_extensions = dict(request.extensions)
+        last_error: Exception | None = None
+        for address in addresses:
+            if address == host:  # the URL already names a validated IP: nothing to pin
+                return await self._inner.handle_async_request(request)
+            request.url = original_url.copy_with(host=address)
+            request.extensions = {**original_extensions, "sni_hostname": host}
+            try:
+                return await self._inner.handle_async_request(request)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                last_error = exc  # try the next validated address
+        raise last_error or httpx.ConnectError(f"cannot connect to {host}")
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+def new_fetch_client(timeout: float, *, allow_private: bool = False) -> httpx.AsyncClient:
+    """Client for fetching URLs chosen by the model: pinned to validated public IPs."""
+    if allow_private:
+        return httpx.AsyncClient(timeout=timeout)
+    return httpx.AsyncClient(timeout=timeout, transport=PinnedIPTransport())
+
+
 def _is_reparse_point(path: str | Path) -> bool:
     """True for symlinks and Windows junctions/reparse points."""
     try:
@@ -3558,7 +3636,7 @@ class ToolExecutor:
                         self.http_client, url, allow_private=self._allow_private_fetch(), max_bytes=20_000_000
                     )
                 else:
-                    async with httpx.AsyncClient(timeout=60.0) as client:
+                    async with new_fetch_client(60.0, allow_private=self._allow_private_fetch()) as client:
                         fetched = await safe_http_get(
                             client, url, allow_private=self._allow_private_fetch(), max_bytes=20_000_000
                         )
@@ -3826,7 +3904,7 @@ class ToolExecutor:
             if self.http_client is not None:
                 page = await safe_http_get(self.http_client, url, headers=headers, allow_private=allow_private)
             else:
-                async with httpx.AsyncClient(timeout=15.0) as client:
+                async with new_fetch_client(15.0, allow_private=allow_private) as client:
                     page = await safe_http_get(client, url, headers=headers, allow_private=allow_private)
         except UnsafeURL as exc:
             return ToolResult(False, "blocked: unsafe URL", f"webfetch refused `{url}`: {exc}")

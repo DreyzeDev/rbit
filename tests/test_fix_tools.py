@@ -675,3 +675,196 @@ async def test_formatter_failure_never_fails_the_edit(tmp_path: Path, monkeypatc
     result: ToolResult = await ex.execute("edit", {"filePath": "a.txt", "oldString": "x", "newString": "y"})
     assert result.ok is True
     assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "y"
+
+
+# --- 8b: DNS rebinding: connect to the address that was validated ---------------
+
+PUBLIC_IP = "93.184.216.34"
+OTHER_PUBLIC_IP = "93.184.216.35"
+
+
+def _addrinfo(*ips: str) -> list[Any]:
+    import socket
+
+    rows: list[Any] = []
+    for ip in ips:
+        if ":" in ip:
+            rows.append((socket.AF_INET6, socket.SOCK_STREAM, 6, "", (ip, 0, 0, 0)))
+        else:
+            rows.append((socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0)))
+    return rows
+
+
+def _pinned_client(handler: Any, resolver: Any = None) -> httpx.AsyncClient:
+    from rbit.tools import PinnedIPTransport
+
+    return httpx.AsyncClient(transport=PinnedIPTransport(inner=httpx.MockTransport(handler), resolver=resolver))
+
+
+@pytest.mark.asyncio
+async def test_pinned_transport_connects_to_the_validated_ip_and_keeps_host_and_sni() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(
+            host=request.url.host,
+            port=request.url.port,
+            host_header=request.headers["host"],
+            sni=request.extensions.get("sni_hostname"),
+        )
+        return httpx.Response(200, text="ok")
+
+    async def resolver(host: str) -> list[str]:
+        return [PUBLIC_IP]
+
+    async with _pinned_client(handler, resolver) as client:
+        response = await client.get("https://evil.test:8443/path?q=1")
+
+    assert response.status_code == 200
+    # TLS verification and virtual hosting still see the original name; only the socket target changes.
+    assert seen == {"host": PUBLIC_IP, "port": 8443, "host_header": "evil.test:8443", "sni": "evil.test"}
+
+
+@pytest.mark.asyncio
+async def test_dns_rebinding_cannot_swap_the_address_between_check_and_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import socket
+
+    # A rebinding DNS server: the first answer is public, every later one is loopback.
+    calls: list[str] = []
+
+    def rebinding_getaddrinfo(host: str, *args: Any, **kwargs: Any) -> list[Any]:
+        calls.append(host)
+        return _addrinfo(PUBLIC_IP) if len(calls) == 1 else _addrinfo("127.0.0.1")
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding_getaddrinfo)
+    connected: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        connected.append(request.url.host)
+        return httpx.Response(200, text="ok")
+
+    async with _pinned_client(handler) as client:  # real resolver
+        assert (await client.get("http://rebind.test/")).status_code == 200
+        assert connected == [PUBLIC_IP]  # the connection used the address that was validated
+        assert len(calls) == 1  # ... and the name was NOT resolved a second time
+        with pytest.raises(UnsafeURL):  # the next request resolves afresh and is refused
+            await client.get("http://rebind.test/")
+    assert connected == [PUBLIC_IP]
+
+
+@pytest.mark.asyncio
+async def test_a_host_with_any_non_public_address_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    import socket
+
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, *a, **k: _addrinfo(PUBLIC_IP, "10.0.0.5"))
+    reached: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reached.append(request.url.host)
+        return httpx.Response(200)
+
+    async with _pinned_client(handler) as client:
+        with pytest.raises(UnsafeURL):
+            await client.get("http://mixed.test/")
+    assert reached == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1/",
+        "http://[::1]/",
+        "http://169.254.169.254/latest/meta-data",
+        "http://2130706433/",  # 127.0.0.1 spelled as one decimal number
+        "http://10.1.2.3/",
+        "http://localhost/",
+        "http://app.localhost/",
+    ],
+)
+async def test_pinned_transport_refuses_non_public_targets(url: str) -> None:
+    reached: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reached.append(request.url.host)
+        return httpx.Response(200)
+
+    async with _pinned_client(handler) as client:
+        with pytest.raises(UnsafeURL):
+            await client.get(url)
+    assert reached == []
+
+
+@pytest.mark.asyncio
+async def test_pinned_transport_tries_the_next_validated_address_on_connect_error() -> None:
+    tried: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        tried.append(request.url.host)
+        if request.url.host == PUBLIC_IP:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(200, text="second address")
+
+    async def resolver(host: str) -> list[str]:
+        return [PUBLIC_IP, OTHER_PUBLIC_IP]
+
+    async with _pinned_client(handler, resolver) as client:
+        response = await client.get("http://two-addresses.test/")
+    assert response.text == "second address"
+    assert tried == [PUBLIC_IP, OTHER_PUBLIC_IP]
+
+
+@pytest.mark.asyncio
+async def test_a_public_ip_literal_is_not_rewritten() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(host=request.url.host, sni=request.extensions.get("sni_hostname"))
+        return httpx.Response(200)
+
+    async with _pinned_client(handler) as client:
+        await client.get(f"https://{PUBLIC_IP}/")
+    assert seen == {"host": PUBLIC_IP, "sni": None}
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_host_is_a_connect_error_not_a_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    import socket
+
+    def failing_getaddrinfo(host: str, *args: Any, **kwargs: Any) -> list[Any]:
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+
+    monkeypatch.setattr(socket, "getaddrinfo", failing_getaddrinfo)
+    async with _pinned_client(lambda request: httpx.Response(200)) as client:
+        with pytest.raises(httpx.ConnectError):
+            await client.get("http://does-not-exist.test/")
+
+
+def test_fetch_client_is_pinned_unless_private_fetching_is_allowed() -> None:
+    from rbit.tools import PinnedIPTransport, new_fetch_client
+
+    assert isinstance(new_fetch_client(5.0)._transport, PinnedIPTransport)
+    assert not isinstance(new_fetch_client(5.0, allow_private=True)._transport, PinnedIPTransport)
+
+
+@pytest.mark.asyncio
+async def test_webfetch_blocks_a_host_that_resolves_to_loopback_at_connect_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even when the up-front check was fooled (it saw a public address), the connection
+    itself must refuse a loopback answer."""
+    import socket
+
+    import rbit.tools as tools_module
+
+    async def fooled_check(url: str, *, allow_private: bool = False) -> None:
+        return None  # the "check" step saw a public address
+
+    monkeypatch.setattr(tools_module, "check_url_safe", fooled_check)
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, *a, **k: _addrinfo("127.0.0.1"))
+
+    result = await _executor(tmp_path).execute("webfetch", {"url": "http://evil.test/"})
+    assert result.ok is False
+    assert "blocked" in result.summary
