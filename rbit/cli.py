@@ -220,6 +220,8 @@ async def _run_headless(args: argparse.Namespace) -> int:
         workspace = created
     storage = StorageManager(workspace)
     cfg = storage.load_config()
+    if storage.untrusted_keys:
+        console.print("[yellow]" + markup_escape(storage.untrusted_notice()) + "[/]")
     if getattr(args, "prompt_profile", None):
         cfg["prompt_profile"] = args.prompt_profile
 
@@ -423,6 +425,39 @@ async def _run_headless(args: argparse.Namespace) -> int:
             f"\n[#fab283]▣[/] [#808080]{markup_escape(reply.agent.capitalize())} · {markup_escape(str(reply.model))} · "
             f"{reply.duration_s:.2f}s · session {markup_escape(str(session.id))}[/]"
         )
+    return 0
+
+
+def _run_trust(workspace: Path, *, yes: bool = False, status: bool = False, revoke: bool = False) -> int:
+    """`rbit trust`: show the project's risky settings and trust them after confirmation."""
+    from .trust import describe
+
+    storage = StorageManager(workspace)
+    if revoke:
+        print("Trust revoked for this workspace." if storage.revoke_trust() else "Nothing was trusted for this workspace.")
+        return 0
+    pending = storage.pending_trust()
+    if not pending:
+        print("Nothing to trust: this project's config has no untrusted settings.")
+        return 0
+    print(f"Untrusted settings in {storage.config_path}:")
+    for key, value in pending.items():
+        print(f"  - {key}: {describe(key, value)}")
+    if status:
+        return 1
+    if not yes:
+        if not (sys.stdin and sys.stdin.isatty()):
+            print("Not a terminal: review the list above and re-run with --yes to trust it.", file=sys.stderr)
+            return 1
+        try:
+            answer = input("Trust these settings for this workspace? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("Not trusted.")
+            return 1
+    trusted = storage.trust_keys()
+    print("Trusted: " + ", ".join(trusted))
     return 0
 
 
@@ -1916,7 +1951,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "audit", "usage", "selftest", "skill", "migrate", "diag", "status", "test", "gh", "schedule", "risk", "replay", "reload", "pair", "mini"}
+    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "audit", "usage", "selftest", "skill", "migrate", "diag", "status", "test", "gh", "schedule", "risk", "replay", "reload", "pair", "mini", "trust"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = _normalize_subcommand_args(sub, args_list[1:])
@@ -1979,6 +2014,18 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("dir", nargs="?", help="Workspace directory")
             parsed = p.parse_args(rest)
             return asyncio.run(_run_doctor(_resolve_workspace(parsed.dir)))
+
+        if sub == "trust":
+            p = argparse.ArgumentParser(
+                prog="rbit trust",
+                description="Review and trust the risky settings of this project's .rbit/config.json",
+            )
+            p.add_argument("dir", nargs="?", help="Workspace directory")
+            p.add_argument("-y", "--yes", action="store_true", help="Trust without asking")
+            p.add_argument("--status", action="store_true", help="Only show what is untrusted")
+            p.add_argument("--revoke", action="store_true", help="Forget everything trusted for this workspace")
+            parsed = p.parse_args(rest)
+            return _run_trust(_resolve_workspace(parsed.dir), yes=parsed.yes, status=parsed.status, revoke=parsed.revoke)
 
         if sub == "watch":
             p = argparse.ArgumentParser(prog="rbit watch", description="Watch workspace files and react to changes")

@@ -6,6 +6,18 @@ All notable changes to rbit are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **A cloned project's `.rbit/config.json` can no longer run programs or widen permissions
+  on its own.** MCP/LSP servers, plugins, hooks, formatters, `permission_mode`,
+  `auto_approve`, `allow` permission rules, `allow_outside_paths`, `allow_secret_reads`,
+  `instructions`, `api_base` (where the API key is sent) and similar settings are ignored
+  until you trust them with `rbit trust` (`--status`, `--yes`, `--revoke`). Trust is kept
+  per workspace and per setting in `~/.rbit/trust.json`, as a fingerprint, so a changed
+  value must be trusted again. Settings you change yourself (`mcp add`, `/connect`,
+  `plugin enable`, the permissions dialog) are trusted automatically; `deny`/`ask` rules
+  and everything harmless keep working. `RBIT_TRUST_ALL=1` restores the old behaviour.
+
 ### Fixed
 
 - **Files that are not UTF-8 can be edited.** `edit` read such a file as UTF-8 with

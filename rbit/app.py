@@ -648,6 +648,9 @@ class RbitApp(App[None]):
                 timeout=5.0,
             )
         self._plugins_loaded = False
+        untrusted = self.storage.untrusted_notice()
+        if untrusted:
+            self.notify(untrusted, title="Project config", severity="warning", timeout=12.0)
         self._maybe_show_doctor_hint()
         # Config-driven keybindings: {"bindings": {"open_models": "ctrl+shift+m"}}
         custom_bindings = self.config_data.get("bindings")

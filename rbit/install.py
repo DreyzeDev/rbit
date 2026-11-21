@@ -344,15 +344,20 @@ def _write_config(workspace: Path, config: dict[str, Any]) -> None:
 
 
 def _set_plugin_enabled(workspace: Path, name: str, enabled: bool) -> None:
-    config = _read_config(workspace)
+    from .storage import StorageManager
+
+    storage = StorageManager(workspace)
+    # Start from the plugins the user has TRUSTED, not from the raw file: a repository's own
+    # plugin list must not be swept into the trusted list by enabling one plugin.
+    config = storage.load_config()
     entries = [e for e in (config.get("plugins") or []) if isinstance(e, str)]
     rel = f".rbit/plugins/{name}"
     if enabled and rel not in entries:
         entries.append(rel)
     if not enabled:
         entries = [e for e in entries if Path(e).name != name and e != rel]
-    config["plugins"] = entries
-    _write_config(workspace, config)
+    # The user just enabled/disabled this plugin: write the list and trust it.
+    storage.set_setting("plugins", entries)
 
 
 def set_plugin_enabled(workspace: Path, name: str, enabled: bool) -> None:

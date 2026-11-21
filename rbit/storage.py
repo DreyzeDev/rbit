@@ -13,6 +13,15 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .models import CheckpointMeta, Session, short_id
+from .trust import (
+    PERMISSION_KEYS,
+    STRIP_KEYS,
+    TrustStore,
+    fingerprint,
+    risky_settings,
+    split_config,
+    trust_all_requested,
+)
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +91,58 @@ class StorageManager:
         self.api_key_source: str = ""
         #: Session files that failed to load during the last list_sessions().
         self.corrupt_sessions: list[str] = []
+        #: Settings of this project's config.json that were ignored by the last load_config()
+        #: because the user has not trusted them (see rbit/trust.py).
+        self.untrusted_keys: list[str] = []
+        self.trust_store = TrustStore()
+
+    # --- Trust for project config (see rbit/trust.py) ---
+    def _read_raw_config(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def untrusted_notice(self) -> str:
+        """A one-paragraph explanation for the user, or "" when everything was trusted."""
+        if not self.untrusted_keys:
+            return ""
+        names = ", ".join(self.untrusted_keys)
+        return (
+            f"Ignored untrusted settings from this project's .rbit/config.json: {names}. "
+            "They can start programs, run code or widen permissions, so they stay off until "
+            "you review them: run `rbit trust`."
+        )
+
+    def pending_trust(self) -> dict[str, Any]:
+        """The risky settings in config.json that are not trusted yet, as {key: value-as-written}."""
+        raw = self._read_raw_config()
+        trusted = self.trust_store.trusted_for(self.workspace)
+        return {k: v for k, v in risky_settings(raw).items() if trusted.get(k) != fingerprint(v)}
+
+    def trust_keys(self, keys: list[str] | None = None) -> list[str]:
+        """Trusts the current value of `keys` (default: every pending one); returns what was trusted."""
+        pending = self.pending_trust()
+        chosen = {k: v for k, v in pending.items() if keys is None or k in keys}
+        self.trust_store.trust(self.workspace, {k: fingerprint(v) for k, v in chosen.items()})
+        return sorted(chosen)
+
+    def revoke_trust(self) -> bool:
+        return self.trust_store.forget(self.workspace)
+
+    def set_setting(self, key: str, value: Any) -> None:
+        """Writes ONE setting the user explicitly asked for and trusts it.
+
+        The rest of config.json is kept exactly as it is (nothing else is persisted or
+        dropped), which `save_config` cannot promise because it writes the whole dict.
+        """
+        raw = self._read_raw_config()
+        raw[key] = value
+        self._atomic_write_json(self.config_path, json.dumps(raw, ensure_ascii=False, indent=2))
+        risky = risky_settings({key: value}).get(key)
+        if risky is not None and not trust_all_requested():
+            self.trust_store.trust(self.workspace, {key: fingerprint(risky)})
 
     def ensure_dirs(self) -> None:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -210,12 +271,21 @@ class StorageManager:
             "allow_secret_reads": False,
         }
         self.config_warning = ""
+        self.untrusted_keys = []
         if self.config_path.exists():
             try:
                 # utf-8-sig: a BOM (Notepad, PowerShell) must not make the config "empty".
                 loaded = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
                 if not isinstance(loaded, dict):
                     raise ValueError("config.json must contain a JSON object")
+                if not trust_all_requested():
+                    # A cloned repository's config may not start programs or widen permissions
+                    # until the user trusts those settings.
+                    loaded, self.untrusted_keys = split_config(
+                        loaded, self.trust_store.trusted_for(self.workspace)
+                    )
+                    if self.untrusted_keys:
+                        log.warning(self.untrusted_notice())
                 if loaded.get("theme") in ("opencode", "opencode-dark"):
                     loaded["theme"] = "rbit-dark"
                 if loaded.get("theme") == "opencode-light":
@@ -370,15 +440,51 @@ class StorageManager:
                 json.dumps(raw, ensure_ascii=False, indent=2),
             )
         else:
+            to_write, trust_updates = self._apply_trust_on_save(cfg)
             self._atomic_write_json(
                 self.config_path,
-                json.dumps(cfg, ensure_ascii=False, indent=2),
+                json.dumps(to_write, ensure_ascii=False, indent=2),
             )
+            if trust_updates:
+                self.trust_store.trust(self.workspace, trust_updates)
         if os.name != "nt":
             try:
                 os.chmod(self.config_path, 0o600)
             except OSError:
                 pass
+
+    def _apply_trust_on_save(self, cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+        """Decides what to write and which risky settings the user just chose.
+
+        The app saves the dict it got from load_config(), in which untrusted settings are
+        missing. Writing that back unchanged would silently delete them from the project's
+        file, so a setting the user did not touch is restored from the file and stays
+        untrusted. A setting that differs from what load_config() showed was changed on the
+        user's behalf (`mcp add`, `/connect`, `plugin enable`, `config set`, ...): it is
+        written and its new value is trusted.
+        """
+        if trust_all_requested():
+            return cfg, {}
+        shown = self.load_config()  # exactly what the user saw (also refreshes untrusted_keys)
+        untrusted = set(self.untrusted_keys)
+        raw = self._read_raw_config()
+        to_write = dict(cfg)
+        updates: dict[str, str] = {}
+        for key in (*STRIP_KEYS, *PERMISSION_KEYS, "profiles"):
+            changed = cfg.get(key) != shown.get(key)
+            if not changed:
+                # Untouched: keep exactly what the file had (an untrusted value stays untrusted)
+                # and never write a default or an env override into the file, where it would
+                # later look like a project-supplied risky value.
+                if key in raw:
+                    to_write[key] = raw[key]
+                else:
+                    to_write.pop(key, None)
+            elif changed and key in to_write:
+                risky = risky_settings({key: to_write[key]}).get(key)
+                if risky is not None and key != "profiles":
+                    updates[key] = fingerprint(risky)
+        return to_write, updates
 
     def _existing_file_key(self) -> str:
         try:
