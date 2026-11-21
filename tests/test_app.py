@@ -1457,6 +1457,7 @@ def test_pre_commit_config_present() -> None:
 @pytest.mark.asyncio
 async def test_bash_timeout_and_background(tmp_path: Path) -> None:
     executor = ToolExecutor(workspace=tmp_path, session=Session())
+    executor.always_allow_bash = True  # no prompt channel in this test
 
     slow = await executor.execute(
         "bash",
@@ -1874,6 +1875,7 @@ async def test_background_pid_stop_controls(tmp_path: Path) -> None:
     from rbit.widgets import ToolCallCard
 
     executor = ToolExecutor(workspace=tmp_path, session=Session())
+    executor.always_allow_bash = True  # no prompt channel in this test
     bg = await executor.execute(
         "bash",
         {"command": 'python -c "import time; time.sleep(30)"', "background": True},

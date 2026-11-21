@@ -4309,9 +4309,10 @@ class ToolExecutor:
         if not command:
             return ToolResult(False, "empty command", "command is required.")
 
-        # `bash` keeps its historic no-callback behaviour (headless `rbit run` has no
-        # prompt channel and existing tests rely on it); `terminal` and bisect fail closed.
-        blocked = await self._gate_shell(command, agent_mode, fail_closed=False)
+        # Fails closed like `terminal`: without a prompt channel a command needs a standing
+        # approval (`always_allow_bash`, which `rbit run`/ACP/`--auto` set, an allow rule, or
+        # the `commands`/`auto` mode). Read-only commands never need one.
+        blocked = await self._gate_shell(command, agent_mode)
         if blocked is not None:
             return blocked
 

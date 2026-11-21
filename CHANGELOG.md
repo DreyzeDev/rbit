@@ -18,6 +18,13 @@ All notable changes to rbit are documented here. The format follows
   `plugin enable`, the permissions dialog) are trusted automatically; `deny`/`ask` rules
   and everything harmless keep working. `RBIT_TRUST_ALL=1` restores the old behaviour.
 
+- **`bash` fails closed when nobody can approve a command.** Unlike `terminal`, it ran any
+  command if the executor had no approval channel. Now such a command needs a standing
+  approval: `rbit run`, ACP and `--auto` already set one; otherwise a `shell` allow rule or
+  the `commands`/`auto` permission mode. Read-only commands are unaffected. Visible effect:
+  `rbit watch --run` no longer lets the agent run mutating shell commands unless the project
+  is configured to allow them.
+
 ### Fixed
 
 - **Files that are not UTF-8 can be edited.** `edit` read such a file as UTF-8 with
