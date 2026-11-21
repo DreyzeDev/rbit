@@ -121,9 +121,24 @@ def _rmtree(path: Path) -> None:
         raise InstallError(f"could not remove {path}; close programs using it and retry")
 
 
+def _is_link_like(path: Path) -> bool:
+    """Symlinks AND Windows junctions / reparse points: all of them can lead outside the source.
+
+    `Path.is_symlink()` is False for a junction (`mklink /J`, no admin rights needed), and
+    copytree follows it, which copied the contents of an arbitrary outside folder into the
+    install, where the agent then reads it.
+    """
+    try:
+        if path.is_symlink():
+            return True
+        return bool(getattr(os.lstat(path), "st_file_attributes", 0) & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+    except OSError:
+        return False
+
+
 def _ignore_links_and_git(directory: str, names: list[str]) -> list[str]:
-    """copytree ignore: never copy symlinks (they could point outside the source) or .git."""
-    return [n for n in names if n == ".git" or (Path(directory) / n).is_symlink()]
+    """copytree ignore: never copy links/junctions (they could point outside the source) or .git."""
+    return [n for n in names if n == ".git" or _is_link_like(Path(directory) / n)]
 
 
 def _name_from_source(source: str) -> str:
@@ -226,7 +241,7 @@ def install_skill(
         for sibling in entry.parent.iterdir():
             if sibling == entry or sibling == target_dir:
                 continue
-            if sibling.is_symlink():
+            if _is_link_like(sibling):
                 continue
             if sibling.is_dir() and (sibling.name in {"assets", "references", "templates"}):
                 shutil.copytree(
