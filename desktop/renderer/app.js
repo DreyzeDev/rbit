@@ -6,6 +6,8 @@ const rbitCfg = window.rbit || {
 };
 const PORT = rbitCfg.port;
 const BASE = `http://127.0.0.1:${PORT}`;
+// The backend requires the per-launch bearer token handed over by the main process.
+const AUTH = rbitCfg.token ? { Authorization: `Bearer ${rbitCfg.token}` } : {};
 
 let sessionId = null;
 let sessions = [];
@@ -90,7 +92,7 @@ function renderSessionsPanel() {
 
 async function refreshSessions() {
   try {
-    const res = await fetch(`${BASE}/v1/sessions`);
+    const res = await fetch(`${BASE}/v1/sessions`, { headers: AUTH });
     const data = await res.json();
     sessions = data.sessions || [];
     renderTabs();
@@ -100,7 +102,7 @@ async function refreshSessions() {
 
 async function loadSession(id) {
   try {
-    const res = await fetch(`${BASE}/v1/sessions/${id}`);
+    const res = await fetch(`${BASE}/v1/sessions/${id}`, { headers: AUTH });
     if (!res.ok) throw new Error(String(res.status));
     const data = await res.json();
     sessionId = data.id;
@@ -140,9 +142,13 @@ async function send() {
   try {
     const res = await fetch(`${BASE}/v1/turns`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...AUTH },
       body: JSON.stringify({ prompt: text, session_id: sessionId }),
     });
+    if (!res.ok) {
+      addNote(`✗ Backend error: HTTP ${res.status}`, "notice error");
+      return;
+    }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";

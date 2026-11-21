@@ -585,3 +585,63 @@ async def test_answer_stays_below_tool_cards_in_a_real_turn(app_workspace: Path)
 
         # The end of the answer must be the visible tail of the log.
         assert scroll.max_scroll_y - scroll.scroll_y <= 1
+
+
+@pytest.mark.asyncio
+async def test_unrendered_reply_is_recovered_without_reopening(
+    app_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: after a task only tool cards were visible; the answer appeared
+    only after re-opening the session.
+
+    Simulates a card whose final render never lands (finalize does nothing, the
+    card keeps the streamed prefix). The app must notice the answer is not on
+    screen and rebuild the log from the saved session on its own.
+    """
+    from rbit.app import RbitApp
+    from rbit.models import ChatMessage, Session, ToolCallRecord, short_id
+    from rbit.widgets import AssistantMessageCard, ChatScroll
+
+    async def broken_finalize(self: Any, final_msg: Any) -> None:
+        return None
+
+    monkeypatch.setattr(AssistantMessageCard, "finalize", broken_finalize)
+
+    final = "ПОЛНЫЙ_ОТВЕТ после инструментов. КОНЕЦ_ОТВЕТА"
+    sess = Session()
+    sess.messages = [ChatMessage(id=short_id(), role="user", content="сделай")]
+    app = RbitApp(workspace=app_workspace, initial_session=sess)
+    app.config_data["self_check"] = False
+
+    async def fake_run_turn(session, user_msg, agent_mode, model_id, on_tool_start=None,
+                            on_tool_end=None, on_status=None, on_stream_chunk=None,
+                            on_thinking=None, on_reasoning_chunk=None, **_kw):
+        if on_stream_chunk:
+            await on_stream_chunk("Начало")
+        rec = ToolCallRecord(id="t1", name="read", arguments={"filePath": "main.py"},
+                             output="x", status="success", summary="Read")
+        if on_tool_start:
+            await on_tool_start(rec)
+        if on_tool_end:
+            await on_tool_end(rec)
+        return ChatMessage(id=short_id(), role="assistant", content=final, agent=agent_mode,
+                           model=model_id, duration_s=1.0, tool_calls=[rec])
+
+    app.engine.run_turn = fake_run_turn  # type: ignore[assignment]
+
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause(0.2)
+        app._submit_prompt("сделай")
+        for _ in range(60):
+            await pilot.pause(0.1)
+            if not app.is_busy and app.session.finished:
+                break
+        await pilot.pause(2.5)
+
+        scroll = app.query_one("#chat-scroll", ChatScroll)
+        shown = [
+            (getattr(c.query_one("Markdown"), "_markdown", "") or "")
+            for c in scroll.children
+            if isinstance(c, AssistantMessageCard)
+        ]
+        assert any("КОНЕЦ_ОТВЕТА" in text for text in shown), shown

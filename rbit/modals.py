@@ -858,34 +858,55 @@ class PermissionModal(ModalScreen[str]):
         Binding("escape", "deny", "Reject"),
     ]
 
+    #: Seconds after the dialog appears during which allow keys are ignored. The user
+    #: is often typing the next prompt while a tool asks for permission; a stray
+    #: "y" or "a" from that text must not approve a command (or switch on "always").
+    ARM_DELAY = 0.6
+
     def __init__(self, tool_name: str, detail: str, command: str = "") -> None:
         super().__init__()
         self.tool_name = tool_name
         self.detail = detail
         self.command = command
+        self._armed = False
+
+    def on_mount(self) -> None:
+        self.set_timer(self.ARM_DELAY, self._arm)
+
+    def _arm(self) -> None:
+        self._armed = True
 
     def compose(self) -> ComposeResult:
         prefix = " ".join(self.command.split()[:2])
         with Vertical(classes="oc-modal"):
             yield Static(_modal_header("Permission required"), classes="oc-modal-header")
+            # The command comes from the model: show it verbatim. In markup mode a
+            # `[...]` would be swallowed (hiding part of the command) or crash the UI.
             yield Static(
-                f"[#808080]Tool:[/] [bold #fab283]{self.tool_name}[/]\n\n"
-                f"[bold #eeeeee]{self.detail}[/]",
+                Text.assemble(
+                    ("Tool: ", "#808080"),
+                    (self.tool_name, "bold #fab283"),
+                    "\n\n",
+                    (self.detail, "bold #eeeeee"),
+                ),
                 classes="oc-perm-body",
             )
             foot = "y allow once   a always allow   esc reject"
             if prefix:
                 foot = f"y once   a always   p always '{prefix}…'   esc reject"
-            yield Label(foot, classes="oc-modal-foot")
+            yield Label(Text(foot), classes="oc-modal-foot")
 
     def action_allow_once(self) -> None:
-        self.dismiss("once")
+        if self._armed:
+            self.dismiss("once")
 
     def action_allow_always(self) -> None:
-        self.dismiss("always")
+        if self._armed:
+            self.dismiss("always")
 
     def action_allow_prefix(self) -> None:
-        self.dismiss("prefix")
+        if self._armed:
+            self.dismiss("prefix")
 
     def action_deny(self) -> None:
         self.dismiss("deny")
@@ -946,10 +967,10 @@ class QuestionModal(ModalScreen[str | None]):
     def compose(self) -> ComposeResult:
         with Vertical(classes="oc-modal"):
             yield Static(_modal_header("Agent question"), classes="oc-modal-header")
-            yield Static(self.question, classes="oc-perm-body")
+            yield Static(Text(self.question), classes="oc-perm-body")
             if self.options:
                 yield OptionList(
-                    *[Option(option, id=str(index)) for index, option in enumerate(self.options)],
+                    *[Option(Text(option), id=str(index)) for index, option in enumerate(self.options)],
                     id="question-options",
                 )
             yield Input(placeholder="Type an answer...", id="question-input")

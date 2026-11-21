@@ -835,12 +835,21 @@ class AssistantMessageCard(Vertical):
         except Exception:
             pass
 
-    async def _finalize_retry(self) -> None:
-        """Second attempt at rendering the final answer after a late compose."""
+    async def _finalize_retry(self, attempt: int = 0) -> None:
+        """Further attempts at rendering the final answer after a late compose.
+
+        Gives up silently only after ~2s: the app then rebuilds the log from the
+        saved session (`RbitApp._ensure_reply_rendered`), so the answer cannot stay
+        hidden just because compose was slow.
+        """
         try:
             md = self.query_one(Markdown)
             meta = self.query_one(".assistant-meta", Static)
         except NoMatches:
+            if attempt < 20 and self.is_attached:
+                self.set_timer(
+                    0.1, lambda: self._run_coro_safely(self._finalize_retry(attempt + 1))
+                )
             return
         await md.update(self.msg.content)
         meta.update(self._build_meta_text())
@@ -1088,8 +1097,15 @@ class SidebarPanel(Vertical):
             lines = ["[bold #eeeeee]Modified Files[/]"]
             for rel, stat in list(files.items())[-10:]:
                 short_rel = rel if len(rel) <= 22 else "…" + rel[-21:]
-                safe = rel.replace("\\", "/").replace("'", "")
-                line = f"[@click=app.open_file_diff('{safe}')]{short_rel}[/]"
+                from urllib.parse import quote
+
+                from textual.markup import escape as _markup_escape
+
+                # The path travels inside a markup action: percent-encode it so `[`, `]`,
+                # quotes and spaces (`pages/[id].tsx`) cannot break or crash the markup
+                # (the action handler decodes it), and escape the visible label.
+                safe = quote(rel.replace("\\", "/"), safe="/")
+                line = f"[@click=app.open_file_diff('{safe}')]{_markup_escape(short_rel)}[/]"
                 if stat.added:
                     line += f" [#7fd88f]+{stat.added}[/]"
                 if stat.removed:

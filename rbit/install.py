@@ -148,8 +148,12 @@ def install_skill(
             skill_name = entry.parent.name
         else:
             skill_name = root.name or entry.stem
-        skill_name = re.sub(r"[^A-Za-z0-9._-]+", "-", skill_name) or "skill"
+        # A leading dot would let `.` / `..` name the skills dir (or `.rbit`) itself,
+        # and the replace branch below deletes the target directory.
+        skill_name = re.sub(r"[^A-Za-z0-9._-]+", "-", skill_name).lstrip(".") or "skill"
         target_dir = skills_dir / skill_name
+        if target_dir.resolve().parent != skills_dir.resolve():
+            raise InstallError(f"invalid skill name `{skill_name}`")
         if target_dir.exists():
             existing = target_dir / "SKILL.md"
             changed = existing.is_file() and _digest(existing) != _digest(entry)
@@ -174,6 +178,18 @@ def install_skill(
     return InstallResult(skill_name, target_dir, source, "skill", replaced)
 
 
+_PLUGIN_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _require_plugin_name(name: str) -> None:
+    """Rejects names that could escape `.rbit/plugins` (`.`, `..`, separators)."""
+    if not _PLUGIN_NAME_RE.fullmatch(name or "") or ".." in name:
+        raise InstallError(
+            "plugin name must start with a letter or digit and may only contain "
+            "letters, digits, dot, dash, underscore"
+        )
+
+
 def validate_plugin_manifest(root: Path) -> dict[str, Any]:
     """Reads and checks `plugin.json`; raises when it is unusable."""
     manifest_path = root / MANIFEST_NAME
@@ -190,8 +206,7 @@ def validate_plugin_manifest(root: Path) -> dict[str, Any]:
     name = str(data.get("name") or "").strip()
     if not name:
         raise InstallError(f"{MANIFEST_NAME} must declare a `name`")
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
-        raise InstallError("plugin name may only contain letters, digits, dot, dash, underscore")
+    _require_plugin_name(name)
     entry = str(data.get("entry") or "").strip()
     if entry and not (root / entry).is_file():
         raise InstallError(f"declared entry `{entry}` does not exist in the source")
@@ -268,6 +283,7 @@ def _set_plugin_enabled(workspace: Path, name: str, enabled: bool) -> None:
 
 
 def set_plugin_enabled(workspace: Path, name: str, enabled: bool) -> None:
+    _require_plugin_name(name)
     target = workspace / ".rbit" / "plugins" / name
     if not target.is_dir():
         raise InstallError(f"plugin `{name}` is not installed")
@@ -275,6 +291,7 @@ def set_plugin_enabled(workspace: Path, name: str, enabled: bool) -> None:
 
 
 def remove_plugin(workspace: Path, name: str) -> None:
+    _require_plugin_name(name)  # `rbit plugin remove ../..` must not delete the workspace
     target = workspace / ".rbit" / "plugins" / name
     if not target.is_dir():
         raise InstallError(f"plugin `{name}` is not installed")

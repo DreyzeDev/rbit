@@ -20,6 +20,7 @@ from typing import Any
 
 from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
+from rich.markup import escape as markup_escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -60,7 +61,7 @@ def _create_worktree(workspace: Path, name: str = "") -> Path | None:
             ["git", "worktree", "add", str(target), branch], cwd=str(repo), capture_output=True, text=True, check=False
         )
     if proc.returncode != 0:
-        console.print(f"[red]git worktree failed:[/] {(proc.stderr or proc.stdout).strip()[:300]}")
+        console.print(f"[red]git worktree failed:[/] {markup_escape((proc.stderr or proc.stdout).strip()[:300])}")
         return None
     console.print(f"[#7fd88f]Worktree:[/] {target} [dim]({branch})[/]")
     return target
@@ -177,7 +178,7 @@ async def _run_headless(args: argparse.Namespace) -> int:
         if jsonl_mode:
             _jsonl({"event": "tool_start", "name": rec.name, "arguments": rec.arguments})
         elif not json_mode:
-            console.print(f"[#808080]  ~ {rec.name}[/] [dim]{json.dumps(rec.arguments, ensure_ascii=False)}[/]")
+            console.print(f"[#808080]  ~ {markup_escape(rec.name)}[/] [dim]{markup_escape(json.dumps(rec.arguments, ensure_ascii=False))}[/]")
 
     async def on_tool_end(rec: ToolCallRecord) -> None:
         if jsonl_mode:
@@ -191,7 +192,7 @@ async def _run_headless(args: argparse.Namespace) -> int:
             )
         elif not json_mode:
             color = "#7fd88f" if rec.status == "success" else "#e06c75"
-            console.print(f"[{color}]  ✓ {rec.name}[/] [#808080]{rec.summary}[/]")
+            console.print(f"[{color}]  ✓ {markup_escape(rec.name)}[/] [#808080]{markup_escape(str(rec.summary))}[/]")
 
     async def on_status(_txt: str) -> None:
         return
@@ -394,6 +395,8 @@ def _run_auth(
     if not isinstance(credentials, dict):
         credentials = {}
     active = str(cfg.get("active_credential") or "")
+    if cmd == "ls":  # argparse stores the alias the user typed
+        cmd = "list"
     if cmd == "list":
         entries = []
         base = str(cfg.get("api_base") or "(not set)")
@@ -498,6 +501,10 @@ def _run_auth(
             storage.save_config(cfg)
             console.print(f"credential removed: {cred_name}")
             return 0
+        if name:
+            # An unknown name must not fall through to wiping the active API key.
+            console.print(f"[red]Unknown credential:[/] {markup_escape(name)}")
+            return 1
         cfg["api_key"] = ""
         cfg["active_credential"] = ""
         storage.save_config(cfg)
@@ -554,7 +561,7 @@ def _run_auth(
                 text = sys.stdin.read()
             data = json.loads(text)
         except (OSError, ValueError) as exc:
-            console.print(f"[red]Import failed:[/] {exc}")
+            console.print(f"[red]Import failed:[/] {markup_escape(str(exc))}")
             return 1
         if not isinstance(data, dict):
             console.print("[red]Import failed:[/] expected a JSON object")
@@ -732,7 +739,7 @@ def _run_github(workspace: Path, kind: str, number: int, as_json: bool) -> int:
         check=False,
     )
     if proc.returncode != 0:
-        console.print(f"[red]gh {kind} view failed:[/] {(proc.stderr or proc.stdout).strip()[:400]}")
+        console.print(f"[red]gh {kind} view failed:[/] {markup_escape((proc.stderr or proc.stdout).strip()[:400])}")
         return 1
     try:
         data = json.loads(proc.stdout)
@@ -1035,7 +1042,7 @@ def _run_import(workspace: Path, source: str) -> int:
             with urllib.request.urlopen(source, timeout=20) as response:
                 text = response.read().decode("utf-8", errors="replace")
         except Exception as exc:  # noqa: BLE001 - network/URL errors are user-facing
-            console.print(f"[red]Download failed:[/] {exc}")
+            console.print(f"[red]Download failed:[/] {markup_escape(str(exc))}")
             return 1
         name = Path(source.split("?", 1)[0]).name or "remote-session.json"
         fpath = Path(name if Path(name).suffix else "remote-session.json")
@@ -1411,7 +1418,7 @@ def _run_sessions_prune(workspace: Path, age_spec: str) -> int:
     try:
         seconds = _parse_age_spec(age_spec)
     except ValueError as exc:
-        console.print(f"[bold #e06c75]{exc}[/]")
+        console.print(f"[bold #e06c75]{markup_escape(str(exc))}[/]")
         return 2
 
     cutoff = time.time() - seconds
@@ -1568,11 +1575,11 @@ def _run_commit(workspace: Path, apply: bool = False, message: str | None = None
 
     add = git("add", "-A")
     if add.returncode != 0:
-        console.print(f"[bold #e06c75]git add failed:[/] {add.stderr.strip()}")
+        console.print(f"[bold #e06c75]git add failed:[/] {markup_escape(add.stderr.strip())}")
         return 1
     commit = git("commit", "-m", draft)
     if commit.returncode != 0:
-        console.print(f"[bold #e06c75]git commit failed:[/] {commit.stderr.strip()}")
+        console.print(f"[bold #e06c75]git commit failed:[/] {markup_escape(commit.stderr.strip())}")
         return 1
 
     subject = draft.splitlines()[0]
@@ -1682,7 +1689,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             p.add_argument("--archived", action="store_true", help="Create the session archived")
             p.add_argument("--thinking", action="store_true", help="Show reasoning/thinking blocks")
-            p.add_argument("-f", "--file", action="append", default=None, help="File(s) to attach to the message")
+            p.add_argument(
+                "-f", "--file", dest="files", action="append", default=None, help="File(s) to attach to the message"
+            )
             p.add_argument("--title", nargs="?", const="", default=None, help="Session title (truncated prompt if no value)")
             p.add_argument("-d", "--dir", help="Target workspace directory")
             p.add_argument("--stdin", action="store_true", help="Read the prompt (or extra context) from stdin")
@@ -2712,7 +2721,7 @@ def _run_api(args: argparse.Namespace) -> int:
     try:
         status_code, body = api_request(url, method, path, data=data, headers=headers, params=params)
     except httpx.HTTPError as exc:
-        console.print(f"[red]Request failed:[/] {exc}")
+        console.print(f"[red]Request failed:[/] {markup_escape(str(exc))}")
         return 1
     try:
         parsed = json.loads(body)
@@ -2857,7 +2866,7 @@ def _run_uninstall(dry_run: bool = False, force: bool = False) -> int:
     if proc.returncode == 0:
         console.print("[#7fd88f]rbit uninstalled. Session data was kept in ~/.rbit.[/]")
         return 0
-    console.print(f"[#e06c75]uninstall failed:[/] {(proc.stderr or proc.stdout).strip()[-500:]}")
+    console.print(f"[#e06c75]uninstall failed:[/] {markup_escape((proc.stderr or proc.stdout).strip()[-500:])}")
     return 1
 
 
@@ -2878,7 +2887,7 @@ def _run_reload(server: str | None = None) -> int:
     try:
         response = httpx.post(f"{url}/v1/reload", timeout=10.0)
     except httpx.HTTPError as exc:
-        console.print(f"[red]reload failed:[/] {exc}")
+        console.print(f"[red]reload failed:[/] {markup_escape(str(exc))}")
         return 1
     console.print(f"reload: HTTP {response.status_code}")
     return 0 if response.status_code < 400 else 1
@@ -2952,10 +2961,10 @@ async def _run_mini(args: argparse.Namespace) -> int:
     console.print("[bold #fab283]rbit mini[/] [dim]type /exit to quit[/]")
 
     async def _tool_start(rec: ToolCallRecord) -> None:
-        console.print(f"[#808080]  ~ {rec.name}[/] [dim]{json.dumps(rec.arguments, ensure_ascii=False)}[/]")
+        console.print(f"[#808080]  ~ {markup_escape(rec.name)}[/] [dim]{markup_escape(json.dumps(rec.arguments, ensure_ascii=False))}[/]")
 
     async def _tool_end(rec: ToolCallRecord) -> None:
-        console.print(f"[#808080]  ✓ {rec.name}: {rec.summary}[/]")
+        console.print(f"[#808080]  ✓ {markup_escape(rec.name)}: {markup_escape(str(rec.summary))}[/]")
 
     while True:
         try:
@@ -3279,7 +3288,7 @@ def _run_skill(
         try:
             result = install_skill(source, workspace=workspace, name=name or "", force=force)
         except InstallError as exc:
-            console.print(f"[red]Install failed:[/] {exc}")
+            console.print(f"[red]Install failed:[/] {markup_escape(str(exc))}")
             return 1
         console.print(result.describe())
         console.print("The skill is available immediately via `/skill`.")
@@ -3339,7 +3348,7 @@ def _run_plugin(
         try:
             result = install_plugin(name, workspace=workspace, force=force, approve=approve)
         except InstallError as exc:
-            console.print(f"[red]Install failed:[/] {exc}")
+            console.print(f"[red]Install failed:[/] {markup_escape(str(exc))}")
             return 1
         console.print(result.describe())
         if approve:
@@ -3358,7 +3367,7 @@ def _run_plugin(
         try:
             set_plugin_enabled(workspace, name, action == "enable")
         except InstallError as exc:
-            console.print(f"[red]{exc}[/]")
+            console.print(f"[red]{markup_escape(str(exc))}[/]")
             return 1
         console.print(f"plugin `{name}` {action}d")
         return 0
@@ -3370,7 +3379,7 @@ def _run_plugin(
         try:
             remove_plugin(workspace, name)
         except InstallError as exc:
-            console.print(f"[red]{exc}[/]")
+            console.print(f"[red]{markup_escape(str(exc))}[/]")
             return 1
         console.print(f"plugin `{name}` removed")
         return 0
@@ -3933,6 +3942,24 @@ def _mobile_links(port: int, token: str) -> list[tuple[str, str]]:
     return links
 
 
+_SECRET_KEY_RE = re.compile(r"(api_?key|token$|secret|password|authorization|credential|oauth)", re.IGNORECASE)
+
+
+def _mask_secret_values(value: Any, key: str = "") -> Any:
+    """Deep copy of `value` with every secret-looking entry replaced by '***'.
+
+    Keys are matched by name (api_key, *_token, authorization, credentials, mcp_oauth...)
+    so nested MCP headers, per-profile keys and OAuth stores are covered too.
+    """
+    if key and _SECRET_KEY_RE.search(key):
+        return "***" if value not in (None, "", {}, []) else value
+    if isinstance(value, dict):
+        return {k: _mask_secret_values(v, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_mask_secret_values(v, key) for v in value]
+    return value
+
+
 def _run_serve(
     args: argparse.Namespace,
     hostname: str = "127.0.0.1",
@@ -3983,6 +4010,20 @@ def _run_serve(
                 server_token = _secrets.token_urlsafe(24)
         except Exception:  # noqa: BLE001 - token persistence is optional
             server_token = _secrets.token_urlsafe(24)
+    if not server_token and hostname not in ("127.0.0.1", "localhost", "::1"):
+        # Listening beyond loopback without a token would hand the agent (and its
+        # bash tool) to everyone on the network: always require one.
+        import secrets as _secrets
+
+        server_token = _secrets.token_urlsafe(24)
+
+    def _token_matches(value: str, tokens: set[str]) -> bool:
+        """Constant-time token comparison."""
+        import hmac
+
+        data = value.encode("utf-8", "replace")
+        return any(hmac.compare_digest(data, token.encode("utf-8", "replace")) for token in tokens)
+
     sessions: dict[str, Session] = {}
     # Interactive tool approvals: with RBIT_APPROVALS=1 the desktop client gets
     # a `tool_approval` event for every non-read-only bash command and answers
@@ -4217,30 +4258,57 @@ def _run_serve(
         def log_message(self, *a) -> None:  # quiet
             return
 
+        def _host_is_loopback(self) -> bool:
+            """DNS-rebinding guard: a loopback-bound server only answers loopback Host names."""
+            host = (self.headers.get("Host") or "").strip().lower()
+            if host.startswith("["):
+                name = host[1:].split("]", 1)[0]
+            elif host.count(":") == 1:
+                name = host.rsplit(":", 1)[0]
+            else:
+                name = host
+            return name in ("127.0.0.1", "localhost", "::1")
+
+        def _origin_trusted(self) -> bool:
+            """A browser Origin is trusted only when it is this server or listed in --cors.
+
+            Requests without an Origin (CLI, native apps) are not cross-site browser requests.
+            """
+            origin = self.headers.get("Origin", "")
+            if not origin:
+                return True
+            if cors_origins and origin in cors_origins:
+                return True
+            host = self.headers.get("Host", "")
+            return bool(host) and origin in (f"http://{host}", f"https://{host}")
+
         def _authorized(self) -> bool:
             tokens = {token for token in (server_token, pair_token) if token}
             if not tokens:
-                return True
+                # No token configured: only same-origin loopback clients may talk to
+                # the server. Any website could otherwise drive the agent (bash!)
+                # with a cross-origin fetch to 127.0.0.1.
+                return self._host_is_loopback() and self._origin_trusted()
             if self.path.split("?", 1)[0] in ("/health", "/openapi.json", "/v1/openapi.json"):
                 return True
             authorization = self.headers.get("Authorization", "")
-            if authorization.startswith("Bearer ") and authorization[7:] in tokens:
+            if authorization.startswith("Bearer ") and _token_matches(authorization[7:], tokens):
                 return True
             explicit = self.headers.get("X-RBit-Token", "") or self.headers.get("X-RBit-Pair", "")
-            if explicit and explicit in tokens:
+            if explicit and _token_matches(explicit, tokens):
                 return True
             from urllib.parse import parse_qs, urlparse
 
             query = parse_qs(urlparse(self.path).query)
             for key in ("pair", "token"):
                 value = (query.get(key) or [""])[0]
-                if value and value in tokens:
+                if value and _token_matches(value, tokens):
                     return True
             cookie = self.headers.get("Cookie", "")
             for part in cookie.split(";"):
                 if part.strip().startswith("rbit_pair="):
                     value = part.strip().split("=", 1)[1]
-                    if value in tokens:
+                    if _token_matches(value, tokens):
                         return True
             return False
 
@@ -4262,7 +4330,12 @@ def _run_serve(
 
         def _cors(self) -> None:
             origin = self.headers.get("Origin", "")
-            allowed = origin if origin and cors_origins and origin in cors_origins else "*"
+            if origin and self._origin_trusted():
+                allowed = origin
+            elif server_token or pair_token:
+                allowed = "*"  # bearer-token protected: a foreign page cannot supply it
+            else:
+                return  # token-less server: never grant a foreign website access
             self.send_header("Access-Control-Allow-Origin", allowed)
             self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS, DELETE")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-RBit-Token, X-RBit-Pair")
@@ -4369,10 +4442,15 @@ def _run_serve(
                 raw = unquote((query.get("path") or ["."])[0])
                 try:
                     target = (workspace / raw).resolve() if not Path(raw).is_absolute() else Path(raw).resolve()
-                    target.relative_to(workspace)
+                    rel_parts = target.relative_to(workspace.resolve()).parts
                 except (ValueError, OSError):
                     self._send_json({"error": "path outside workspace"}, 403)
                 else:
+                    from rbit.tools import is_secret_file
+
+                    if ".rbit" in rel_parts or ".git" in rel_parts or is_secret_file(target):
+                        self._send_json({"error": "forbidden path"}, 403)
+                        return
                     if target.is_dir():
                         entries = [
                             {"name": child.name, "type": "dir" if child.is_dir() else "file"}
@@ -4401,13 +4479,7 @@ def _run_serve(
                     }
                 )
             elif self.path == "/v1/config":
-                redacted = dict(cfg)
-                if redacted.get("api_key"):
-                    redacted["api_key"] = "***"
-                for profile in (redacted.get("profiles") or {}).values():
-                    if isinstance(profile, dict) and profile.get("api_key"):
-                        profile["api_key"] = "***"
-                self._send_json(redacted)
+                self._send_json(_mask_secret_values(cfg))
             elif self.path == "/v1/skills":
                 from rbit.skills import load_skills
 
@@ -4856,7 +4928,7 @@ def _run_watch(workspace: Path, run_prompt: str | None, interval: float) -> int:
             model_id=str(cfg.get("model", "rbit/smart-local")),
             on_tool_start=_noop, on_tool_end=_noop, on_status=_noop_s,
         )
-        console.print(f"[bold #7fd88f]rbit[/] {reply.content[:600]}")
+        console.print(f"[bold #7fd88f]rbit[/] {markup_escape(reply.content[:600])}")
 
     def scan() -> list[str]:
         changed: list[str] = []

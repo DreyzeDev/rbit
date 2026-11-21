@@ -1465,6 +1465,14 @@ class ToolExecutor:
 
         if not raw:
             return ToolResult(False, "missing filePath", "filePath is required.")
+        if not old_str:
+            # `"".replace("", x)` inserts x between every character and `count("")`
+            # matches everywhere, so an empty oldString would corrupt the file.
+            return ToolResult(
+                False,
+                "empty oldString",
+                "oldString must not be empty; use `write` to create or overwrite a file.",
+            )
         target = self.resolve_path(raw)
         rel = self.rel_display(target)
         if not target.exists():
@@ -1548,6 +1556,8 @@ class ToolExecutor:
             old_s = str(ed.get("oldString", ""))
             new_s = str(ed.get("newString", ""))
             rep_all = bool(ed.get("replaceAll", False))
+            if not old_s:
+                return ToolResult(False, f"edit #{idx} failed", f"oldString in edit #{idx} must not be empty.")
             if old_s not in updated:
                 return ToolResult(False, f"edit #{idx} failed", f"oldString in edit #{idx} not found.")
             if not rep_all and updated.count(old_s) > 1:

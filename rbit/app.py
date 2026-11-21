@@ -19,8 +19,9 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
+from textual.markup import escape as markup_escape
 from textual.timer import Timer
-from textual.widgets import Input, OptionList, Static
+from textual.widgets import Input, Markdown, OptionList, Static
 
 from . import __version__
 from .agent import AgentEngine
@@ -881,6 +882,9 @@ class RbitApp(App[None]):
     @work
     async def action_open_file_diff(self, rel: str) -> None:
         """Shows the session's cumulative diff for a modified file (sidebar click)."""
+        from urllib.parse import unquote
+
+        rel = unquote(rel)  # the sidebar percent-encodes the path inside its markup action
         try:
             target = self.executor.resolve_path(rel)
         except Exception:
@@ -1501,11 +1505,18 @@ class RbitApp(App[None]):
         if getattr(event.widget, "id", None) == "load-older":
             self._load_older()
 
-    def _post_notice(self, text: str) -> None:
+    def _post_notice(self, text: str, *, markup: bool = False) -> None:
+        """Posts an inline notice.
+
+        Plain text by default: notices carry test output, file names (`pages/[id].tsx`),
+        git output and error text, and `[/tmp/x]` in markup mode raises MarkupError
+        and crashes the app, while `[id]` silently disappears. Pass `markup=True`
+        only for text built from trusted tags with every dynamic part escaped.
+        """
         self._has_inline_notices = True
         self._update_layout_mode()
         scroll = self.query_one("#chat-scroll", ChatScroll)
-        scroll.mount(Static(text, classes="system-notice"))
+        scroll.mount(Static(text, classes="system-notice", markup=markup))
         self._smart_scroll_end()
 
     async def _auto_title(self, session: Session, first_user_text: str) -> None:
@@ -1604,10 +1615,11 @@ class RbitApp(App[None]):
             lines = ["[bold #eeeeee]Skills[/]"]
             for name, meta in skills.items():
                 lines.append(
-                    f"  • [bold]{name}[/] — {meta.get('description') or '(no description)'}"
-                    f"  → /skill {name}"
+                    f"  • [bold]{markup_escape(str(name))}[/] — "
+                    f"{markup_escape(str(meta.get('description') or '(no description)'))}"
+                    f"  → /skill {markup_escape(str(name))}"
                 )
-            self._post_notice("\n".join(lines))
+            self._post_notice("\n".join(lines), markup=True)
             return
         name = parts[0].strip()
         if name not in skills:
@@ -1698,18 +1710,23 @@ class RbitApp(App[None]):
             status = self.mcp.status.get(name) or {}
             if status.get("connected"):
                 count = int(status.get("tools") or 0)
-                lines.append(f"  [bold #7fd88f]●[/] [bold]{name}[/] — {count} tool(s), {status.get('transport', 'stdio')}")
+                lines.append(
+                    f"  [bold #7fd88f]●[/] [bold]{markup_escape(str(name))}[/] — {count} tool(s), "
+                    f"{markup_escape(str(status.get('transport', 'stdio')))}"
+                )
             else:
                 error = status.get("error") or "not connected"
-                lines.append(f"  [bold #e06c75]●[/] [bold]{name}[/] — {error}")
+                lines.append(f"  [bold #e06c75]●[/] [bold]{markup_escape(str(name))}[/] — {markup_escape(str(error))}")
         if self.mcp.tools:
             lines.append("")
             lines.append("[bold #eeeeee]Tools[/]")
             for exposed, tool in self.mcp.tools.items():
-                lines.append(f"  • [bold]{exposed}[/] — {tool.description[:80]}")
+                lines.append(
+                    f"  • [bold]{markup_escape(str(exposed))}[/] — {markup_escape(str(tool.description)[:80])}"
+                )
         lines.append("")
         lines.append("[#808080]/mcp add <name> <command…> · /mcp add <name> --url <url> · /mcp reload[/]")
-        self._post_notice("\n".join(lines))
+        self._post_notice("\n".join(lines), markup=True)
 
     @work(exclusive=True)
     async def _reload_mcp(self) -> None:
@@ -2081,6 +2098,50 @@ class RbitApp(App[None]):
         except Exception:
             pass
 
+    async def _show_reply(self, scroll: ChatScroll, reply: ChatMessage) -> None:
+        """Renders the finished answer: finalizes the live card or mounts a fresh one."""
+        live_card = self._live_card
+        self._live_card = None
+        if live_card is not None:
+            await live_card.finalize(reply)
+        else:
+            await scroll.mount(AssistantMessageCard(reply, self.engine.extra_models))
+
+    @staticmethod
+    def _reply_is_rendered(scroll: ChatScroll, reply: ChatMessage) -> bool:
+        """True when a mounted card on screen already shows the whole reply text."""
+        expected = (reply.content or "").strip()
+        for card in scroll.children:
+            if not isinstance(card, AssistantMessageCard) or card.msg.id != reply.id:
+                continue
+            try:
+                shown = (getattr(card.query_one(Markdown), "_markdown", "") or "").strip()
+            except NoMatches:
+                return False
+            return shown == expected
+        return False
+
+    def _ensure_reply_rendered(self, reply: ChatMessage, attempt: int = 0) -> None:
+        """Rebuilds the chat log when the finished answer never reached the screen.
+
+        Reported symptom: after a task ends only the tool cards are visible and the
+        answer shows up only after re-opening the session. The reply is always saved
+        in the session, so a rebuild (what re-opening does) restores it.
+        """
+        if self.is_busy or reply not in self.session.messages:
+            return  # a new turn owns the view, or the reply was removed on purpose
+        try:
+            scroll = self.query_one("#chat-scroll", ChatScroll)
+        except NoMatches:
+            return
+        if (reply.content or "").strip() == "" or self._reply_is_rendered(scroll, reply):
+            return
+        if attempt < 3:
+            self.set_timer(0.3, lambda: self._ensure_reply_rendered(reply, attempt + 1))
+            return
+        self._rebuild_chat_view()
+        self.call_after_refresh(self._reveal_turn_result)
+
     def _smart_scroll_end(self) -> None:
         """Follows new output only while the user is already at the bottom."""
         self.query_one("#chat-scroll", ChatScroll).follow_end()
@@ -2301,7 +2362,9 @@ class RbitApp(App[None]):
             self._cmd_mcp(arg)
             return True
         if cmd == "/continue":
-            self._run_coro(self._cmd_continue_session(arg))
+            # Already a `@work` method: calling it starts the worker. Wrapping the
+            # returned Worker in `run_worker` raised WorkerFailed and crashed the app.
+            self._cmd_continue_session(arg)
             return True
         if cmd in ("/skill", "/skills"):
             self._cmd_skill(arg)
@@ -2847,6 +2910,7 @@ class RbitApp(App[None]):
         self._schedule_save_session(delay=0.05)
 
         quiet = bool(self.config_data.get("quiet"))
+        last_reply: ChatMessage | None = None
 
         async def on_tool_start(rec: ToolCallRecord) -> None:
             self._settle_thinking()
@@ -2966,13 +3030,9 @@ class RbitApp(App[None]):
                 self._live_card = None
                 return
             session.messages.append(reply)
+            last_reply = reply
             self._schedule_save_session(delay=0.05)
-            live_card = self._live_card
-            self._live_card = None
-            if live_card is not None:
-                await live_card.finalize(reply)
-            else:
-                scroll.mount(AssistantMessageCard(reply, self.engine.extra_models))
+            await self._show_reply(scroll, reply)
             self._smart_scroll_end()
 
             # Self-check: diagnostics over files mutated this turn; a single
@@ -2993,9 +3053,9 @@ class RbitApp(App[None]):
                         fix_reply = await run_engine_once(fix_msg)
                         if not self._interrupted_turn:
                             session.messages.append(fix_reply)
+                            last_reply = fix_reply
                             self._schedule_save_session(delay=0.05)
-                            self._live_card = None
-                            scroll.mount(AssistantMessageCard(fix_reply, self.engine.extra_models))
+                            await self._show_reply(scroll, fix_reply)
                             self._smart_scroll_end()
                     finally:
                         self._auto_fix_round = False
@@ -3023,6 +3083,11 @@ class RbitApp(App[None]):
             # tool cards were still growing) still ends up on screen.
             if not self._interrupted_turn:
                 self.call_after_refresh(self._reveal_turn_result)
+                if last_reply is not None:
+                    # Safety net: the answer is already saved in the session, so if
+                    # its card failed to render, rebuild the log exactly as a
+                    # re-open of the session would.
+                    self.set_timer(0.4, lambda r=last_reply: self._ensure_reply_rendered(r))
             if self.config_data.get("notify_done", True) and getattr(self, "_turn_started", 0):
                 import time as _time
 

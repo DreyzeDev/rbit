@@ -4,8 +4,12 @@ const { app, BrowserWindow, shell } = require("electron");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const crypto = require("crypto");
 
 const PORT = Number(process.env.RBIT_DESKTOP_PORT || 8337);
+// One random bearer token per launch: the backend refuses every request without
+// it, so a web page in the user's browser cannot drive the local agent.
+const TOKEN = crypto.randomBytes(24).toString("base64url");
 const WORKSPACE = process.env.RBIT_DESKTOP_WORKSPACE || app.getPath("home");
 let backend = null;
 let backendReady = false;
@@ -37,7 +41,7 @@ function startBackend() {
   const py = process.platform === "win32" ? "python" : "python3";
   backend = spawn(py, ["-m", "rbit.cli", "serve", "--port", String(PORT), "-d", WORKSPACE], {
     cwd: WORKSPACE,
-    env: { ...process.env, PYTHONUNBUFFERED: "1" },
+    env: { ...process.env, PYTHONUNBUFFERED: "1", RBIT_SERVER_TOKEN: TOKEN },
     stdio: ["ignore", "pipe", "pipe"],
   });
   backend.stderr.on("data", (d) => console.error("[rbit]", String(d)));
@@ -68,11 +72,12 @@ function createWindow() {
     },
   });
   win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    // Only web links: file:, smb: and custom protocols can launch local programs.
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
     return { action: "deny" };
   });
   win.loadFile(path.join(__dirname, "renderer", "index.html"), {
-    query: { port: String(PORT), workspace: WORKSPACE, ready: backendReady ? "1" : "0" },
+    query: { port: String(PORT), workspace: WORKSPACE, ready: backendReady ? "1" : "0", token: TOKEN },
   });
 }
 
