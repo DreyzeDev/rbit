@@ -1,6 +1,7 @@
 // rbit desktop: spawns `rbit serve` (the local HTTP/NDJSON backend) and shows
 // the chat UI. Requires Python with the rbit package installed.
-const { app, BrowserWindow, shell } = require("electron");
+const { app, BrowserWindow, shell, ipcMain } = require("electron");
+const { pathToFileURL } = require("url");
 const { spawn } = require("child_process");
 const http = require("http");
 const net = require("net");
@@ -105,6 +106,30 @@ function killBackend() {
   }
 }
 
+// Hands the renderer its config (including the bearer token) over IPC, and only to a
+// frame that was loaded from this app's own renderer folder. Anything else (a page
+// that navigated away, a foreign frame) gets nothing.
+const RENDERER_DIR_URL = pathToFileURL(path.join(__dirname, "renderer") + path.sep).href;
+
+function isOurRenderer(url) {
+  if (typeof url !== "string" || !url) return false;
+  const norm = (u) => decodeURIComponent(u).replace(/\\/g, "/").toLowerCase();
+  try {
+    return norm(url).startsWith(norm(RENDERER_DIR_URL));
+  } catch {
+    return false;
+  }
+}
+
+ipcMain.on("rbit:config", (event) => {
+  const frameUrl = event.senderFrame ? event.senderFrame.url : "";
+  if (!isOurRenderer(frameUrl)) {
+    event.returnValue = null;
+    return;
+  }
+  event.returnValue = { port: PORT, workspace: WORKSPACE, token: TOKEN, ready: backendReady };
+});
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1280,
@@ -126,9 +151,8 @@ function createWindow() {
     if (/^https?:\/\//i.test(url)) shell.openExternal(url);
     return { action: "deny" };
   });
-  win.loadFile(path.join(__dirname, "renderer", "index.html"), {
-    query: { port: String(PORT), workspace: WORKSPACE, ready: backendReady ? "1" : "0", token: TOKEN },
-  });
+  // No query string: port, workspace and token reach the page through the preload IPC.
+  win.loadFile(path.join(__dirname, "renderer", "index.html"));
 }
 
 app.on("second-instance", () => {

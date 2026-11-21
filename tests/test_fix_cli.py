@@ -333,3 +333,41 @@ def test_desktop_csp_and_renderer_guards() -> None:
     app_js = _read("desktop/renderer/app.js")
     assert 'ev.type === "session"' in app_js
     assert "if (busy) return" in app_js
+
+
+# --- desktop: the bearer token travels over IPC, not in the page URL ---------
+
+
+def test_desktop_token_is_not_in_the_window_url() -> None:
+    root = Path(__file__).resolve().parent.parent / "desktop"
+    main = (root / "main.js").read_text(encoding="utf-8")
+    preload = (root / "preload.js").read_text(encoding="utf-8")
+
+    assert "query:" not in main  # loadFile no longer carries port/workspace/token
+    assert "token: TOKEN" in main and 'ipcMain.on("rbit:config"' in main
+    assert 'ipcRenderer.sendSync("rbit:config")' in preload
+    assert "location.search" not in preload and "URLSearchParams" not in preload
+
+
+def test_desktop_config_ipc_only_answers_our_own_renderer() -> None:
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    repo = Path(__file__).resolve().parent.parent
+    probe = repo / "tests" / "js" / "desktop_ipc_probe.js"
+    proc = subprocess.run(
+        [node, str(probe), str(repo)], capture_output=True, text=True, encoding="utf-8", timeout=60
+    )
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert result["registered"] is True
+    assert result["oursHasToken"] is True and result["oursHasPort"] is True
+    assert result["oursWithQueryAllowed"] is True
+    assert result["foreignHttps"] is None  # a foreign page never gets the token
+    assert result["siblingDir"] is None  # nor a look-alike folder next to renderer/
+    assert result["noFrame"] is None
