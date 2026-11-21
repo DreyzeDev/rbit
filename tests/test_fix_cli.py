@@ -255,12 +255,77 @@ def _read(relative: str) -> str:
 def test_windows_launchers_isolate_cwd_and_propagate_exit_code() -> None:
     bat = _read("rbit.bat")
     ps1 = _read("rbit.ps1")
-    assert "PYTHONSAFEPATH=1" in bat and '"%RBIT_PY%" -P -m rbit' in bat
+    for text in (bat, ps1):
+        # `-P` and PYTHONSAFEPATH exist only on Python 3.11+ (3.10 is supported), and the env
+        # var would leak into every Python process the agent starts: neither may be used in
+        # code (the comments explaining this may of course mention them).
+        code = "\n".join(
+            line for line in text.splitlines() if not line.lstrip().lower().startswith(("rem ", "#"))
+        )
+        assert " -P " not in code and "PYTHONSAFEPATH" not in code
+        assert "sys.path[:] = [p for p in sys.path if p not in ('', '.')]" in code
+        assert "runpy.run_module('rbit', run_name='__main__', alter_sys=True)" in text
     assert "exit /b %ERRORLEVEL%" in bat
     assert 'if not exist "%RBIT_PY%"' in bat  # falls back to PATH python without .venv
-    assert "-P -m rbit @args" in ps1
-    assert "exit $LASTEXITCODE" in ps1
+    assert "@args" in ps1 and "exit $LASTEXITCODE" in ps1
     assert "UTF8" in ps1
+
+
+def _hijacked_project(tmp_path: Path) -> Path:
+    project = tmp_path / "proj"
+    (project / "rbit").mkdir(parents=True)
+    (project / "rbit" / "__init__.py").write_text(
+        'print("HIJACKED")\nraise SystemExit(99)\n', encoding="utf-8"
+    )
+    (project / "json.py").write_text('print("HIJACKED json")\n', encoding="utf-8")
+    return project
+
+
+def _launcher_env() -> dict[str, str]:
+    import os
+
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONSAFEPATH"}
+    env["PYTHONPATH"] = str(REPO_ROOT)  # makes rbit importable without an installed copy
+    return env
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows launchers")
+def test_plain_python_dash_m_is_hijackable_from_the_project_dir(tmp_path: Path) -> None:
+    """Documents the threat the launchers close (and proves the fixture is effective)."""
+    import subprocess
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "rbit", "--version"], cwd=_hijacked_project(tmp_path),
+        env=_launcher_env(), capture_output=True, text=True, encoding="utf-8", timeout=60,
+    )
+    assert "HIJACKED" in proc.stdout
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows launchers")
+@pytest.mark.parametrize("launcher", ["bat", "ps1"])
+def test_launchers_ignore_a_package_planted_in_the_project_dir(tmp_path: Path, launcher: str) -> None:
+    import subprocess
+
+    command = (
+        [str(REPO_ROOT / "rbit.bat")]
+        if launcher == "bat"
+        else ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(REPO_ROOT / "rbit.ps1")]
+    )
+    project = _hijacked_project(tmp_path)
+
+    ok = subprocess.run(
+        [*command, "--version"], cwd=project, env=_launcher_env(),
+        capture_output=True, text=True, encoding="utf-8", timeout=60,
+    )
+    assert "HIJACKED" not in ok.stdout + ok.stderr
+    assert ok.stdout.strip().startswith("rbit v") and ok.returncode == 0
+
+    # Arguments reach rbit and its exit code comes back out of the launcher.
+    bad = subprocess.run(
+        [*command, "--generate-completion", "tcsh"], cwd=project, env=_launcher_env(),
+        capture_output=True, text=True, encoding="utf-8", timeout=60,
+    )
+    assert bad.returncode == 2 and "Unsupported shell" in bad.stderr
 
 
 def test_action_installs_from_action_path_and_is_safe_to_call() -> None:
