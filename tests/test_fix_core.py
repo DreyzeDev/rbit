@@ -970,3 +970,30 @@ async def test_light_heavy_routing_is_skipped_when_the_smart_router_runs(tmp_pat
     old_only = {"model_routing": {"enabled": True, "light": "light/x", "heavy": "heavy/x"}}
     model, _, _ = await _routed_turn(tmp_path, old_only, "what is this file?")
     assert model == "light/x"  # the older routing still works on its own
+
+
+def test_memory_append_waits_when_the_lock_file_is_mid_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: on Windows creating a lock file that is being deleted raises
+    PermissionError. That used to mean "no locking possible", so two writers ran at
+    once and entries were lost (~1 in 10 runs with 25 threads). It must be retried."""
+    import rbit.storage as storage_module
+
+    real_open = os.open
+    attempts = {"lock": 0}
+
+    def flaky_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if str(path).endswith(".lock"):
+            attempts["lock"] += 1
+            if attempts["lock"] <= 3:
+                raise PermissionError(13, "access denied (lock file is being deleted)")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(storage_module.os, "open", flaky_open)
+    s = StorageManager(tmp_path)
+    s.append_memory_rule("kept")
+
+    assert attempts["lock"] == 4  # three refusals were retried, the fourth took the lock
+    assert "kept" in s.memory_path.read_text(encoding="utf-8")
+    assert not list(tmp_path.rglob("*.lock"))  # and the lock was released afterwards

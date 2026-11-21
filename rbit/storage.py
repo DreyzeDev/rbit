@@ -584,7 +584,12 @@ class StorageManager:
         @contextmanager
         def _cm():
             lock = target.with_name(target.name + ".lock")
-            deadline = time.monotonic() + 10.0
+            started = time.monotonic()
+            deadline = started + 10.0
+            #: A PermissionError is retried only briefly: on Windows it also means
+            #: "the previous holder is still deleting the lock file", but in a folder
+            #: we genuinely cannot write to it would otherwise stall every append.
+            permission_deadline = started + 2.0
             fd = -1
             while fd < 0:
                 try:
@@ -598,6 +603,13 @@ class StorageManager:
                         pass
                     if time.monotonic() > deadline:
                         break  # give up waiting: better a racy append than a hung UI
+                    time.sleep(0.005)
+                except PermissionError:
+                    # Windows reports a lock file that is mid-deletion as "access denied".
+                    # Treating that as "no locking possible" let two writers through and
+                    # lost memory entries under contention (seen in ~1 of 10 runs).
+                    if time.monotonic() > permission_deadline:
+                        break
                     time.sleep(0.005)
                 except OSError:
                     break
