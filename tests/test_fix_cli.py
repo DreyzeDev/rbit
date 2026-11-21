@@ -461,3 +461,53 @@ def test_ci_recipe_uses_pipefail_and_the_real_action_path() -> None:
     assert "set -o pipefail" in recipes
     assert '-- "исправь предупреждения ruff' in recipes
     assert "`.github/action.yml`" not in recipes  # the action lives at the repo root
+
+
+# --- CLI audit: markup-looking names, unknown credential, unsafe agent names ---------
+
+MARKUP_NAME = "[/x]"  # a closing tag without an opening one: Rich raises MarkupError when it is printed as markup
+
+
+def test_mcp_remove_and_logout_print_unknown_names_literally(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rbit.cli import main as cli_main
+
+    assert cli_main(["mcp", "remove", MARKUP_NAME, "-d", str(tmp_path)]) == 1
+    assert MARKUP_NAME in capsys.readouterr().out
+    assert cli_main(["mcp", "logout", MARKUP_NAME, "-d", str(tmp_path)]) == 1
+    assert MARKUP_NAME in capsys.readouterr().out
+
+
+def test_auth_export_of_an_unknown_credential_is_an_error_not_a_keyerror(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rbit.cli import main as cli_main
+
+    assert cli_main(["auth", "export", MARKUP_NAME, "-d", str(tmp_path)]) == 1
+    assert "Unknown credential" in capsys.readouterr().out
+
+
+def test_run_prints_a_markup_like_model_id_in_its_footer(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rbit.cli import main as cli_main
+
+    # The model is unknown, so the built-in agent answers; the footer line shows the model id.
+    cli_main(["run", "-d", str(tmp_path), "-m", MARKUP_NAME, "--", "hello"])
+    assert MARKUP_NAME in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("name", ["../evil", "a/b", MARKUP_NAME, ".hidden", "..", "a..b"])
+def test_agent_create_rejects_names_that_could_escape_the_skills_dir(tmp_path: Path, name: str) -> None:
+    from rbit.cli import main as cli_main
+
+    assert cli_main(["agent", "create", name, "-d", str(tmp_path)]) == 2
+    assert list(tmp_path.rglob("*.md")) == []  # nothing was written anywhere, least of all outside
+
+
+def test_agent_create_accepts_a_normal_name(tmp_path: Path) -> None:
+    from rbit.cli import main as cli_main
+
+    assert cli_main(["agent", "create", "reviewer-2", "-d", str(tmp_path)]) == 0
+    assert (tmp_path / ".rbit" / "skills" / "reviewer-2.md").is_file()

@@ -420,7 +420,8 @@ async def _run_headless(args: argparse.Namespace) -> int:
         console.print()
         console.print(RichMarkdown(reply.content))
         console.print(
-            f"\n[#fab283]▣[/] [#808080]{reply.agent.capitalize()} · {reply.model} · {reply.duration_s:.2f}s · session {session.id}[/]"
+            f"\n[#fab283]▣[/] [#808080]{markup_escape(reply.agent.capitalize())} · {markup_escape(str(reply.model))} · "
+            f"{reply.duration_s:.2f}s · session {markup_escape(str(session.id))}[/]"
         )
     return 0
 
@@ -705,10 +706,10 @@ def _run_auth(
             if resolved.get("api_key") == "keyring":
                 resolved["api_key"] = storage.load_secret(f"credential:{cred_name}") or ""
             resolved_credentials[cred_name] = resolved
-        data = {name: resolved_credentials[name]} if name else resolved_credentials
-        if name and name not in credentials:
+        if name and name not in resolved_credentials:  # check BEFORE indexing: an unknown name was a KeyError
             console.print(f"[red]Unknown credential:[/] {markup_escape(str(name))}")
             return 1
+        data = {name: resolved_credentials[name]} if name else resolved_credentials
         text = json.dumps(data, ensure_ascii=False, indent=2)
         if file:
             Path(file).write_text(text + "\n", encoding="utf-8")
@@ -774,6 +775,13 @@ def _run_agent(workspace: Path, cmd: str, name: str | None) -> int:
             console.print("  (none - rbit agent create <name>)")
         return 0
     if cmd == "create" and name:
+        # The name becomes a file name under .rbit/skills: `../../x` or `a/b` must not escape it.
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) or ".." in name:
+            console.print(
+                f"[red]Invalid agent name:[/] {markup_escape(name)} "
+                "(start with a letter or digit; letters, digits, dot, dash and underscore only)"
+            )
+            return 2
         skills_dir = workspace / ".rbit" / "skills"
         skills_dir.mkdir(parents=True, exist_ok=True)
         target = skills_dir / f"{name}.md"
@@ -2792,7 +2800,7 @@ def _run_mcp(args: argparse.Namespace) -> int:
         tokens.pop(name, None)
         cfg["mcp_oauth"] = tokens
         storage.save_config(cfg)
-        console.print(("removed MCP token for " if existed else "no stored token for ") + (name or "(all)"))
+        console.print(("removed MCP token for " if existed else "no stored token for ") + (markup_escape(name) or "(all)"))
         return 0 if existed else 1
 
     if action == "remove":
@@ -2806,7 +2814,7 @@ def _run_mcp(args: argparse.Namespace) -> int:
         cfg["mcp"] = configs
         cfg["mcp_servers"] = legacy
         storage.save_config(cfg)
-        console.print(("[bold #7fd88f]✓[/] Removed " if existed else "[dim]Not found:[/] ") + name)
+        console.print(("[bold #7fd88f]✓[/] Removed " if existed else "[dim]Not found:[/] ") + markup_escape(name))
         return 0 if existed else 1
 
     async def _run() -> int:
