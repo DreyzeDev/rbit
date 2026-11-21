@@ -16,10 +16,6 @@ inputs:
     description: "Model ID override passed to `rbit run -m` (OpenRouter / OpenAI / DeepSeek / Ollama). Optional."
     required: false
     default: ""
-  github-token:
-    description: "Token used for checking out the repository."
-    required: false
-    default: ${{ github.token }}
 
 outputs:
   output-file:
@@ -43,9 +39,15 @@ runs:
 
     # The agent reads RBIT_API_KEY / OPENROUTER_API_KEY / OPENAI_API_KEY from the
     # environment, or falls back to the built-in offline smart-local agent.
-    # Provide the key on the calling workflow step:
-    #   secrets: inherit  (with RBIT_API_KEY in repo secrets)
-    #   env: RBIT_API_KEY: ${{ secrets.RBIT_API_KEY }}
+    # A composite action cannot read the caller's secrets itself, so pass the key
+    # as an environment variable on the step that uses this action:
+    #   - uses: DreyzeDev/rbit@<ref>
+    #     with: { task: "..." }
+    #     env:
+    #       RBIT_API_KEY: ${{ secrets.RBIT_API_KEY }}
+    # (`secrets: inherit` only exists for reusable workflows, not for actions.)
+    # The task text may come from untrusted input (an issue or PR body): the agent
+    # runs shell commands, so only pass trusted text or run it without secrets.
     - name: Run rbit
       shell: bash
       env:

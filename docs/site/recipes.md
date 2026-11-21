@@ -136,8 +136,10 @@ Headless-режим — способ использовать агента в п
     - name: rbit fix warnings
       env:
         RBIT_API_KEY: ${{ secrets.RBIT_API_KEY }}
+      shell: bash   # bash -e {0} без pipefail: сбой rbit за `| tee` остался бы незамеченным
       run: |
-        rbit run "исправь предупреждения ruff в rbit/" --output-format jsonl \
+        set -o pipefail
+        rbit run --output-format jsonl -- "исправь предупреждения ruff в rbit/" \
           | tee rbit-output.jsonl
     - uses: actions/upload-artifact@v4
       if: always()
@@ -162,5 +164,8 @@ Headless-режим — способ использовать агента в п
    удобно парсить в шаге-постобработке или складывать в артефакт как журнал
    действий агента.
 
-В репозитории есть готовый composite action `.github/action.yml` — шаблон шага
+В репозитории есть готовый composite action `action.yml` (в корне) — шаг
 «установить rbit, выполнить задачу, сохранить jsonl» для переиспользования.
+Ключ провайдера передаётся переменной окружения на шаге, который его вызывает
+(`env: RBIT_API_KEY: ${{ secrets.RBIT_API_KEY }}`), а текст задачи не берите из
+недоверенного ввода (тело issue или PR): агент выполняет команды оболочки.

@@ -371,3 +371,28 @@ def test_desktop_config_ipc_only_answers_our_own_renderer() -> None:
     assert result["foreignHttps"] is None  # a foreign page never gets the token
     assert result["siblingDir"] is None  # nor a look-alike folder next to renderer/
     assert result["noFrame"] is None
+
+
+def test_action_declares_only_inputs_it_uses_and_documents_secrets_correctly() -> None:
+    import re
+
+    action = _read("action.yml")
+    block = action.split("\ninputs:", 1)[1].split("\noutputs:", 1)[0]
+    declared = set(re.findall(r"^  ([A-Za-z0-9_-]+):\s*$", block, flags=re.MULTILINE))
+    assert declared == {"task", "model"}  # the unused `github-token` input is gone
+
+    for name in declared:  # every declared input is actually read by a step
+        assert f"inputs.{name}" in action
+
+    comments = "\n".join(line for line in action.splitlines() if line.lstrip().startswith("#"))
+    assert "RBIT_API_KEY: ${{ secrets.RBIT_API_KEY }}" in comments
+    assert "only exists for reusable workflows" in comments  # not advice to use it here
+
+
+def test_ci_recipe_uses_pipefail_and_the_real_action_path() -> None:
+    recipes = (Path(__file__).resolve().parent.parent / "docs" / "site" / "recipes.md").read_text(
+        encoding="utf-8"
+    )
+    assert "set -o pipefail" in recipes
+    assert '-- "исправь предупреждения ruff' in recipes
+    assert "`.github/action.yml`" not in recipes  # the action lives at the repo root
