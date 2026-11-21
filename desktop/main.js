@@ -80,7 +80,13 @@ async function waitBackend(timeoutMs = 20000) {
 
 function startBackend() {
   const py = process.platform === "win32" ? "python" : "python3";
-  backend = spawn(py, ["-m", "rbit.cli", "serve", "--port", String(PORT), "-d", WORKSPACE], {
+  // `python -m rbit.cli` puts the working directory (the user's project, or their home) first
+  // on sys.path, so a rbit/ folder or a json.py there would replace the real code. Drop '' and
+  // '.' from sys.path first and run the module as __main__ (works on every Python 3.10+).
+  const boot =
+    "import sys, runpy; sys.path[:] = [p for p in sys.path if p not in ('', '.')]; " +
+    "runpy.run_module('rbit.cli', run_name='__main__', alter_sys=True)";
+  backend = spawn(py, ["-c", boot, "serve", "--port", String(PORT), "-d", WORKSPACE], {
     cwd: WORKSPACE,
     env: { ...process.env, PYTHONUNBUFFERED: "1", RBIT_SERVER_TOKEN: TOKEN },
     stdio: ["ignore", "pipe", "pipe"],

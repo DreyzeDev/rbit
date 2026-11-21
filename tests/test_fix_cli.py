@@ -511,3 +511,43 @@ def test_agent_create_accepts_a_normal_name(tmp_path: Path) -> None:
 
     assert cli_main(["agent", "create", "reviewer-2", "-d", str(tmp_path)]) == 0
     assert (tmp_path / ".rbit" / "skills" / "reviewer-2.md").is_file()
+
+
+# --- desktop: the backend must not import code from the user's workspace ------------
+
+DESKTOP_BOOT = (
+    "import sys, runpy; sys.path[:] = [p for p in sys.path if p not in ('', '.')]; "
+    "runpy.run_module('rbit.cli', run_name='__main__', alter_sys=True)"
+)
+
+
+def test_desktop_main_starts_the_backend_with_the_sys_path_bootstrap() -> None:
+    main = (REPO_ROOT / "desktop" / "main.js").read_text(encoding="utf-8")
+    spawn_call = main[main.index("backend = spawn(") : main.index("backend.stderr.on")]
+    assert '"-m"' not in spawn_call  # `python -m` puts the workspace first on sys.path
+    assert '"-c", boot, "serve"' in spawn_call
+    assert "sys.path[:] = [p for p in sys.path if p not in ('', '.')]" in main
+    assert "runpy.run_module('rbit.cli', run_name='__main__', alter_sys=True)" in main
+
+
+def test_the_desktop_bootstrap_ignores_a_package_planted_in_the_workspace(tmp_path: Path) -> None:
+    import subprocess
+
+    project = tmp_path / "proj"
+    (project / "rbit").mkdir(parents=True)
+    (project / "rbit" / "__init__.py").write_text('print("HIJACKED")\nraise SystemExit(99)\n', encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONSAFEPATH"}
+    env["PYTHONPATH"] = str(REPO_ROOT)
+
+    plain = subprocess.run(
+        [sys.executable, "-m", "rbit.cli", "--help"], cwd=project, env=env,
+        capture_output=True, text=True, encoding="utf-8", timeout=60,
+    )
+    assert "HIJACKED" in plain.stdout  # what the desktop app used to do: the planted package wins
+
+    safe = subprocess.run(
+        [sys.executable, "-c", DESKTOP_BOOT, "--help"], cwd=project, env=env,
+        capture_output=True, text=True, encoding="utf-8", timeout=60,
+    )
+    assert "HIJACKED" not in safe.stdout + safe.stderr
+    assert safe.returncode == 0 and "usage" in safe.stdout.lower()
