@@ -152,8 +152,11 @@ def wrap(text: str, source: str = "external", *, findings: list[Finding] | None 
     if not text:
         return text
     header = UNTRUSTED_OPEN.format(source=source)
-    body = f"{header}\n{text}\n{UNTRUSTED_CLOSE}\n\n{INJECTION_WARNING}"
     findings = findings if findings is not None else scan(text, source=source)
+    # A page that contains the closing marker itself would end the fence early and make the
+    # rest of its text look like it came from outside the block. Defuse it (zero-width break).
+    text = text.replace(UNTRUSTED_CLOSE, UNTRUSTED_CLOSE.replace("<<<", "<<​<", 1))
+    body = f"{header}\n{text}\n{UNTRUSTED_CLOSE}\n\n{INJECTION_WARNING}"
     high = [f for f in findings if f.severity == "high"]
     if high:
         names = ", ".join(sorted({f.name for f in high}))

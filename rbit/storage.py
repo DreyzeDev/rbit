@@ -140,7 +140,17 @@ class StorageManager:
         The rest of config.json is kept exactly as it is (nothing else is persisted or
         dropped), which `save_config` cannot promise because it writes the whole dict.
         """
-        raw = self._read_raw_config()
+        raw: dict[str, Any] = {}
+        if self.config_path.exists():
+            try:
+                loaded = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
+                if not isinstance(loaded, dict):
+                    raise ValueError("not a JSON object")
+                raw = loaded
+            except (OSError, ValueError) as exc:
+                # An unreadable file must not be replaced by a one-key file (that would destroy
+                # the API key and every other setting in it): keep it as config.json.bak first.
+                self._backup_corrupt_config(exc)
         raw[key] = value
         self._atomic_write_json(self.config_path, json.dumps(raw, ensure_ascii=False, indent=2))
         risky = risky_settings({key: value}).get(key)
@@ -562,6 +572,13 @@ class StorageManager:
                     value = call.get(field)
                     if isinstance(value, str) and value:
                         call[field] = redact_secrets(value)
+                # A token typed on a command line (`curl -H "Authorization: Bearer ..."`) is a secret
+                # too. Only shell commands are masked: other tools' arguments are file contents.
+                arguments = call.get("arguments")
+                if call.get("name") in ("bash", "terminal") and isinstance(arguments, dict):
+                    command = arguments.get("command")
+                    if isinstance(command, str) and command:
+                        arguments["command"] = redact_secrets(command)
         return data
 
     def save_session(self, session: Session) -> None:

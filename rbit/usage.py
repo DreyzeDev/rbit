@@ -515,7 +515,12 @@ def estimate_cost(
         override = catalog.get("per_1k")
         if isinstance(override, (int, float)) and override > 0:
             cost_per_1k = float(override)
-    total = usage.get("input", 0) + usage.get("output", 0) + usage.get("reasoning", 0)
+    # OpenAI-style `completion_tokens` and Anthropic `output_tokens` already include the reasoning
+    # tokens (`*_details.reasoning_tokens` is a breakdown of them), so adding the two charged
+    # every thinking token twice. Only what exceeds the output count can be extra.
+    output = usage.get("output", 0)
+    extra_reasoning = max(0, usage.get("reasoning", 0) - output)
+    total = usage.get("input", 0) + output + extra_reasoning
     if total <= 0:
         return 0.0, False
     if cost_per_1k <= 0:

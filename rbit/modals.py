@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 
 from rich.table import Table
@@ -171,6 +172,15 @@ class PromptHistoryModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+def markdown_diff_block(body: str) -> str:
+    """The diff as a fenced Markdown block. The fence is longer than any run of backticks in the
+    diff, so a changed README with its own ``` lines cannot close the block early and spill the
+    rest of the diff out as ordinary Markdown."""
+    longest = max((len(run) for run in re.findall(r"`+", body)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}diff\n{body}\n{fence}"
+
+
 class DiffViewerModal(ModalScreen[None]):
     """Unified diff for one modified file (opened from the sidebar)."""
 
@@ -190,7 +200,7 @@ class DiffViewerModal(ModalScreen[None]):
         with Vertical(classes="oc-modal help-modal"):
             yield Static(_modal_header(f"Diff — {self.rel}"), classes="oc-modal-header")
             with VerticalScroll(id="diff-scroll"):
-                yield Markdown(f"```diff\n{body}\n```", id="diff-content")
+                yield Markdown(markdown_diff_block(body), id="diff-content")
             yield Label("esc close", classes="oc-modal-foot")
 
     def action_close(self) -> None:

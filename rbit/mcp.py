@@ -407,7 +407,9 @@ class MCPClient:
             if isinstance(parsed, dict):
                 messages.append(parsed)
 
-        for line in text.splitlines():
+        # SSE lines end at \n, \r\n or \r only: str.splitlines() also breaks on U+2028, \x85 and
+        # \x0c, which JSON may carry unescaped inside a string, cutting an event in two.
+        for line in re.split(r"\r\n|\n|\r", text):
             if not line.strip():
                 flush()
             elif line.startswith("data:"):

@@ -639,6 +639,20 @@ class RbitApp(App[None]):
             yield SidebarPanel(self.workspace)
         yield BottomStatusBar()
 
+    def notify(  # type: ignore[override]
+        self,
+        message: str,
+        *,
+        title: str = "",
+        severity: str = "information",
+        timeout: float | None = None,
+        markup: bool = False,
+    ) -> None:
+        """Toasts show text as written. Textual would read `[name]` or `[red]x` as markup and
+        silently drop it ("Skill not found: " with no name); the messages carry user input, paths
+        and error texts, never markup."""
+        super().notify(message, title=title, severity=severity, timeout=timeout, markup=markup)  # type: ignore[arg-type]
+
     def on_mount(self) -> None:
         acquired, other_pid = self.storage.acquire_lock()
         if not acquired:
@@ -774,12 +788,13 @@ class RbitApp(App[None]):
             self.lsp.terminate()
         except Exception:
             pass
+        # Flush the debounced save while we still hold the session lock; afterwards another
+        # rbit may already own the directory and this write would race with it.
+        if self._save_timer is not None:
+            self._save_timer.stop()
+            self._save_timer = None
+            self._flush_save_session()
         self.storage.release_lock()
-        if self._save_timer is None:
-            return
-        self._save_timer.stop()
-        self._save_timer = None
-        self._flush_save_session()
 
     @work
     async def _connect_mcp(self) -> None:
@@ -2895,7 +2910,16 @@ class RbitApp(App[None]):
             self.notify("Agent is busy — press Esc first.", severity="warning")
             return
         msgs = self.session.messages
-        idx = next((i for i in range(len(msgs) - 1, -1, -1) if msgs[i].role == "user"), None)
+        # Skip the "[auto] Self-check ..." follow-up the app writes itself: retrying must resend what
+        # the user actually asked, not re-run the fix-up with the original request gone from history.
+        idx = next(
+            (
+                i
+                for i in range(len(msgs) - 1, -1, -1)
+                if msgs[i].role == "user" and not msgs[i].content.startswith("[auto]")
+            ),
+            None,
+        )
         if idx is None:
             self.notify("Nothing to retry — no user prompt in this session.", severity="warning")
             return

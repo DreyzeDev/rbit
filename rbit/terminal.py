@@ -30,7 +30,10 @@ class PersistentShell:
     def _command() -> list[str]:
         if os.name == "nt":
             return ["cmd.exe", "/Q", "/K"]
-        return [os.environ.get("SHELL") or "/bin/sh", "-i"]
+        # Not `-i`: an interactive bash reads its input through readline, which echoes every line
+        # back into the captured output. A shell reading stdin keeps `cd` and variables between
+        # commands just the same, without prompts, banners or echo.
+        return [os.environ.get("SHELL") or "/bin/sh"]
 
     async def start(self) -> None:
         if self.process is not None and self.process.returncode is None:
@@ -44,7 +47,7 @@ class PersistentShell:
         if self.policy is not None:
             command = self._command()
             if os.name != "nt":
-                command = ["/bin/sh", "-i"]  # $SHELL may live where the sandbox cannot read
+                command = ["/bin/sh"]  # $SHELL may live where the sandbox cannot read
             box_env = sandbox.sandbox_env(self.policy)
             if os.name != "nt":
                 box_env.update({"PS1": "", "PS2": ""})

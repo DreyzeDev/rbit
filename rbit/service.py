@@ -85,11 +85,23 @@ def _alive(pid: int) -> bool:
             kernel32.CloseHandle(ctypes.c_void_p(handle))
     try:
         os.kill(pid, 0)
-        return True
     except PermissionError:
         return True
     except OSError:
         return False
+    # `kill(pid, 0)` also succeeds for a zombie: a process that has finished but whose parent
+    # has not collected it yet. For our purposes it is gone.
+    try:
+        done, _status = os.waitpid(pid, os.WNOHANG)  # collects our own finished child
+        if done == pid:
+            return False
+    except (ChildProcessError, OSError):
+        pass  # not our child: its own parent will collect it
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as handle:
+            return handle.read().rsplit(")", 1)[-1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
 
 
 pid_alive = _alive
@@ -148,7 +160,16 @@ def _cmdline_mentions_rbit(pid: int) -> bool:
         data = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
         return False
-    return b"rbit" in data
+    # Our server is `python -m rbit serve ...` (or the `rbit` entry point with `serve`). A mere
+    # "rbit" somewhere in the command line (an editor on rbit.py, a path like /home/me/rbit/...)
+    # does not make a process ours: SIGTERM must never hit an unrelated process that got the PID.
+    args = data.split(b"\0")
+    if b"serve" not in args:
+        return False
+    for index, arg in enumerate(args[:-2]):
+        if arg == b"-m" and args[index + 1] == b"rbit":
+            return True
+    return any(os.path.basename(arg.decode("utf-8", "replace")) in ("rbit", "rbit.exe") for arg in args[:2])
 
 
 class ServiceManager:

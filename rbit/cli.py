@@ -1394,15 +1394,19 @@ def _run_export(workspace: Path, session_id: str | None, out_file: str | None, f
     fmt = str(fmt or "markdown")
     if fmt == "openai":
         out = Path(out_file) if out_file else workspace / f"rbit-{target.id}-openai.json"
+        from .tools import redact_secrets
+
         messages = []
         for m in target.messages:
-            messages.append({"role": m.role, "content": m.content})
+            messages.append({"role": m.role, "content": redact_secrets(m.content)})  # as the Markdown export does
         out.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
         console.print(f"[bold #7fd88f]✓ OpenAI-format export →[/] {markup_escape(str(out))}")
         return 0
     if fmt == "html":
         out = Path(out_file) if out_file else workspace / f"rbit-{target.id}.html"
         import html as _html
+
+        from .tools import redact_secrets
 
         parts = [
             "<!doctype html><meta charset='utf-8'><title>rbit ",
@@ -1415,10 +1419,10 @@ def _run_export(workspace: Path, session_id: str | None, out_file: str | None, f
         for m in target.messages:
             cls = _html.escape(m.role, quote=True)
             parts.append(f"<div class='msg {cls}'><b>{_html.escape(m.role)}</b>")
-            body = _html.escape(m.content)
+            body = _html.escape(redact_secrets(m.content))
             if m.role == "assistant" and m.tool_calls:
                 for tc in m.tool_calls:
-                    d = _html.escape(tc.diff or "")
+                    d = _html.escape(redact_secrets(tc.diff or ""))
                     if d:
                         lines = [
                             f"<span class='diff-add'>{ln}</span>" if ln.startswith("+") and not ln.startswith("+++") else
@@ -1544,7 +1548,8 @@ def _run_lint(workspace: Path, as_json: bool = False) -> int:
         output = output or "No lint issues."
     else:
         res = executor.builtin_diagnostics({"filePath": "."})
-        ok = res.ok
+        # "ran" is not "clean": a syntax error must give a failing exit code, like the ruff branch
+        ok = res.ok and res.summary.startswith("0 issues")
         output = res.output
 
     issues = [
@@ -1697,13 +1702,16 @@ def _run_update(
 
 
 def _parse_age_spec(spec: str) -> float:
-    match = re.fullmatch(r"\s*(\d+)\s*([smhdw]?)\s*", spec.lower())
-    if not match:
-        raise ValueError(f"invalid age '{spec}' (use e.g. 30d, 12h, 2w)")
-    value = int(match.group(1))
-    unit = match.group(2) or "d"
-    factor = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
-    return float(value * factor)
+    # The case of the unit matters: `m` is minutes, `M` is months (the spec used to be lower-cased,
+    # so `prune 1M` meant "older than one minute" and silently deleted recent sessions).
+    match = re.fullmatch(r"\s*(\d+)\s*([A-Za-z]?)\s*", spec)
+    unit = (match.group(2) if match else "") or "d"
+    if match and unit not in "M":
+        unit = unit.lower()
+    factors = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "M": 30 * 86400, "y": 365 * 86400}
+    if not match or unit not in factors:
+        raise ValueError(f"invalid age '{spec}' (use e.g. 30d, 12h, 2w, 1M for a month, 5m for minutes)")
+    return float(int(match.group(1)) * factors[unit])
 
 
 def _session_last_activity(session: Session) -> float:
@@ -3560,6 +3568,7 @@ CONFIG_TYPES: dict[str, type | tuple[type, ...]] = {
     "theme": str,
     "effort": str,
     "auto_compact": bool,
+    "auto_approve": bool,
     "auto_design_skill": bool,
     "formatter": (bool, dict),
     "lsp": (bool, dict),
@@ -3600,8 +3609,11 @@ def _run_config(
             console.print("[red]config set requires KEY VALUE[/]")
             return 2
         root = key.split(".")[0]
+        words = {"true": True, "yes": True, "on": True, "1": True, "false": False, "no": False, "off": False, "0": False}
         if CONFIG_TYPES.get(root) is str and "." not in key and not value.lstrip().startswith('"'):
             parsed = value  # string-typed key: never reinterpret `123`/`true` as JSON
+        elif CONFIG_TYPES.get(root) is bool and "." not in key and value.strip().lower() in words:
+            parsed = words[value.strip().lower()]  # `config set auto_approve no` is False, not the text "no"
         else:
             try:
                 parsed = json.loads(value)

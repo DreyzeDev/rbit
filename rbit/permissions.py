@@ -104,10 +104,21 @@ def permission_mode_from_config(
 
     # `RBIT_AUTO_APPROVE=1` (the --auto/--yolo flag) and `auto_approve` in the
     # config both predate modes and mean exactly "never prompt".
-    if env.get("RBIT_AUTO_APPROVE") == "1" or cfg.get("auto_approve"):
+    if env.get("RBIT_AUTO_APPROVE") == "1" or config_flag(cfg.get("auto_approve")):
         return "auto"
 
     return normalize_permission_mode(cfg.get("permission_mode"), DEFAULT_MODE)
+
+
+def config_flag(value: object) -> bool:
+    """A boolean setting that may have been written by hand or by `config set` as a string.
+
+    `"false"`, `"no"`, `"off"`, `"0"` and `""` are False; a plain truthiness test treated them
+    as True, so `auto_approve: "no"` silently switched every confirmation off.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off", "none", "null")
+    return bool(value)
 
 
 def describe_permission_mode(mode: str) -> str:

@@ -3412,6 +3412,7 @@ async def test_provider_models_parse_pricing_and_context(tmp_path: Path) -> None
     assert by_id["m/free"].cost_per_1k == 0.0
 
 
+@pytest.mark.skipif(os.name != "nt", reason="the commands are PowerShell (Get-ChildItem) and a Windows path")
 @pytest.mark.asyncio
 async def test_bash_sandbox_blocks_workspace_escapes(tmp_path: Path) -> None:
     executor = ToolExecutor(

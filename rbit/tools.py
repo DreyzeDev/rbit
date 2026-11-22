@@ -364,6 +364,10 @@ def atomic_write_text(path: Path, content: str) -> None:
             data = data.replace(b"\n", b"\r\n")
         else:
             data = _merge_mixed_line_endings(original, data)
+    # Whole-file rewrites (the `write` tool) carry no BOM of their own: keep the file's, since
+    # some Windows tools (Excel, old PowerShell, MSBuild) rely on it to read UTF-8 correctly.
+    if encoding == "utf-8" and original.startswith(codecs.BOM_UTF8) and not data.startswith(codecs.BOM_UTF8):
+        data = codecs.BOM_UTF8 + data
     atomic_write_bytes(path, data, mode_from=path)
 
 
@@ -656,7 +660,8 @@ def redact_secrets(text: str, *, code: bool = False) -> str:
 
 def _strip_blocks(text: str) -> str:
     """Removes <script>/<style>/... blocks in linear time (a lazy `.*?` regex is quadratic on unclosed tags)."""
-    lowered = text.lower()
+    # No `text.lower()` copy: it changes the length of some characters (U+0130 "İ" becomes two),
+    # so indexes found in the copy drifted off the original and cut the wrong text.
     out: list[str] = []
     pos = 0
     opener = re.compile(r"<(script|style|noscript|nav|header|footer|aside)\b[^>]{0,2000}>", re.IGNORECASE)
@@ -666,13 +671,13 @@ def _strip_blocks(text: str) -> str:
             out.append(text[pos:])
             break
         out.append(text[pos : match.start()])
-        close = lowered.find(f"</{match.group(1).lower()}>", match.end())
-        if close == -1:
+        closer = re.compile(f"</{match.group(1)}>", re.IGNORECASE).search(text, match.end())
+        if closer is None:
             out.append(" ")
             pos = match.end()
             continue
         out.append(" ")
-        pos = close + len(match.group(1)) + 3
+        pos = closer.end()
     return "".join(out)
 
 
@@ -3275,7 +3280,10 @@ class ToolExecutor:
 
         diag = await self._tool_diagnostics(args)
         note = "ruff/pyflakes not installed — ran built-in syntax diagnostics only (pip install ruff)."
-        return ToolResult(diag.ok, f"fallback: {diag.summary}", f"{diag.output}\n\n{note}")
+        # `diagnostics` reports "the check ran"; a linter reports "the code is clean" (as the ruff
+        # path above does): a file with a syntax error must not come back as ok.
+        clean = diag.ok and diag.summary.startswith("0 issues")
+        return ToolResult(clean, f"fallback: {diag.summary}", f"{diag.output}\n\n{note}")
 
     async def _tool_diagnostics(self, args: dict[str, Any]) -> ToolResult:
         raw = str(args.get("filePath") or args.get("path") or ".").strip()
@@ -3918,7 +3926,10 @@ class ToolExecutor:
             )
         items: list[TodoItem] = []
         for raw in raw_todos:
-            if isinstance(raw, dict):
+            if isinstance(raw, str) and raw.strip():
+                # Models sometimes send plain strings: a todo, not something to drop silently.
+                items.append(TodoItem(id=short_id(), content=raw.strip(), status="pending", priority="medium"))
+            elif isinstance(raw, dict):
                 items.append(
                     TodoItem(
                         id=raw.get("id") or short_id(),

@@ -760,3 +760,49 @@ async def test_escape_cancels_plain_turn_after_retry(tmp_path: Path) -> None:
         await _wait_until(pilot, lambda: cancelled["flag"])
         assert app.is_busy is False
         assert app._busy_worker is None
+
+
+@pytest.mark.asyncio
+async def test_toasts_show_bracketed_text_literally(workspace: Path) -> None:
+    """`Skill not found: [name]` used to show "Skill not found: ": Textual read `[name]` as markup."""
+    app = RbitApp(workspace=workspace)
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause(0.2)
+        app.notify("Skill not found: [name]  Bad: '[red]x'  Macro: C:\m\[/oops]", severity="warning", timeout=30)
+        await pilot.pause(0.2)
+        toast = next(n for n in app._notifications if n.message.startswith("Skill not found"))
+        assert toast.markup is False
+        assert toast.message == "Skill not found: [name]  Bad: '[red]x'  Macro: C:\m\[/oops]"
+
+
+def test_diff_block_fence_outgrows_backticks_inside_the_diff() -> None:
+    """A changed README with its own ``` lines used to close the viewer's code block early."""
+    from rbit.modals import markdown_diff_block
+
+    plain = markdown_diff_block("+x\n-y")
+    assert plain.startswith("```diff\n") and plain.endswith("\n```")
+    fenced = "```python\nprint(1)\n```"
+    block = markdown_diff_block(f"+{fenced}")
+    opening = block.split("\n", 1)[0]
+    assert opening == "````diff"  # one backtick longer than the longest run inside
+    assert block.endswith("\n````") and fenced in block
+    assert markdown_diff_block("+````x").startswith("`````diff")
+
+
+@pytest.mark.asyncio
+async def test_retry_resends_the_users_prompt_not_the_auto_self_check_followup(workspace: Path) -> None:
+    """After a self-check the last user message is the app's own "[auto] ..." text; /retry reran that."""
+    app = RbitApp(workspace=workspace)
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause(0.2)
+        sent: list[ChatMessage] = []
+        app._execute_agent_turn = lambda msg: sent.append(msg)  # type: ignore[method-assign,assignment]
+        app.session.messages = [
+            ChatMessage(id="u1", role="user", content="add a --json flag"),
+            ChatMessage(id="a1", role="assistant", content="done"),
+            ChatMessage(id="u2", role="user", content="[auto] Self-check found problems in the files you just changed:\n\nx"),
+            ChatMessage(id="a2", role="assistant", content="fixed"),
+        ]
+        app._cmd_retry()
+        assert [m.id for m in sent] == ["u1"]
+        assert [m.id for m in app.session.messages] == ["u1"]

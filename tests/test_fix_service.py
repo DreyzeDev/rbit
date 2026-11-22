@@ -145,3 +145,48 @@ def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+# --- POSIX process identity (found by the first Linux run of the suite) -------------------
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc")
+def test_a_finished_but_uncollected_child_is_not_alive() -> None:
+    """`kill(pid, 0)` succeeds for a zombie, so `service stop` waited for a process that was gone."""
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    deadline = time.time() + 5
+    while time.time() < deadline:  # wait until it has exited but WITHOUT collecting it
+        state = Path(f"/proc/{child.pid}/stat").read_text().rsplit(")", 1)[-1].split()[0]
+        if state == "Z":
+            break
+        time.sleep(0.05)
+    assert state == "Z", "the test child did not become a zombie"
+    assert pid_alive(child.pid) is False
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc")
+def test_only_a_real_rbit_serve_command_line_counts_as_our_server(tmp_path: Path) -> None:
+    """A path or file name containing 'rbit' used to be enough to be SIGTERMed on a reused PID."""
+    from rbit.service import _cmdline_mentions_rbit
+
+    lookalike_dir = tmp_path / "rbit"
+    lookalike_dir.mkdir()
+    sleeper = lookalike_dir / "rbit_serve_notes.py"
+    sleeper.write_text("import time; time.sleep(60)\n", encoding="utf-8")
+    impostor = subprocess.Popen([sys.executable, str(sleeper), "serve"])  # 'rbit' and 'serve' both appear
+
+    package = tmp_path / "fake" / "rbit"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__main__.py").write_text("import time; time.sleep(60)\n", encoding="utf-8")
+    real = subprocess.Popen(
+        [sys.executable, "-m", "rbit", "serve"], env={**os.environ, "PYTHONPATH": str(tmp_path / "fake")}
+    )
+    try:
+        time.sleep(0.6)
+        assert _cmdline_mentions_rbit(impostor.pid) is False
+        assert _cmdline_mentions_rbit(real.pid) is True
+    finally:
+        for process in (impostor, real):
+            process.kill()
+            process.wait()

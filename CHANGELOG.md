@@ -112,6 +112,26 @@ All notable changes to rbit are documented here. The format follows
   explicit pin. A disabled router leaves the selected model alone, and the older
   `model_routing` (light/heavy) is skipped while the smart router is active.
 
+- **Bug hunt (core, CLI, TUI).**
+  - Linux: the persistent terminal no longer echoes every typed line twice (the shell now runs
+    without a forced `-i`/readline pair).
+  - `lint` fallback is only "clean" when the checker really reported `0 issues`.
+  - `rbit serve` liveness ignores zombies and processes that merely mention `serve`.
+  - Toast notifications show `[brackets]` literally instead of swallowing them as markup.
+  - The diff viewer survives diffs that contain Markdown code fences.
+  - `set_setting` (used by `pair` and plugin install) backs up an unreadable `config.json`
+    instead of replacing it with a one-key file.
+  - `sessions prune 1M` means one month (it was one minute); `config set auto_approve no`
+    stores `false`, and a text `"no"`/`"off"`/`"0"` no longer switches confirmations off.
+  - OpenAI/HTML exports and saved sessions mask secrets (shell commands, diffs, messages)
+    the way the Markdown export already did.
+  - Rewriting a whole file keeps its UTF-8 BOM; untrusted-content fences cannot be closed by
+    the content itself; `todowrite` accepts plain-string items; SSE events with U+2028/U+0085
+    inside JSON are no longer cut in two; `_strip_blocks` no longer drifts on `İ`.
+  - Reasoning tokens are no longer billed twice in cost estimates.
+  - `/retry` resends the user's own prompt, not the app's `[auto]` self-check follow-up; the
+    debounced session save is flushed before the session lock is released.
+
 ## [1.6.0] - 2026-11-18
 
 Closes every remaining actionable item in `docs/RBIT_BLUEPRINT.md`: 132 of 134
