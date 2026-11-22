@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -145,6 +146,11 @@ def interpreter_paths() -> tuple[Path, ...]:
     return tuple(seen.values())
 
 
+def _is_windows_drive_mount(path: str) -> bool:
+    """`/mnt/c`, `/mnt/d/...`: a Windows drive as WSL mounts it."""
+    return bool(re.match(r"^/mnt/[A-Za-z](/|$)", path.replace("\\", "/")))
+
+
 def path_directories() -> tuple[Path, ...]:
     """Existing PATH directories that are not credential stores (read and execute only)."""
     found: dict[str, Path] = {}
@@ -152,6 +158,8 @@ def path_directories() -> tuple[Path, ...]:
         if not part:
             continue
         path = Path(part)
+        if _is_windows_drive_mount(part):
+            continue  # WSL appends the Windows PATH (/mnt/c/Windows/...): never expose those drives
         if path.is_dir() and not _is_secret_location(path):
             found[str(path)] = path
     return tuple(found.values())

@@ -184,6 +184,8 @@ def _build_root(libc: ctypes.CDLL, spec: dict) -> None:
     policy (`spec`) carries: root (an empty host directory to build in), read, write, hide
     (paths shown as empty and unwritable), readonly (visible but unwritable), network.
     """
+    if not spec.get("root"):
+        raise SandboxError("the policy has no root directory to build the sandbox in")
     root = str(spec["root"])
     os.makedirs(root, exist_ok=True)
     _mount(libc, "tmpfs", root, "tmpfs", MS_NOSUID | MS_NODEV, "mode=755,size=64m")
@@ -536,6 +538,9 @@ def launch(spec: dict, command: list[str]) -> int:
         except OSError as exc:  # exec failed: report like a shell would
             sys.stderr.write(f"rbit-sandbox: cannot run {command[0]}: {exc.strerror}\n")
             os._exit(127 if exc.errno == errno.ENOENT else 126)
+        except BaseException as exc:  # noqa: BLE001 - whatever went wrong, the command must not run
+            sys.stderr.write(f"rbit-sandbox: unexpected failure, command not run: {exc!r}\n")
+            os._exit(EXIT_UNAVAILABLE)
     for name in ("SIGTERM", "SIGINT", "SIGHUP"):
         signal.signal(getattr(signal, name), lambda signum, _f, c=child: _forward(c, signum))
     while True:

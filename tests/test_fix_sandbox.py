@@ -125,6 +125,12 @@ async def test_with_a_backend_the_command_is_started_through_the_wrapper(
     assert seen and seen[0][0] == "bwrap" and seen[0][-1] == "echo hi" and "--unshare-net" in seen[0]
     off = _executor(tmp_path, {})
     seen.clear()
+
+    async def fake_shell(command: str, **_kw: Any) -> None:  # POSIX starts unsandboxed commands through a shell
+        seen.append(["<shell>", command])
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_shell)
     with pytest.raises(RuntimeError):
         await off._spawn_shell("echo hi", capture=True)
     assert seen and seen[0][0] != "bwrap"

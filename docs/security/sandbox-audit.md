@@ -28,10 +28,16 @@ available; see [macos-verification.md](macos-verification.md) for how to check o
 | Held (blocked) | 81 | 91 |
 | Escapes / partial | 27 / 11 | 18 / 6 |
 | Built-in `rbit sandbox check` after the fixes | **15 / 15** | **22 / 22** as `nobody` **and** as root |
-| Test-suite (whole project) | 790 passed, 7 skipped, 0 failed | (self-test only: see below) |
+| Test-suite (whole project) | 790 passed, 7 skipped, 0 failed | 777 passed, 14 skipped, 6 failed (as root **and** as `nobody`) |
 
-The Linux self-test was run natively inside WSL; the project's `pytest` suite was not (it needs
-packages that were not installed in the distro, and nothing was installed without permission).
+The six Linux failures are **not caused by the sandbox**: the same six tests fail identically on the
+commit before the sandbox existed (`c678326`). Four are environment or platform issues (no `ruff`
+installed; a test written in PowerShell syntax; a service test that sees an un-reaped child as
+still alive), two look like real, older Linux bugs unrelated to this work (the persistent `terminal`
+tool echoes the command back under `sh -i`; one service-stop check). The first Linux run also found
+four real problems in the sandbox that the Windows run could not: WSL's Windows `PATH` entries
+(`/mnt/c/...`) were being mounted into the sandbox, the launcher exited with a Python error instead
+of refusing when its policy lacked a root, and two tests had only ever run on Windows. All fixed.
 
 ## Findings
 
@@ -59,6 +65,7 @@ original attack was re-run against the new code and now fails, and a regression 
 | 17 | Windows | Low | `\\.\pipe\epmapper` (RPC endpoint mapper) opens; about 190 pipe names are listable. No RPC was exercised. | Open, documented. |
 | 18 | Windows | Info | Raw ICMP / UDP `sendto` return success with network off. | **Measured, not an escape**: a DNS query to `1.1.1.1:53` gets **no reply** with network off and a reply with it on (as an unsandboxed program does); packets to the LAN address and loopback were never delivered. |
 | 19 | Windows | Info | A planted `.rbit` junction: the ACL change hit only the link; the target was untouched. | Not reproduced. |
+| 19b | Linux (WSL) | Medium | WSL appends the Windows `PATH` (`/mnt/c/Windows/...`); those directories were mounted into the sandbox. | **Fixed**: Windows drive mounts are never exposed. Found by the first Linux `pytest` run. |
 | 20 | Linux | Low | No pid/memory/disk limits (fork bomb capped at 200 in the test, 256 MiB allocation). | Open: needs cgroups, unavailable here (WSL without delegation). |
 | 21 | Linux | Low | `memfd_create` + `exec` runs code from memory (Landlock exec is path-based). | Accepted: the code is still confined. |
 | 22 | both | By design | A *trusted* MCP entry can explicitly open network, folders and parent variables (`sandbox.*`). | Not a bug: `rbit trust` now shows each of these. |
