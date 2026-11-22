@@ -970,7 +970,11 @@ class PinnedIPTransport(httpx.AsyncBaseTransport):
     request is sent to that IP. The `Host` header and the TLS server name (SNI and
     certificate verification) keep the original host name.
 
-    Limit: with an HTTP proxy configured (environment), the proxy resolves the name itself.
+    Proxies: a client built with this transport ignores HTTP(S)_PROXY (httpx only reads the
+    environment when no transport is given). That is deliberate: a proxy would resolve the
+    name itself and the pinning would mean nothing. The cost is that a machine that can only
+    reach the internet through a proxy cannot use `webfetch` unless `webfetch_allow_private`
+    is set, which makes `new_fetch_client` use the plain, proxy-aware client.
     """
 
     def __init__(self, inner: httpx.AsyncBaseTransport | None = None, resolver: Any = None) -> None:

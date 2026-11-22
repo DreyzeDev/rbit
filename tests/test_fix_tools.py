@@ -868,3 +868,18 @@ async def test_webfetch_blocks_a_host_that_resolves_to_loopback_at_connect_time(
     result = await _executor(tmp_path).execute("webfetch", {"url": "http://evil.test/"})
     assert result.ok is False
     assert "blocked" in result.summary
+
+
+def test_pinned_fetch_client_never_routes_through_an_environment_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A proxy would resolve the host itself and defeat the DNS-rebinding pinning."""
+    import httpx
+
+    from rbit.tools import PinnedIPTransport, new_fetch_client
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+
+    client = new_fetch_client(5)
+
+    for url in ("https://example.com/", "http://example.com/"):
+        assert isinstance(client._transport_for_url(httpx.URL(url)), PinnedIPTransport)
