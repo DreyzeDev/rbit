@@ -27,6 +27,7 @@ from .models import (
 )
 from .router import apply_live_route, router_enabled
 from .rules import load_rules
+from .envscrub import sanitized_env
 from .usage import BudgetGuard, UsageLedger, estimate_cost, normalize_budget_mode, split_usage
 from .skills import load_skills, skills_prompt
 from .storage import StorageManager
@@ -2412,6 +2413,7 @@ class AgentEngine:
                 "git",
                 *args,
                 cwd=str(self.workspace),
+                env=sanitized_env(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )

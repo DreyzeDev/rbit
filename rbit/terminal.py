@@ -7,6 +7,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from .envscrub import sanitized_env
+
 
 class TerminalError(RuntimeError):
     pass
@@ -31,7 +33,7 @@ class PersistentShell:
         if self.process is not None and self.process.returncode is None:
             return
         self._buffer = ""
-        env = dict(os.environ)
+        env = sanitized_env()
         if os.name != "nt":
             # No prompts in the captured output.
             env["PS1"] = ""

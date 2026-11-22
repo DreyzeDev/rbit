@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .envscrub import sanitized_env
+
 logger = logging.getLogger("rbit.formatters")
 
 FORMAT_TIMEOUT_SECONDS = 20.0
@@ -254,7 +256,7 @@ def _run_formatter(path: Path, definition: FormatterDef, workspace: Path) -> For
     command = [part.replace("$FILE", str(path.resolve())) for part in definition.command]
     if os.name == "nt" and command and command[0] == "npx":
         command[0] = shutil.which("npx") or "npx"
-    env = os.environ.copy()
+    env = sanitized_env()
     env.update(definition.environment)
     t0 = time.monotonic()
     try:

@@ -31,6 +31,13 @@ All notable changes to rbit are documented here. The format follows
   `watch` ignored the cap and `/usage` under-counted. The engine now always uses the
   workspace ledger and checks the guard before a turn.
 
+- **Child processes no longer inherit the agent's LLM API keys everywhere.** Only `bash`
+  stripped them; the interactive `terminal` tool, project formatters, `git`, `ripgrep` and
+  `ruff` started with the full environment, so `echo $OPENAI_API_KEY` in `terminal` (or a
+  hostile repo's formatter/git config) could read the key. They now all use
+  `rbit/envscrub.py`, whose list also covers more providers (Perplexity, Fireworks,
+  Cerebras, NVIDIA, Replicate, SambaNova).
+
 ### Fixed
 
 - **Files that are not UTF-8 can be edited.** `edit` read such a file as UTF-8 with

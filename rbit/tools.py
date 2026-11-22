@@ -736,38 +736,7 @@ MAX_HTML_CHARS = 300_000
 MAX_REDIRECTS = 5
 MAX_OUTPUT_KEEP = 100_000
 
-_SENSITIVE_ENV_NAMES = frozenset(
-    {
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "OPENROUTER_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "GROQ_API_KEY",
-        "MISTRAL_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "XAI_API_KEY",
-        "COHERE_API_KEY",
-        "TOGETHER_API_KEY",
-        "AZURE_OPENAI_API_KEY",
-        "HF_TOKEN",
-        "HUGGINGFACE_API_KEY",
-    }
-)
-
-
-def sanitized_env(base: dict[str, str] | None = None) -> dict[str, str]:
-    """Environment for child processes with the agent's own LLM credentials removed."""
-    source = os.environ if base is None else base
-    clean: dict[str, str] = {}
-    for key, value in source.items():
-        upper = key.upper()
-        if upper in _SENSITIVE_ENV_NAMES:
-            continue
-        if upper.startswith("RBIT_") and upper.endswith(("_KEY", "_TOKEN", "_SECRET", "_PASSWORD")):
-            continue
-        clean[key] = value
-    return clean
+from .envscrub import _SENSITIVE_ENV_NAMES, sanitized_env  # noqa: E402,F401  (re-exported)
 
 
 def truncate_middle(text: str, limit: int = 4000) -> str:
@@ -2872,6 +2841,7 @@ class ToolExecutor:
             proc = subprocess.run(
                 cmd,
                 cwd=str(self.workspace),
+                env=sanitized_env(),
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
@@ -3159,6 +3129,7 @@ class ToolExecutor:
                 "git",
                 *cmd,
                 cwd=str(self.workspace),
+                env=sanitized_env(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -3251,6 +3222,7 @@ class ToolExecutor:
                 "git",
                 *cmd,
                 cwd=str(self.workspace),
+                env=sanitized_env(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -3284,6 +3256,7 @@ class ToolExecutor:
                     "concise",
                     str(target),
                     cwd=str(self.workspace),
+                    env=sanitized_env(),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
