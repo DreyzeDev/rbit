@@ -736,6 +736,7 @@ MAX_HTML_CHARS = 300_000
 MAX_REDIRECTS = 5
 MAX_OUTPUT_KEEP = 100_000
 
+from . import sandbox  # noqa: E402
 from .envscrub import _SENSITIVE_ENV_NAMES, sanitized_env  # noqa: E402,F401  (re-exported)
 
 
@@ -3657,6 +3658,14 @@ class ToolExecutor:
         from .terminal import PersistentShell, TerminalError
 
         action = str(args.get("action") or "run").strip().lower()
+        if action != "close" and sandbox.mode(self._config_or_empty()) in ("auto", "strict") and sandbox.backend():
+            # A long-lived interactive shell cannot be wrapped command by command, and running it
+            # outside the sandbox would be a silent way around it.
+            return ToolResult(
+                False,
+                "terminal unavailable in the sandbox",
+                "`shell_sandbox` is on, and the persistent `terminal` is not sandboxed. Use `bash`.",
+            )
         if action not in ("close", "start", "open"):
             command_to_run = str(args.get("command") or "").strip()
             if command_to_run:
@@ -4256,6 +4265,8 @@ class ToolExecutor:
     async def _gate_shell(self, command: str, agent_mode: str, *, fail_closed: bool = True) -> ToolResult | None:
         """The one gate every shell-like tool goes through: danger list, sandbox,
         Plan mode, then approval. Returns a blocking result or None."""
+        if sandbox.mode(self._config_or_empty()) == "strict" and sandbox.backend() is None:
+            return ToolResult(False, f"blocked: {command[:36]}", sandbox.unavailable_message())
         danger = is_dangerous_command(command)
         if danger:
             return ToolResult(
@@ -4318,6 +4329,9 @@ class ToolExecutor:
         prefix = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;$OutputEncoding=[System.Text.Encoding]::UTF8;"
         return ["powershell", "-NoProfile", "-NonInteractive", "-Command", prefix + command]
 
+    def _config_or_empty(self) -> dict[str, Any]:
+        return self.get_config() if self.get_config is not None else {}
+
     async def _spawn_shell(self, command: str, *, capture: bool) -> asyncio.subprocess.Process:
         out = asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL
         err = asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL
@@ -4328,6 +4342,11 @@ class ToolExecutor:
             "stderr": err,
             "env": sanitized_env(),
         }
+        cfg = self._config_or_empty()
+        if sandbox.mode(cfg) in ("auto", "strict"):
+            boxed = sandbox.wrap(command, self.workspace, network=sandbox.network_allowed(cfg))
+            if boxed is not None:
+                return await asyncio.create_subprocess_exec(*boxed, **common)
         argv = self._shell_argv(command)
         if argv is not None:
             return await asyncio.create_subprocess_exec(*argv, **common)

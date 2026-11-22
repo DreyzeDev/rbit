@@ -48,6 +48,8 @@ STRIP_KEYS: tuple[str, ...] = (
     "extra_headers",
     "protocol",
     "server_token",
+    "shell_sandbox",
+    "shell_sandbox_network",
 )
 
 #: For these, a value that only narrows things is harmless, so it does not need trust.
@@ -59,6 +61,8 @@ SAFE_VALUES: dict[str, Any] = {
     "acp_allow_all": False,
     "prompt_injection_guard": True,
     "permission_mode": "ask",
+    "shell_sandbox": "strict",
+    "shell_sandbox_network": False,
 }
 
 #: Permission rule containers: only their `allow` rules need trust (deny/ask only narrow).

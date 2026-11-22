@@ -6,6 +6,20 @@ All notable changes to rbit are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in OS-level shell sandbox (`shell_sandbox`).** `"auto"` runs `bash` commands inside
+  a sandbox when the machine has one, `"strict"` runs them there or not at all (default
+  `"off"`). Inside: the file system is read-only except the workspace and a private `/tmp`,
+  the home directory (`~/.ssh`, `~/.aws`, `~/.rbit/config.json`) is hidden, and the network
+  is cut unless `shell_sandbox_network` is `true`. Backends: bubblewrap on Linux,
+  `sandbox-exec` on macOS. Windows has no equivalent, so there `strict` refuses shell
+  commands and `auto` runs them as before. The persistent `terminal` tool is refused while
+  the sandbox applies. A project's `.rbit/config.json` can switch the sandbox on but not off
+  (see `rbit trust`). This is separate from the older `bash_sandbox`, which only is a
+  best-effort check for path escapes in the command text. The Linux and macOS backends are
+  covered by tests of the generated commands only; they were not run on those systems.
+
 ### Security
 
 - **A cloned project's `.rbit/config.json` can no longer run programs or widen permissions
