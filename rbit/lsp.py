@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import sandbox
+
 logger = logging.getLogger("rbit.lsp")
 
 DIAGNOSTIC_TIMEOUT = 8.0
@@ -253,7 +255,8 @@ def _encode_message(payload: dict[str, Any]) -> bytes:
 
 
 class LSPClient:
-    def __init__(self, definition: LSPServerDef, workspace: Path) -> None:
+    def __init__(self, definition: LSPServerDef, workspace: Path, global_config: dict[str, Any] | None = None) -> None:
+        self.global_config = global_config or {}
         self.definition = definition
         self.workspace = workspace.resolve()
         self.process: asyncio.subprocess.Process | None = None
@@ -277,14 +280,23 @@ class LSPClient:
             # Negative cache: do not respawn a server that already failed.
             return False
         try:
-            self.process = await asyncio.create_subprocess_exec(
-                *self.definition.command,
-                cwd=str(self.workspace),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except OSError as exc:
+            sandbox.ensure(self.global_config)
+            if sandbox.enabled(self.global_config):
+                self.process = await sandbox.spawn(
+                    list(self.definition.command),
+                    sandbox.policy_for(self.global_config, self.workspace),
+                    stdin=True,
+                    stderr="pipe",
+                )
+            else:
+                self.process = await asyncio.create_subprocess_exec(
+                    *self.definition.command,
+                    cwd=str(self.workspace),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+        except (OSError, sandbox.SandboxUnavailable) as exc:
             self._failed = str(exc)
             logger.debug("lsp %s failed to start: %s", self.definition.name, exc)
             return False
@@ -734,8 +746,9 @@ class LSPClient:
 
 
 class LSPManager:
-    def __init__(self, workspace: Path, servers: list[LSPServerDef]) -> None:
+    def __init__(self, workspace: Path, servers: list[LSPServerDef], global_config: dict[str, Any] | None = None) -> None:
         self.workspace = workspace.resolve()
+        self.global_config = global_config or {}
         self.servers = servers
         self._clients: dict[str, LSPClient] = {}
         self._by_extension: dict[str, LSPServerDef] = {}
@@ -745,7 +758,7 @@ class LSPManager:
 
     @classmethod
     def from_config(cls, workspace: Path, config: dict[str, Any] | None) -> LSPManager:
-        return cls(workspace, build_servers(config, workspace))
+        return cls(workspace, build_servers(config, workspace), config)
 
     @property
     def configured_count(self) -> int:
@@ -760,7 +773,7 @@ class LSPManager:
             return None
         client = self._clients.get(definition.name)
         if client is None:
-            client = LSPClient(definition, self.workspace)
+            client = LSPClient(definition, self.workspace, self.global_config)
             self._clients[definition.name] = client
         return client
 

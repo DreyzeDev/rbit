@@ -7,6 +7,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from . import sandbox
 from .envscrub import sanitized_env
 
 
@@ -15,8 +16,10 @@ class TerminalError(RuntimeError):
 
 
 class PersistentShell:
-    def __init__(self, workspace: Path, timeout: float = 30.0) -> None:
+    def __init__(self, workspace: Path, timeout: float = 30.0, policy: sandbox.Policy | None = None) -> None:
         self.workspace = workspace.resolve()
+        #: When set, the shell runs confined by this sandbox policy.
+        self.policy = policy
         self.timeout = timeout
         self.process: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
@@ -38,14 +41,23 @@ class PersistentShell:
             # No prompts in the captured output.
             env["PS1"] = ""
             env["PS2"] = ""
-        self.process = await asyncio.create_subprocess_exec(
-            *self._command(),
-            cwd=str(self.workspace),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=env,
-        )
+        if self.policy is not None:
+            command = self._command()
+            if os.name != "nt":
+                command = ["/bin/sh", "-i"]  # $SHELL may live where the sandbox cannot read
+            box_env = sandbox.sandbox_env(self.policy)
+            if os.name != "nt":
+                box_env.update({"PS1": "", "PS2": ""})
+            self.process = await sandbox.spawn(command, self.policy, stdin=True, stderr="stdout", env=box_env)
+        else:
+            self.process = await asyncio.create_subprocess_exec(
+                *self._command(),
+                cwd=str(self.workspace),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
         await self._handshake()
 
     async def _handshake(self) -> None:

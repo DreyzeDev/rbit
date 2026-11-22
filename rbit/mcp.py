@@ -29,7 +29,7 @@ from typing import Any
 
 import httpx
 
-from . import __version__
+from . import __version__, sandbox
 
 logger = logging.getLogger("rbit.mcp")
 
@@ -94,6 +94,8 @@ class MCPClient:
     server_info: dict[str, Any] = field(default_factory=dict)
     error: str = ""
     transport: str = "stdio"
+    #: The whole rbit configuration: decides whether the server is started inside the sandbox.
+    global_config: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.workspace = Path(self.workspace).resolve()
@@ -189,15 +191,27 @@ class MCPClient:
         if isinstance(extra_env, dict):
             env.update({str(k): str(v) for k, v in extra_env.items()})
         cwd = self.config.get("cwd") or str(self.workspace)
-        self._proc = await asyncio.create_subprocess_exec(
-            *self.command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(cwd),
-            env=env,
-            limit=STREAM_LIMIT,
-        )
+        sandbox.ensure(self.global_config)
+        if sandbox.enabled(self.global_config):
+            # An MCP server is third-party code (often `npx -y ...`): it gets the workspace, no
+            # network and no secrets unless its own "sandbox" block (or "environment") says so.
+            policy = sandbox.policy_for(
+                self.global_config,
+                Path(cwd),
+                self.config.get("sandbox"),
+                env_values={str(k): str(v) for k, v in extra_env.items()} if isinstance(extra_env, dict) else None,
+            )
+            self._proc = await sandbox.spawn(list(self.command), policy, stdin=True, stderr="pipe")
+        else:
+            self._proc = await asyncio.create_subprocess_exec(
+                *self.command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(cwd),
+                env=env,
+                limit=STREAM_LIMIT,
+            )
         self._reader = asyncio.create_task(self._read_loop())
         self._stderr = asyncio.create_task(self._stderr_loop())
 
@@ -651,6 +665,7 @@ class MCPManager:
         for name, cfg in self.configs.items():
             try:
                 client = MCPClient(name, cfg, self.workspace, http_client=http_client)
+                client.global_config = config
             except Exception as exc:  # noqa: BLE001 - one bad server must not break the rest
                 self.status[name] = {
                     "connected": False,

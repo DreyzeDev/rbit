@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +105,7 @@ async def test_auto_and_off_run_unsandboxed_without_a_backend(
         assert (tmp_path / f"{mode}.txt").exists()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows has no argv wrapper: it creates the process itself (tests/test_sandbox_isolation.py)")
 @pytest.mark.asyncio
 async def test_with_a_backend_the_command_is_started_through_the_wrapper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -129,14 +131,25 @@ async def test_with_a_backend_the_command_is_started_through_the_wrapper(
 
 
 @pytest.mark.asyncio
-async def test_persistent_terminal_is_not_a_way_around_the_sandbox(
+async def test_persistent_terminal_starts_inside_the_sandbox_with_the_workspace_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(sandbox, "backend", lambda: "bwrap")
+    seen: list[Any] = []
+
+    async def fake_spawn(argv: list[str], policy: Any, **_kw: Any) -> None:
+        seen.append((argv, policy))
+        raise sandbox.SandboxUnavailable("stop")
+
+    monkeypatch.setattr(sandbox, "spawn", fake_spawn)
     ex = _executor(tmp_path, {"shell_sandbox": "auto"})
     ex.always_allow_bash = True
-    result = await ex.execute("terminal", {"command": "echo hi"})
-    assert result.ok is False and "Use `bash`" in result.output
+
+    result = await ex.execute("terminal", {"action": "start"})
+
+    assert result.ok is False and seen, "the terminal did not go through the sandbox"
+    argv, policy = seen[0]
+    assert policy.workspace == tmp_path.resolve() and policy.network is False
 
 
 def test_a_project_cannot_switch_the_sandbox_off_or_open_the_network(

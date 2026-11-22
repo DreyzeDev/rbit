@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import sandbox
 from .envscrub import sanitized_env
 
 logger = logging.getLogger("rbit.formatters")
@@ -242,13 +243,13 @@ def format_file(
         return FormatResult(ran=False, ok=True)
     last = FormatResult(ran=False, ok=True)
     for definition in candidates:
-        last = _run_formatter(path, definition, workspace)
+        last = _run_formatter(path, definition, workspace, config)
         if last.ok:
             return last
     return last
 
 
-def _run_formatter(path: Path, definition: FormatterDef, workspace: Path) -> FormatResult:
+def _run_formatter(path: Path, definition: FormatterDef, workspace: Path, config: dict[str, Any] | None = None) -> FormatResult:
     try:
         before = path.read_bytes()
     except OSError:
@@ -260,19 +261,30 @@ def _run_formatter(path: Path, definition: FormatterDef, workspace: Path) -> For
     env.update(definition.environment)
     t0 = time.monotonic()
     try:
-        proc = subprocess.run(
-            command,
-            cwd=str(workspace),
-            env=env,
-            capture_output=True,
-            # Formatters print UTF-8 regardless of the console code page; never let
-            # a Cyrillic path or message crash the edit (cp1251 on Windows).
-            encoding="utf-8",
-            errors="replace",
-            timeout=FORMAT_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        if sandbox.enabled(config):
+            # A project formatter is project-chosen code: workspace only, no network, no secrets.
+            policy = sandbox.policy_for(config, workspace, env_values=dict(definition.environment))
+            boxed = sandbox.run_sync(command, policy, timeout=FORMAT_TIMEOUT_SECONDS)
+            proc = subprocess.CompletedProcess(
+                command,
+                boxed.returncode,
+                boxed.stdout.decode("utf-8", errors="replace"),
+                boxed.stderr.decode("utf-8", errors="replace"),
+            )
+        else:
+            proc = subprocess.run(
+                command,
+                cwd=str(workspace),
+                env=env,
+                capture_output=True,
+                # Formatters print UTF-8 regardless of the console code page; never let
+                # a Cyrillic path or message crash the edit (cp1251 on Windows).
+                encoding="utf-8",
+                errors="replace",
+                timeout=FORMAT_TIMEOUT_SECONDS,
+                check=False,
+            )
+    except (OSError, subprocess.TimeoutExpired, sandbox.SandboxUnavailable) as exc:
         logger.debug("formatter %s failed for %s: %s", definition.name, path, exc)
         return FormatResult(ran=True, ok=False, name=definition.name, output=str(exc))
     output = "\n".join(part.strip() for part in (proc.stdout, proc.stderr) if part and part.strip())

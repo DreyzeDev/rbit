@@ -8,17 +8,39 @@ All notable changes to rbit are documented here. The format follows
 
 ### Added
 
-- **Opt-in OS-level shell sandbox (`shell_sandbox`).** `"auto"` runs `bash` commands inside
-  a sandbox when the machine has one, `"strict"` runs them there or not at all (default
-  `"off"`). Inside: the file system is read-only except the workspace and a private `/tmp`,
-  the home directory (`~/.ssh`, `~/.aws`, `~/.rbit/config.json`) is hidden, and the network
-  is cut unless `shell_sandbox_network` is `true`. Backends: bubblewrap on Linux,
-  `sandbox-exec` on macOS. Windows has no equivalent, so there `strict` refuses shell
-  commands and `auto` runs them as before. The persistent `terminal` tool is refused while
-  the sandbox applies. A project's `.rbit/config.json` can switch the sandbox on but not off
-  (see `rbit trust`). This is separate from the older `bash_sandbox`, which only is a
-  best-effort check for path escapes in the command text. The Linux and macOS backends are
-  covered by tests of the generated commands only; they were not run on those systems.
+- **OS-level sandbox for everything the agent starts (`shell_sandbox`).** `"auto"` runs
+  programs inside the sandbox when the machine has one, `"strict"` runs them there or not at
+  all (default `"off"`). Covered: `bash`, the persistent `terminal`, `git`/`ripgrep`/`ruff`
+  that rbit runs itself, project formatters, language servers (LSP) and MCP servers. Inside,
+  a program can read and write the workspace and a private scratch folder, read the system
+  and the interpreter, and nothing else: not the home directory (`~/.ssh`, `~/.aws`,
+  `~/.rbit` with the API key), no network (not even loopback), no sight of other processes,
+  no way to gain privileges, and an environment cut down to an allowlist (a key nobody
+  thought about is not inherited). Settings: `shell_sandbox_network`, `shell_sandbox_read`,
+  `shell_sandbox_write`, `shell_sandbox_env`, and a per-server `"sandbox": {...}` block for
+  MCP servers. Python plugins run inside rbit itself, which no OS sandbox can confine, so
+  under `strict` they are not loaded.
+  - **Linux:** a built-in launcher (no extra software): user/mount/pid/net namespaces, a
+    private `/proc`, Landlock, seccomp (no `ptrace`, `mount`, `unshare`, `bpf`, `io_uring`,
+    nested namespaces...), `no_new_privs`, empty capabilities. It never runs the command
+    unconfined if a step fails. bubblewrap is the fallback.
+  - **Windows:** AppContainer plus a Job Object (process-tree kill, process cap, no clipboard
+    or desktop access, only the three standard handles inherited). Access is granted through
+    ACL entries recorded in `~/.rbit/sandbox-grants.json`; `rbit sandbox cleanup` removes
+    them. The project's own `.rbit` folder is closed to the sandbox, PowerShell runs on a
+    workspace-rooted drive, and `shell_sandbox_network` adds the `internetClient` capability.
+  - **macOS:** `sandbox-exec` with a generated profile.
+  - `rbit sandbox status` and `rbit sandbox check` report the backend and *measure* the
+    isolation on this machine (12-14 checks that start real programs: what must work works,
+    what must be denied is denied). The test-suite runs the same checks.
+  - A project's `.rbit/config.json` can switch the sandbox on but not off or wider (see
+    `rbit trust`).
+  - **Verified on:** Windows 11 (AppContainer, all checks) and Linux (WSL2 kernel 6.18, as an
+    unprivileged user, all checks). **Not run on macOS**: the profile is covered by tests of
+    the generated text only. Known limits: on Linux the project's `.rbit` folder is writable
+    from inside the sandbox; a kernel or OS vulnerability can defeat any sandbox.
+  - Separate from the older `bash_sandbox`, which is a best-effort text check for path
+    escapes in the command.
 
 ### Security
 

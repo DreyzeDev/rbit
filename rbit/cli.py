@@ -428,6 +428,41 @@ async def _run_headless(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_sandbox(workspace: Path, action: str) -> int:
+    """`rbit sandbox status|check|cleanup`."""
+    from . import sandbox
+
+    cfg = StorageManager(workspace).load_config()
+    if action == "cleanup":
+        if sys.platform != "win32":
+            print("Nothing to clean up: this platform's sandbox changes no permissions.")
+            return 0
+        removed = sandbox.windows.revoke_all()
+        print(f"Removed {removed} permission entries and the rbit sandbox profile.")
+        return 0
+    info = sandbox.status(cfg)
+    print(f"platform: {info['platform']}   backend: {info['backend'] or 'none'}   mode: {info['mode']}   network: {'allowed' if info['network'] else 'blocked'}")
+    if action == "status":
+        if info["backend"] is None:
+            print("No sandbox backend on this machine: " + sandbox.unavailable_message())
+            return 1 if info["mode"] == "strict" else 0
+        print("Turn it on with `shell_sandbox: \"auto\"` (or \"strict\") in .rbit/config.json. Run `rbit sandbox check` to prove the isolation here.")
+        return 0
+    if info["backend"] is None:
+        print("Cannot check: " + sandbox.unavailable_message())
+        return 1
+    from .sandbox.selftest import run_checks
+
+    results = run_checks(cfg)
+    for check in results:
+        mark = "PASS" if check.passed else "FAIL"
+        extra = "" if check.passed else f"  -> {check.detail}"
+        print(f"  {mark}  [{check.expect:6}] {check.name}{extra}")
+    failed = [c for c in results if not c.passed]
+    print(f"{len(results) - len(failed)}/{len(results)} checks passed")
+    return 1 if failed else 0
+
+
 def _run_trust(workspace: Path, *, yes: bool = False, status: bool = False, revoke: bool = False) -> int:
     """`rbit trust`: show the project's risky settings and trust them after confirmation."""
     from .trust import describe
@@ -1951,7 +1986,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "audit", "usage", "selftest", "skill", "migrate", "diag", "status", "test", "gh", "schedule", "risk", "replay", "reload", "pair", "mini", "trust"}
+    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "audit", "usage", "selftest", "skill", "migrate", "diag", "status", "test", "gh", "schedule", "risk", "replay", "reload", "pair", "mini", "trust", "sandbox"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = _normalize_subcommand_args(sub, args_list[1:])
@@ -2014,6 +2049,15 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("dir", nargs="?", help="Workspace directory")
             parsed = p.parse_args(rest)
             return asyncio.run(_run_doctor(_resolve_workspace(parsed.dir)))
+
+        if sub == "sandbox":
+            p = argparse.ArgumentParser(
+                prog="rbit sandbox", description="OS-level sandbox for shell commands, MCP servers and tools"
+            )
+            p.add_argument("action", nargs="?", choices=["status", "check", "cleanup"], default="status")
+            p.add_argument("dir", nargs="?", help="Workspace directory")
+            parsed = p.parse_args(rest)
+            return _run_sandbox(_resolve_workspace(parsed.dir), parsed.action)
 
         if sub == "trust":
             p = argparse.ArgumentParser(

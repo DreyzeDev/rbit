@@ -129,9 +129,15 @@ def _load_module(name: str, app: Any) -> Any:
 
 def load_plugins(app: Any, config: dict[str, Any] | None = None, registry: PluginRegistry | None = None) -> list[str]:
     """Loads entry points and config `plugins`; returns plugin names."""
+    from . import sandbox
     from .policy import HookPolicy
 
     loaded: list[str] = []
+    if not sandbox.plugins_allowed(config):
+        # Python plugins run inside the rbit process itself: no OS sandbox can confine them, so a
+        # `strict` sandbox does not load any (it would be a hole in the isolation).
+        logger.warning("plugins are not loaded: shell_sandbox is strict and plugins cannot be sandboxed")
+        return loaded
     if registry is None:
         registry = PluginRegistry(policy=HookPolicy.from_config(config))
     elif registry.policy is None:

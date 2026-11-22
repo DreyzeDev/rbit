@@ -776,6 +776,11 @@ async def _read_capped(stream: Any, keep: int = MAX_OUTPUT_KEEP) -> bytes:
 
 async def _kill_process_tree(proc: Any) -> None:
     """Kills the whole process tree of `proc` (a plain kill() leaves grandchildren running)."""
+    kill_tree = getattr(proc, "kill_tree", None)
+    if callable(kill_tree):  # a sandboxed Windows process: its job object ends the whole tree
+        if proc.returncode is None:
+            kill_tree()
+        return
     if proc.returncode is None:
         if os.name == "nt":
             try:
@@ -2843,16 +2848,22 @@ class ToolExecutor:
             cmd.extend(["--glob", include])
         cmd.extend(["--", pattern, "."])
         try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(self.workspace),
-                env=sanitized_env(),
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=20,
-            )
-        except (OSError, subprocess.SubprocessError):
+            if sandbox.enabled(self._config_or_empty()):
+                boxed = sandbox.run_sync(cmd, sandbox.policy_for(self._config_or_empty(), self.workspace), timeout=20)
+                proc = subprocess.CompletedProcess(
+                    cmd, boxed.returncode, boxed.stdout.decode("utf-8", errors="replace"), ""
+                )
+            else:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(self.workspace),
+                    env=sanitized_env(),
+                    capture_output=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=20,
+                )
+        except (OSError, subprocess.SubprocessError, sandbox.SandboxUnavailable):
             return None
         lines: list[str] = []
         matched: list[str] = []
@@ -3134,14 +3145,7 @@ class ToolExecutor:
             )
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                *cmd,
-                cwd=str(self.workspace),
-                env=sanitized_env(),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+            proc = await self._spawn_tool(["git", *cmd])
             out_b, _err = await asyncio.wait_for(proc.communicate(), timeout=20.0)
         except Exception as exc:
             return ToolResult(False, f"git {action} failed", f"git execution error: {exc}")
@@ -3227,14 +3231,7 @@ class ToolExecutor:
             return ToolResult(False, "unsupported bisect subaction", sub)
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                *cmd,
-                cwd=str(self.workspace),
-                env=sanitized_env(),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+            proc = await self._spawn_tool(["git", *cmd])
             out_b, _err = await asyncio.wait_for(proc.communicate(), timeout=30.0)
         except Exception as exc:
             return ToolResult(False, f"git bisect {sub} failed", f"git execution error: {exc}")
@@ -3258,17 +3255,7 @@ class ToolExecutor:
         ruff = shutil.which("ruff")
         if ruff:
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    ruff,
-                    "check",
-                    "--output-format",
-                    "concise",
-                    str(target),
-                    cwd=str(self.workspace),
-                    env=sanitized_env(),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
+                proc = await self._spawn_tool([ruff, "check", "--output-format", "concise", str(target)], merge_stderr=False)
                 out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=60.0)
             except Exception as exc:
                 return ToolResult(False, f"ruff failed: {rel}", f"ruff execution error: {exc}")
@@ -3658,14 +3645,6 @@ class ToolExecutor:
         from .terminal import PersistentShell, TerminalError
 
         action = str(args.get("action") or "run").strip().lower()
-        if action != "close" and sandbox.mode(self._config_or_empty()) in ("auto", "strict") and sandbox.backend():
-            # A long-lived interactive shell cannot be wrapped command by command, and running it
-            # outside the sandbox would be a silent way around it.
-            return ToolResult(
-                False,
-                "terminal unavailable in the sandbox",
-                "`shell_sandbox` is on, and the persistent `terminal` is not sandboxed. Use `bash`.",
-            )
         if action not in ("close", "start", "open"):
             command_to_run = str(args.get("command") or "").strip()
             if command_to_run:
@@ -3674,7 +3653,13 @@ class ToolExecutor:
                 if blocked is not None:
                     return blocked
         if self._terminal_shell is None:
-            self._terminal_shell = PersistentShell(self.workspace)
+            cfg = self._config_or_empty()
+            try:
+                sandbox.ensure(cfg)
+            except sandbox.SandboxUnavailable as exc:
+                return ToolResult(False, "terminal: sandbox unavailable", str(exc))
+            policy = sandbox.policy_for(cfg, self.workspace) if sandbox.enabled(cfg) else None
+            self._terminal_shell = PersistentShell(self.workspace, policy=policy)
         shell: PersistentShell = self._terminal_shell
         if action == "close":
             await shell.close()
@@ -4314,23 +4299,55 @@ class ToolExecutor:
             timeout_s = 30.0
         timeout_s = max(1.0, min(600.0, timeout_s))
 
-        if args.get("background") or args.get("runInBackground"):
-            result = await self._run_background(command)
-        else:
-            result = await self._run_subprocess(command, timeout_s=timeout_s)
+        try:
+            if args.get("background") or args.get("runInBackground"):
+                result = await self._run_background(command)
+            else:
+                result = await self._run_subprocess(command, timeout_s=timeout_s)
+        except sandbox.SandboxUnavailable as exc:
+            return ToolResult(False, f"sandbox: not started: {command[:30]}", str(exc))
         self.invalidate_file_cache()
         return result
 
     @staticmethod
-    def _shell_argv(command: str) -> list[str] | None:
-        """PowerShell invocation on Windows (UTF-8 output so Cyrillic is not mangled); None elsewhere."""
+    def _shell_argv(command: str, sandbox_root: Path | None = None) -> list[str] | None:
+        """PowerShell invocation on Windows (UTF-8 output so Cyrillic is not mangled); None elsewhere.
+
+        Inside the sandbox PowerShell cannot set its location to a folder whose parent folders
+        it may not list (and must not: that would reveal the user's profile). A PowerShell
+        drive rooted at the workspace avoids walking those parents; it also means `cd ..` cannot
+        leave the workspace from PowerShell's point of view.
+        """
         if os.name != "nt":
             return None
         prefix = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;$OutputEncoding=[System.Text.Encoding]::UTF8;"
+        if sandbox_root is not None:
+            root = str(sandbox_root).replace("'", "''")
+            prefix += f"New-PSDrive -Name rbit -PSProvider FileSystem -Root '{root}' -Scope Global | Out-Null;Set-Location rbit:\\;"
         return ["powershell", "-NoProfile", "-NonInteractive", "-Command", prefix + command]
 
     def _config_or_empty(self) -> dict[str, Any]:
         return self.get_config() if self.get_config is not None else {}
+
+    async def _spawn_tool(self, argv: list[str], *, merge_stderr: bool = True) -> Any:
+        """Starts a helper program rbit itself needs (git, ruff): confined when the sandbox is on.
+
+        A hostile repository's own configuration (`core.fsmonitor`, hooks, aliases) can make
+        even `git status` run commands, so these go through the sandbox too.
+        """
+        cfg = self._config_or_empty()
+        sandbox.ensure(cfg)
+        if sandbox.enabled(cfg):
+            return await sandbox.spawn(
+                argv, sandbox.policy_for(cfg, self.workspace), stderr="stdout" if merge_stderr else "pipe"
+            )
+        return await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(self.workspace),
+            env=sanitized_env(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT if merge_stderr else asyncio.subprocess.PIPE,
+        )
 
     async def _spawn_shell(self, command: str, *, capture: bool) -> asyncio.subprocess.Process:
         out = asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL
@@ -4343,10 +4360,15 @@ class ToolExecutor:
             "env": sanitized_env(),
         }
         cfg = self._config_or_empty()
-        if sandbox.mode(cfg) in ("auto", "strict"):
-            boxed = sandbox.wrap(command, self.workspace, network=sandbox.network_allowed(cfg))
-            if boxed is not None:
-                return await asyncio.create_subprocess_exec(*boxed, **common)
+        if sandbox.enabled(cfg):
+            boxed_argv = self._shell_argv(command, self.workspace) or ["/bin/sh", "-c", command]
+            return await sandbox.spawn(
+                boxed_argv,
+                sandbox.policy_for(cfg, self.workspace),
+                stdin=False,
+                stdout=capture,
+                stderr="pipe" if capture else "null",
+            )
         argv = self._shell_argv(command)
         if argv is not None:
             return await asyncio.create_subprocess_exec(*argv, **common)

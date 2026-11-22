@@ -27,6 +27,7 @@ from .models import (
 )
 from .router import apply_live_route, router_enabled
 from .rules import load_rules
+from . import sandbox
 from .envscrub import sanitized_env
 from .usage import BudgetGuard, UsageLedger, estimate_cost, normalize_budget_mode, split_usage
 from .skills import load_skills, skills_prompt
@@ -2409,14 +2410,20 @@ class AgentEngine:
 
     async def _run_git_full(self, *args: str, timeout: float = 15.0) -> tuple[int, str]:
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                *args,
-                cwd=str(self.workspace),
-                env=sanitized_env(),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+            cfg = self.get_config()
+            if sandbox.enabled(cfg):
+                proc = await sandbox.spawn(
+                    ["git", *args], sandbox.policy_for(cfg, self.workspace), stderr="stdout"
+                )
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    "git",
+                    *args,
+                    cwd=str(self.workspace),
+                    env=sanitized_env(),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
             out, _err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             return proc.returncode, out.decode("utf-8", errors="replace").strip()
         except Exception as exc:

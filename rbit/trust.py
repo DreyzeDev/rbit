@@ -50,6 +50,9 @@ STRIP_KEYS: tuple[str, ...] = (
     "server_token",
     "shell_sandbox",
     "shell_sandbox_network",
+    "shell_sandbox_read",
+    "shell_sandbox_write",
+    "shell_sandbox_env",
 )
 
 #: For these, a value that only narrows things is harmless, so it does not need trust.
