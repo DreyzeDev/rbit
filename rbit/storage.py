@@ -25,6 +25,9 @@ from .trust import (
 
 log = logging.getLogger(__name__)
 
+#: (workspace, untrusted keys) pairs already reported in the log by this process.
+_WARNED_UNTRUSTED: set[tuple[str, tuple[str, ...]]] = set()
+
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _DEFAULT_BASE = "https://openrouter.ai/api/v1"
 
@@ -285,7 +288,11 @@ class StorageManager:
                         loaded, self.trust_store.trusted_for(self.workspace)
                     )
                     if self.untrusted_keys:
-                        log.warning(self.untrusted_notice())
+                        # load_config() runs many times per session: say it once per process.
+                        marker = (str(self.workspace), tuple(self.untrusted_keys))
+                        if marker not in _WARNED_UNTRUSTED:
+                            _WARNED_UNTRUSTED.add(marker)
+                            log.warning(self.untrusted_notice())
                 if loaded.get("theme") in ("opencode", "opencode-dark"):
                     loaded["theme"] = "rbit-dark"
                 if loaded.get("theme") == "opencode-light":

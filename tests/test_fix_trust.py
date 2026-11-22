@@ -365,3 +365,36 @@ def test_rbit_trust_revoke(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -
     assert storage.untrusted_keys == ["plugins"]
     assert _cli(["trust", str(ws), "--revoke"]) == 0
     assert "Nothing was trusted" in capsys.readouterr().out
+
+
+# ------------------------------------------------------ notices (log and TUI)
+
+
+def test_the_untrusted_warning_is_logged_once_not_on_every_config_load(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    storage = StorageManager(_project(tmp_path, {"plugins": [".rbit/plugins/a"]}))
+    with caplog.at_level("WARNING", logger="rbit.storage"):
+        for _ in range(5):
+            storage.load_config()
+    assert [r for r in caplog.records if "untrusted" in r.getMessage()].__len__() == 1
+
+
+@pytest.mark.asyncio
+async def test_tui_tells_the_user_that_project_settings_were_ignored(tmp_path: Path) -> None:
+    from rbit.app import RbitApp
+
+    ws = _project(tmp_path, {"plugins": [".rbit/plugins/a"], "permission_mode": "auto"})
+    app = RbitApp(workspace=ws)
+    shown: list[str] = []
+    original = app.notify
+
+    def spy(message: str, *args: Any, **kwargs: Any) -> None:
+        shown.append(str(message))
+        original(message, *args, **kwargs)
+
+    app.notify = spy  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+    assert any("rbit trust" in text for text in shown)
