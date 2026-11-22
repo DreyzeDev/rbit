@@ -806,3 +806,107 @@ async def test_retry_resends_the_users_prompt_not_the_auto_self_check_followup(w
         app._cmd_retry()
         assert [m.id for m in sent] == ["u1"]
         assert [m.id for m in app.session.messages] == ["u1"]
+
+
+def _executor(workspace: Path) -> Any:
+    from rbit.tools import ToolExecutor
+
+    return ToolExecutor(workspace, Session(title="t"))
+
+
+def test_refused_undo_keeps_the_snapshot_so_it_works_after_the_conflict_is_gone(tmp_path: Path) -> None:
+    executor = _executor(tmp_path)
+    target = tmp_path / "a.txt"
+    target.write_text("old\n", encoding="utf-8")
+    executor._push_snapshot("edit a", target, True, "old\n", "new\n", b"old\n")
+    target.write_text("someone else\n", encoding="utf-8")  # the file changed after rbit's edit
+
+    assert "Cannot undo" in executor.undo_last()
+    assert len(executor.undo_stack) == 1  # it used to be thrown away here
+
+    target.write_text("new\n", encoding="utf-8")  # conflict resolved
+    assert "Reverted" in executor.undo_last()
+    assert target.read_text(encoding="utf-8") == "old\n"
+
+
+def test_undo_turn_skips_a_conflicting_file_and_still_restores_the_rest(tmp_path: Path) -> None:
+    executor = _executor(tmp_path)
+    a, b = tmp_path / "a.txt", tmp_path / "b.txt"
+    a.write_text("A1\n", encoding="utf-8")
+    b.write_text("B1\n", encoding="utf-8")
+    executor._push_snapshot("edit a", a, True, "A0\n", "A1\n", b"A0\n")
+    executor._push_snapshot("edit b", b, True, "B0\n", "B1\n", b"B0\n")
+    a.write_text("A-user\n", encoding="utf-8")
+
+    assert executor.undo_to_count(0) == 1  # terminates, reverts b only
+    assert b.read_text(encoding="utf-8") == "B0\n" and a.read_text(encoding="utf-8") == "A-user\n"
+    assert executor.undo_stack == []
+
+
+@pytest.mark.asyncio
+async def test_new_session_forgets_the_previous_sessions_undo_history(workspace: Path) -> None:
+    app = RbitApp(workspace=workspace)
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause(0.2)
+        target = workspace / "x.txt"
+        target.write_text("1\n", encoding="utf-8")
+        app.executor._push_snapshot("edit x", target, True, "0\n", "1\n", b"0\n")
+        app.action_new_session()
+        await pilot.pause(0.1)
+        assert app.executor.undo_stack == [] and app.executor.redo_stack == []
+        app._cmd_undo()
+        assert target.read_text(encoding="utf-8") == "1\n"  # the old session's edit stays
+
+
+@pytest.mark.asyncio
+async def test_clear_chat_is_saved(workspace: Path) -> None:
+    app = RbitApp(workspace=workspace)
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause(0.2)
+        app.session.messages = [ChatMessage(id="u1", role="user", content="hi")]
+        app.storage.save_session(app.session)
+        app.action_clear_chat()
+        await pilot.pause(0.1)
+        assert app.storage.find_session(app.session.id).messages == []
+
+
+@pytest.mark.asyncio
+async def test_bang_command_typed_while_busy_stays_in_the_input(workspace: Path) -> None:
+    """`!pytest` pressed during a turn only said "busy" and the typed command was lost."""
+    app = RbitApp(workspace=workspace)
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause(0.2)
+        app.is_busy = True
+        inp = app.query_one("#prompt-input", Input)
+        inp.focus()
+        inp.value = "!echo hi"
+        await pilot.press("enter")
+        await pilot.pause(0.1)
+        assert inp.value == "!echo hi"
+        app.is_busy = False
+
+
+@pytest.mark.asyncio
+async def test_cost_notice_has_no_literal_markdown_asterisks(workspace: Path) -> None:
+    app = RbitApp(workspace=workspace)
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause(0.2)
+        app._cmd_info("/cost")
+        await pilot.pause(0.1)
+        notices = [str(w.render()) for w in app.query(".system-notice")]
+        assert any("Estimated session cost: $" in n for n in notices)
+        assert not any("**" in n for n in notices)
+
+
+def test_every_palette_entry_has_a_dispatcher_and_the_new_ones_are_listed() -> None:
+    """A palette row without a handler would be a dead button."""
+    import re
+
+    from rbit.modals import PALETTE_ITEMS
+
+    source = (Path(__file__).resolve().parent.parent / "rbit" / "app.py").read_text(encoding="utf-8")
+    dispatch = source[source.index("dispatch = {"):source.index("fn = dispatch.get(act)")]
+    handled = set(re.findall(r'^\s*"([a-z_]+)":', dispatch, flags=re.MULTILINE))
+    ids = {item[1] for item in PALETTE_ITEMS}
+    assert ids <= handled, ids - handled
+    assert {"undo_turn", "cost"} <= ids

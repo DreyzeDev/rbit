@@ -306,6 +306,18 @@ def decode_file_bytes(raw: bytes) -> tuple[str, str]:
     return raw.decode(encoding, errors="surrogateescape"), encoding
 
 
+def split_text_lines(text: str) -> list[str]:
+    """Lines as every editor, `edit` and ripgrep count them: only \\n or \\r\\n end a line.
+
+    `str.splitlines()` also breaks on form feed (common in GNU/Emacs sources), U+2028 and U+0085,
+    which shifted the line numbers shown by `read` and `grep` away from the real ones.
+    """
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return [line[:-1] if line.endswith("\r") else line for line in lines]
+
+
 def read_text_for_display(path: Path) -> str:
     """File text for showing to the model: right encoding, U+FFFD for undecodable bytes."""
     raw = path.read_bytes()
@@ -1747,10 +1759,8 @@ class ToolExecutor:
         self.undo_stack.append(snap)
         self.redo_stack.clear()
 
-    def undo_last(self, force: bool = False) -> str:
-        if not self.undo_stack:
-            return "No file changes to undo."
-        snap = self.undo_stack.pop()
+    def _revert_snapshot(self, snap: FileSnapshot, force: bool) -> tuple[bool, str]:
+        """Reverts one snapshot. Returns (done, message); a refusal leaves the file untouched."""
         target = Path(snap.path)
         rel = self.rel_display(target)
         if not force:
@@ -1759,7 +1769,7 @@ class ToolExecutor:
             except OSError:
                 current = None
             if current is None or current != snap.new_content.replace("\r\n", "\n"):
-                return (
+                return False, (
                     f"Cannot undo `{rel}` ({snap.step_label}): the file changed after that edit, "
                     "so reverting would silently overwrite newer content. The file was left as it is."
                 )
@@ -1773,10 +1783,19 @@ class ToolExecutor:
         elif target.exists():
             target.unlink()
         self.invalidate_file_cache()
-        self.redo_stack.append(snap)
         if self.on_files_updated:
             self.on_files_updated()
-        return f"Reverted `{rel}` ({snap.step_label})"
+        return True, f"Reverted `{rel}` ({snap.step_label})"
+
+    def undo_last(self, force: bool = False) -> str:
+        if not self.undo_stack:
+            return "No file changes to undo."
+        # Peek, do not pop: a refused undo used to throw the snapshot away, so the edit could
+        # never be reverted again even after the user fixed the conflict.
+        done, message = self._revert_snapshot(self.undo_stack[-1], force)
+        if done:
+            self.redo_stack.append(self.undo_stack.pop())
+        return message
 
     def import_graph(self, limit: int = 200) -> dict[str, set[str]]:
         """Python-only import graph: local file → local modules it imports."""
@@ -1805,11 +1824,18 @@ class ToolExecutor:
         return graph
 
     def undo_to_count(self, mark: int) -> int:
-        """Reverts file snapshots until the undo stack is back to `mark` length."""
+        """Reverts file snapshots until the undo stack is back to `mark` length.
+
+        A step whose file changed afterwards is skipped (left on disk as it is) and dropped from
+        the stack, so the other files of the turn are still restored and the loop always ends.
+        """
         reverted = 0
         while len(self.undo_stack) > max(0, mark):
-            self.undo_last()
-            reverted += 1
+            snap = self.undo_stack.pop()
+            done, _message = self._revert_snapshot(snap, False)
+            if done:
+                self.redo_stack.append(snap)
+                reverted += 1
         return reverted
 
     def redo_last(self) -> str:
@@ -2331,7 +2357,7 @@ class ToolExecutor:
         raw_bytes = target.read_bytes()
         encoding = detect_file_encoding(raw_bytes)
         text = raw_bytes.decode(encoding, errors="replace")
-        lines = text.splitlines()
+        lines = split_text_lines(text)
         sliced = lines[offset - 1 : offset - 1 + limit]
         numbered = "\n".join(f"{idx}: {line}" for idx, line in enumerate(sliced, start=offset))
         output = numbered or "(empty file)"
@@ -2969,7 +2995,7 @@ class ToolExecutor:
                 text = read_text_for_display(full)
             except Exception:
                 continue
-            lines = text.splitlines()
+            lines = split_text_lines(text)
             file_hits = 0
             for idx, line in enumerate(lines, start=1):
                 if len(line) > self.MAX_GREP_LINE:

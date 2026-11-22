@@ -40,6 +40,8 @@ PALETTE_ITEMS: list[tuple[str, str, str, str]] = [
     ("Session", "export", "Export session to Markdown", "/export"),
     ("Session", "undo", "Undo last file edit", "/undo"),
     ("Session", "redo", "Redo file edit", "/redo"),
+    ("Session", "undo_turn", "Undo every file edit of the last turn", "/undoturn"),
+    ("Session", "cost", "Show estimated session cost", "/cost"),
     ("Session", "compact", "Compact session context", "/compact"),
     ("Session", "retry", "Re-run the last prompt", "/retry"),
     ("Session", "fork", "Fork session into a new branch", "/fork"),

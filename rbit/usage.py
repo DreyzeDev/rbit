@@ -319,7 +319,7 @@ class UsageLedger:
             model["calls"] += 1
             model["cost"] += rec.cost_usd
             model["tokens"] += rec.total_tokens
-            day_key = rec.ts[:10]
+            day_key = _local_day_key(rec.ts)
             by_day[day_key] = by_day.get(day_key, 0.0) + rec.cost_usd
             provider = rec.provider or "?"
             by_provider[provider] = by_provider.get(provider, 0.0) + rec.cost_usd
@@ -460,6 +460,21 @@ class BudgetGuard:
         hours = forecast.get("hours_left")
         tail = f" — at this rate the limit lasts ~{hours:.1f}h" if isinstance(hours, float) else ""
         return f"Budget {labels.get(crossed, f'{crossed:.0%}')} used today{tail}"
+
+
+def _local_day_key(ts: str) -> str:
+    """`YYYY-MM-DD` of a stored UTC timestamp in the user's local day, as the daily files are named.
+
+    Taking the first ten characters of the UTC string put calls made just after local midnight
+    (or before it, west of Greenwich) under the wrong day in `/usage`.
+    """
+    try:
+        stamp = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return str(ts)[:10]
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone().date().isoformat()
 
 
 def split_usage(usage: dict[str, Any] | None) -> dict[str, int]:

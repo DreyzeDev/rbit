@@ -702,3 +702,48 @@ def test_reasoning_tokens_are_not_billed_twice() -> None:
     })
     cost, priced = estimate_cost(usage, 1.0)
     assert priced and cost == pytest.approx((1000 + 600) / 1000.0)
+
+
+def test_project_memory_does_not_glue_onto_an_unterminated_line_or_drop_near_duplicates(tmp_path: Path) -> None:
+    from rbit.storage import StorageManager
+
+    storage = StorageManager(tmp_path)
+    storage.ensure_dirs()
+    storage.memory_path.write_text("- use pytest -x for speed", encoding="utf-8")  # no trailing newline
+    assert storage.append_project_memory(["use pytest", "- use pytest -x for speed"]) == 1
+    lines = storage.memory_path.read_text(encoding="utf-8").splitlines()
+    assert lines == ["- use pytest -x for speed", "- use pytest"]
+
+
+def test_read_and_grep_number_lines_like_the_editor_with_form_feeds(tmp_path: Path) -> None:
+    """A form feed (GNU sources) or U+2028 used to count as a line break and shift every number after it."""
+    from rbit.models import Session
+    from rbit.tools import ToolExecutor, split_text_lines
+
+    assert split_text_lines("a\x0cb\nc\r\nd\n") == ["a\x0cb", "c", "d"]
+    assert split_text_lines("") == [] and split_text_lines("x") == ["x"]
+
+    (tmp_path / "f.txt").write_text("one\x0c\ntwo\u2028still two\nthree TARGET\n", encoding="utf-8", newline="")
+    executor = ToolExecutor(tmp_path, Session(title="t"))
+    read = executor._tool_read({"filePath": "f.txt"})
+    assert "3: three TARGET" in read.output and read.summary == "3/3 lines"
+    hit = executor._tool_grep({"pattern": "TARGET", "path": "."})
+    assert "f.txt:3:" in hit.output.replace("\\", "/")
+
+
+def test_usage_by_day_uses_the_local_day_not_the_utc_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+
+    from rbit.usage import _local_day_key
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("needs time.tzset (POSIX)")
+    monkeypatch.setenv("TZ", "Etc/GMT-3")  # UTC+3, no daylight saving
+    time.tzset()
+    try:
+        assert _local_day_key("2026-11-21T22:30:00+00:00") == "2026-11-22"  # 01:30 the next local day
+        assert _local_day_key("2026-11-21T12:00:00+00:00") == "2026-11-21"
+        assert _local_day_key("garbage-ts") == "garbage-ts"[:10]
+    finally:
+        monkeypatch.delenv("TZ", raising=False)
+        time.tzset()

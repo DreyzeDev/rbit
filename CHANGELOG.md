@@ -132,6 +132,15 @@ All notable changes to rbit are documented here. The format follows
   - `/retry` resends the user's own prompt, not the app's `[auto]` self-check follow-up; the
     debounced session save is flushed before the session lock is released.
 
+- **Undo and session fixes.** A refused `/undo` (file edited after rbit's change) no longer
+  throws the snapshot away; `/undoturn` skips a conflicting file, restores the rest and says
+  how many it skipped; `/new` forgets the previous session's undo history; `/clear` is saved;
+  `!cmd` typed while the agent is busy stays in the input; `/cost` shows no literal `**`.
+- **Smaller fixes.** `read` and `grep` count lines like editors do (form feed, U+2028 and U+0085
+  no longer shift line numbers); project memory no longer glues a bullet onto an unterminated
+  line or drops "use pytest" because "use pytest -x" exists; `/usage` groups by local day.
+- **Command palette** gains "Undo every file edit of the last turn" and "Show estimated cost".
+
 ## [1.6.0] - 2026-11-18
 
 Closes every remaining actionable item in `docs/RBIT_BLUEPRINT.md`: 132 of 134

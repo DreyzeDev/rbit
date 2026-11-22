@@ -1292,6 +1292,8 @@ class RbitApp(App[None]):
             "sessions": self.action_open_sessions,
             "undo": self._cmd_undo,
             "redo": self._cmd_redo,
+            "undo_turn": self._cmd_undo_turn,
+            "cost": lambda: self._cmd_info("/cost"),
             "diff": self._cmd_diff,
             "compact": self._cmd_compact,
             "retry": self._cmd_retry,
@@ -1482,6 +1484,10 @@ class RbitApp(App[None]):
         self._queued_prompt = None
         self.session = Session()
         self.executor.session = self.session
+        # The previous session's file edits must not be undoable from the new, empty one.
+        self.executor.undo_stack.clear()
+        self.executor.redo_stack.clear()
+        self._turn_undo_mark = 0
         self.audit.bind_session(self.session.id)
         self._history_window = 30
         self._has_inline_notices = False
@@ -1496,6 +1502,7 @@ class RbitApp(App[None]):
             self.notify("Agent is busy — press Esc first.", severity="warning")
             return
         self.session.messages.clear()
+        self.storage.save_session(self.session)  # otherwise the "cleared" chat comes back on resume
         self._history_window = 30
         self._has_inline_notices = False
         self._rebuild_chat_view()
@@ -1899,8 +1906,15 @@ class RbitApp(App[None]):
         self.notify("No assistant message to pin.", severity="warning")
 
     def _cmd_undo_turn(self) -> None:
-        n = self.executor.undo_to_count(getattr(self, "_turn_undo_mark", 0))
-        self.notify(f"Undone {n} change(s) from this turn." if n else "Nothing to undo.", timeout=2.0)
+        mark = getattr(self, "_turn_undo_mark", 0)
+        total = max(0, len(self.executor.undo_stack) - mark)
+        n = self.executor.undo_to_count(mark)
+        self.storage.save_session(self.session)
+        skipped = total - n
+        text = f"Undone {n} change(s) from this turn." if n else "Nothing to undo."
+        if skipped:
+            text += f" Skipped {skipped}: the file was edited again afterwards."
+        self.notify(text, timeout=3.0 if skipped else 2.0)
         self._sync_ui()
 
     def _cmd_info(self, kind: str, arg: str = "") -> None:
@@ -1916,7 +1930,7 @@ class RbitApp(App[None]):
             )
             budget = float(self.config_data.get("budget_usd") or 0)
             suffix = f" / ${budget:.2f} budget" if budget else ""
-            self._post_notice(f"Estimated session cost: **${spent:.4f}**{suffix}")
+            self._post_notice(f"Estimated session cost: ${spent:.4f}{suffix}")  # notices are plain text: no Markdown
             return
         if kind == "/usage":
             tools = sum(len(message.tool_calls) for message in self.session.messages)
@@ -3075,6 +3089,7 @@ class RbitApp(App[None]):
 
         if raw.startswith("!"):
             if self.is_busy:
+                event.input.value = raw  # keep what was typed: it was cleared a few lines above
                 self.notify("Agent is busy — press Esc first.", severity="warning")
                 return
             cmd_str = raw[1:].strip()

@@ -248,21 +248,25 @@ class StorageManager:
         if not bullets:
             return 0
         self.ensure_dirs()
-        existing = ""
+        raw = ""
         if self.memory_path.exists():
-            existing = self.memory_path.read_text(encoding="utf-8", errors="ignore").lower()
+            raw = self.memory_path.read_text(encoding="utf-8", errors="ignore")
+        # Whole-bullet comparison: a substring test dropped "use pytest" because the file already
+        # had "use pytest -x for speed".
+        known = {line.strip().lstrip("-• ").strip().lower() for line in raw.splitlines()}
         added = 0
         new_lines = []
         for b in bullets:
             b = str(b).strip().lstrip("-• ").strip()
-            if not b or b.lower() in existing:
+            if not b or b.lower() in known:
                 continue
             new_lines.append(f"- {b}")
-            existing += b.lower() + "\n"
+            known.add(b.lower())
             added += 1
         if new_lines:
+            lead = "\n" if raw and not raw.endswith("\n") else ""  # do not glue onto the last line
             with self.memory_path.open("a", encoding="utf-8") as f:
-                f.write("\n".join(new_lines) + "\n")
+                f.write(lead + "\n".join(new_lines) + "\n")
         return added
 
     def load_config(self) -> dict[str, Any]:
