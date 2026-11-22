@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .policy import Policy
+from .policy import SECRET_HOME_DIRS, Policy, private_tmp
 
 HELPER = Path(__file__).with_name("_linux_exec.py")
 
@@ -47,12 +47,33 @@ def backend() -> str | None:
     return None
 
 
+#: System files that hold credentials even though /etc is otherwise readable.
+SYSTEM_SECRETS = (
+    "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-", "/etc/sudoers", "/etc/sudoers.d",
+    "/etc/ssl/private", "/etc/security/opasswd",
+)
+
+
 def landlock_spec(policy: Policy) -> dict[str, object]:
+    workspace = policy.workspace
+    root = private_tmp(workspace) / "root"  # an empty host directory the launcher builds the new root in
+    root.mkdir(exist_ok=True)
+    home = Path.home()
+    reads = [*SYSTEM_READ, *(str(p) for p in policy.read_paths)]
+    if policy.network and os.path.lexists("/etc/resolv.conf"):
+        reads.append(os.path.realpath("/etc/resolv.conf"))  # on WSL and systemd it points outside /etc
     return {
-        "workspace": str(policy.workspace),
+        "workspace": str(workspace),
+        "cwd": str(policy.start_dir),
+        "root": str(root),
         "network": policy.network,
-        "read": [*SYSTEM_READ, *(str(p) for p in policy.read_paths)],
+        "read": reads,
         "write": [str(p) for p in policy.write_paths],
+        # invisible inside, even when a granted folder contains them: the project's own state,
+        # the user's credential folders (a user who lists "~" must not expose ~/.ssh), system secrets
+        "hide": [str(workspace / ".rbit"), *(str(home / rel) for rel in SECRET_HOME_DIRS), *SYSTEM_SECRETS],
+        # visible but not writable: files a later `git` run OUTSIDE the sandbox would execute
+        "readonly": [str(workspace / ".git" / "hooks"), str(workspace / ".git" / "config")],
     }
 
 
@@ -63,6 +84,8 @@ def landlock_argv(argv: list[str], policy: Policy) -> list[str]:
 def bwrap_argv(argv: list[str], policy: Policy) -> list[str]:
     ws = str(policy.workspace)
     out = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
+    # /run and /mnt hold the sockets that matter (ssh-agent, docker, D-Bus, the WSL bridge)
+    out += ["--tmpfs", "/run", "--tmpfs", "/mnt"]
     home = os.environ.get("HOME")
     if home and Path(home) != Path("/"):
         out += ["--tmpfs", home]  # hide ~/.ssh, ~/.rbit/config.json, ~/.aws ...
@@ -75,5 +98,5 @@ def bwrap_argv(argv: list[str], policy: Policy) -> list[str]:
             "--cap-drop", "ALL"]
     if not policy.network:
         out.append("--unshare-net")
-    out += ["--chdir", ws, *argv]
+    out += ["--chdir", str(policy.start_dir), *argv]
     return out

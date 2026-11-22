@@ -420,6 +420,169 @@ def test_linux_launcher_refuses_to_run_unconfined_when_setup_fails(tmp_path: Pat
     assert probe.returncode == 2
 
 
+# ------------------------------------------------ regression tests for the audit findings
+
+
+def test_audit_a_working_directory_outside_the_workspace_is_refused(tmp_path: Path) -> None:
+    """F2: an MCP `cwd` of ~/.ssh used to become the sandbox's writable workspace."""
+    workspace = tmp_path / "ws"
+    (workspace / "sub").mkdir(parents=True)
+    policy = policy_for({"shell_sandbox": "strict"}, workspace, None, None, workspace / "sub")
+    assert policy.workspace == workspace.resolve() and policy.start_dir == (workspace / "sub").resolve()
+    for outside in (Path.home(), Path.home() / ".ssh", tmp_path):
+        with pytest.raises(sandbox.SandboxUnavailable):
+            policy_for({"shell_sandbox": "strict"}, workspace, None, None, outside)
+
+
+def test_audit_a_workspace_inside_a_credential_folder_is_refused() -> None:
+    with pytest.raises(sandbox.SandboxUnavailable):
+        policy_for({"shell_sandbox": "strict"}, Path.home() / ".ssh")
+
+
+def test_audit_extra_folders_that_contain_secrets_are_dropped(tmp_path: Path) -> None:
+    """F2/F3: `read: ["~"]` (or a parent of it) used to expose ~/.ssh through the ancestor."""
+    home = Path.home()
+    options = {"read": [str(home), str(home.parent), str(home / ".ssh"), str(tmp_path / "ok")], "write": [str(home), "~"]}
+    policy = policy_for({"shell_sandbox": "strict"}, tmp_path / "ws", options)
+    granted = {Path(p) for p in (*policy.read_paths, *policy.write_paths)}
+    assert tmp_path / "ok" in granted  # an ordinary folder is still honoured
+    for forbidden in (home, home.parent, home / ".ssh"):
+        assert forbidden not in granted, f"{forbidden} reached the policy"
+    assert home.resolve() not in {p.resolve() for p in policy.write_paths}
+
+
+def test_audit_trust_shows_everything_an_mcp_entry_widens() -> None:
+    """F3: `rbit trust` used to print only the command and hide cwd, sandbox.* and environment."""
+    from rbit.trust import describe, fingerprint
+
+    entry = {
+        "type": "local", "command": ["npx", "-y", "pkg"], "cwd": "~/.ssh",
+        "sandbox": {"network": True, "read": ["~/Documents"], "write": ["~/.rbit"], "env": ["OPENAI_API_KEY"]},
+        "environment": {"TOKEN": "super-secret-value"},
+    }
+    text = describe("mcp", {"evil": entry})
+    for must_show in ("npx -y pkg", "~/.ssh", "NETWORK", "~/Documents", "WRITES", "~/.rbit", "OPENAI_API_KEY", "TOKEN"):
+        assert must_show in text, f"{must_show!r} is hidden from the user"
+    assert "super-secret-value" not in text  # values of variables are never printed
+    widened = {**entry, "sandbox": {**entry["sandbox"], "write": ["~"]}}
+    assert fingerprint({"evil": entry}) != fingerprint({"evil": widened})  # a widening needs new trust
+
+
+@needs_backend
+@pytest.mark.asyncio
+async def test_audit_mcp_server_with_a_cwd_outside_the_workspace_never_runs(tmp_path: Path) -> None:
+    from rbit.mcp import MCPManager
+
+    workspace = tmp_path / "ws"
+    elsewhere = tmp_path / "elsewhere"
+    workspace.mkdir()
+    elsewhere.mkdir()
+    marker = tmp_path / "server_ran.txt"
+    (workspace / "server.py").write_text(f"open(r'{marker}', 'w').write('ran')\n", encoding="utf-8")
+    cfg = {
+        "shell_sandbox": "strict",
+        "mcp": {"x": {"type": "local", "command": [sys.executable, str(workspace / "server.py")], "cwd": str(elsewhere)}},
+    }
+    manager = MCPManager.from_config(cfg, workspace)
+    try:
+        await manager.start()
+    finally:
+        await manager.close()
+    assert not manager.status["x"]["connected"] and "outside the workspace" in manager.status["x"]["error"]
+    assert not marker.exists()
+
+
+@needs_backend
+def test_audit_folders_opened_for_one_program_stay_closed_to_the_others(tmp_path: Path) -> None:
+    """F4: with one shared container identity a folder opened for one server stayed open for all."""
+    workspace = tmp_path / "ws"
+    extra = tmp_path / "documents"
+    workspace.mkdir()
+    extra.mkdir()
+    (extra / "private.txt").write_text(SECRET, encoding="utf-8")
+    code = "import sys;print(open(sys.argv[1]).read())"
+    widened = policy_for({"shell_sandbox": "strict"}, workspace, {"read": [str(extra)]})
+    plain = policy_for({"shell_sandbox": "strict"}, workspace)
+    target = str(extra / "private.txt")
+
+    first = sandbox.run_sync([sys.executable, "-c", code, target], widened, timeout=60)
+    second = sandbox.run_sync([sys.executable, "-c", code, target], plain, timeout=60)
+    third = sandbox.run_sync([sys.executable, "-c", code, target], widened, timeout=60)
+
+    assert SECRET.encode() in first.stdout and SECRET.encode() in third.stdout  # the widening works for its program
+    assert second.returncode != 0 and SECRET.encode() not in second.stdout  # and only for it
+
+
+@pytest.mark.skipif(sys.platform != "win32" or sandbox.backend() is None, reason="Windows hard links")
+def test_audit_a_hard_linked_file_stays_closed_to_the_sandbox(tmp_path: Path) -> None:
+    """F1: a grant on the workspace used to reach the OUTSIDE copy of a hard-linked file."""
+    import os
+
+    workspace = tmp_path / "ws"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    victim = outside / "victim.txt"
+    victim.write_text(SECRET, encoding="utf-8")
+    os.link(victim, workspace / "link.txt")  # as a local `git clone` or an archive could leave it
+    policy = policy_from_config({"shell_sandbox": "strict"}, workspace)
+    code = "import sys;print(open(sys.argv[1]).read())"
+
+    via_link = sandbox.run_sync([sys.executable, "-c", code, str(workspace / "link.txt")], policy, timeout=60)
+    direct = sandbox.run_sync([sys.executable, "-c", code, str(victim)], policy, timeout=60)
+
+    assert SECRET.encode() not in via_link.stdout and SECRET.encode() not in direct.stdout
+    assert victim.read_text(encoding="utf-8") == SECRET  # the file itself is untouched
+
+
+@pytest.mark.skipif(sys.platform != "win32" or sandbox.backend() is None, reason="Windows ledger")
+def test_audit_a_recreated_workspace_is_granted_again(tmp_path: Path) -> None:
+    """F10: the ledger remembered a path, not the folder: a re-created folder was silently denied."""
+    import shutil
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    policy = policy_from_config({"shell_sandbox": "strict"}, workspace)
+    code = "import sys;open(sys.argv[1],'w').write('x');print('wrote')"
+    first = sandbox.run_sync([sys.executable, "-c", code, str(workspace / "a.txt")], policy, timeout=60)
+    shutil.rmtree(workspace)
+    workspace.mkdir()
+    from rbit.sandbox import windows
+
+    windows._granted_this_process.clear()  # a new process would start with an empty memo
+    second = sandbox.run_sync([sys.executable, "-c", code, str(workspace / "b.txt")], policy, timeout=60)
+    assert b"wrote" in first.stdout and b"wrote" in second.stdout
+
+
+@pytest.mark.skipif(sys.platform != "win32" or sandbox.backend() is None, reason="Windows job memory limit")
+def test_audit_the_job_memory_limit_stops_a_runaway_allocation(tmp_path: Path) -> None:
+    policy = policy_from_config({"shell_sandbox": "strict", "shell_sandbox_memory_mb": 256}, tmp_path)
+    code = "b = bytearray(700 * 1024 * 1024); print('allocated')"
+    result = sandbox.run_sync([sys.executable, "-c", code], policy, timeout=60)
+    assert b"allocated" not in result.stdout and result.returncode != 0
+
+
+def test_linux_launcher_policy_hides_secrets_and_protects_project_state(tmp_path: Path) -> None:
+    """Audit findings: unix sockets in /run, ~/.ssh under a granted parent, /etc/shadow, .git/hooks."""
+    from rbit.sandbox import linux
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    policy = policy_from_config({"shell_sandbox": "strict"}, workspace)
+    spec = linux.landlock_spec(policy)
+    home = Path.home()
+
+    assert str(workspace) in spec["write"] and str(workspace / ".rbit") in spec["hide"]
+    for secret in (".ssh", ".aws", ".gnupg", ".rbit"):
+        assert str(home / secret) in spec["hide"], f"{secret} is not masked even if an ancestor is granted"
+    assert "/etc/shadow" in spec["hide"] and "/etc/sudoers.d" in spec["hide"]
+    assert str(workspace / ".git" / "hooks") in spec["readonly"] and str(workspace / ".git" / "config") in spec["readonly"]
+    root = Path(str(spec["root"]))
+    assert root.is_dir() and not any(root.iterdir())  # an EMPTY host folder the launcher builds in
+    assert "/run" not in spec["read"] and "/mnt" not in spec["read"] and "/tmp" not in spec["read"]
+    assert spec["network"] is False
+
+
 # ------------------------------------------------------------------------------- CLI
 
 

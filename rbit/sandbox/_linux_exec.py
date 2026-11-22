@@ -12,11 +12,14 @@ What it sets up, in this order:
 1. new user, mount, pid, ipc, uts namespaces (and a network namespace unless the policy
    allows network): the command is pid 1 of its own pid namespace, cannot see or signal
    other processes, and has no network devices at all;
-2. a private mount propagation and a fresh /proc for that pid namespace (the host's
-   /proc/<pid>/environ of the parent, with its API keys, is no longer reachable);
+2. a NEW ROOT file system built from scratch (tmpfs plus bind mounts of exactly the granted
+   paths) and entered with pivot_root, then a fresh /proc for the pid namespace. Whatever is
+   not granted does not exist: not /run (ssh-agent, docker.sock, D-Bus, the WSL interop
+   socket), not /mnt, not the host's /tmp, not the home directory. Landlock cannot do this:
+   it governs neither connect() to a unix socket nor path lookup. Mounts can;
 3. a new session (no controlling terminal: TIOCSTI keystroke injection is not possible);
-4. Landlock: only the listed read-only and read-write paths are accessible. The home
-   directory, ~/.ssh, ~/.rbit, /root, other users' files are simply not on the list;
+4. Landlock on top (defence in depth): only the listed paths are accessible; abstract unix
+   sockets and signals are scoped to the sandbox (ABI 6+);
 5. no_new_privs, an empty capability set (also bounding and ambient), core dumps off;
 6. every inherited file descriptor above 2 is closed.
 
@@ -40,11 +43,22 @@ CLONE_NEWUSER = 0x10000000
 CLONE_NEWPID = 0x20000000
 CLONE_NEWNET = 0x40000000
 
+MS_RDONLY = 1
 MS_NOSUID = 2
 MS_NODEV = 4
 MS_NOEXEC = 8
+MS_REMOUNT = 32
+MS_BIND = 4096
+MS_NOATIME = 1024
+MS_NODIRATIME = 2048
 MS_REC = 0x4000
 MS_PRIVATE = 1 << 18
+MNT_DETACH = 2
+SYS_PIVOT_ROOT = {"x86_64": 155, "aarch64": 41}
+SYS_MOUNT_SETATTR = 442  # same number on every architecture
+AT_FDCWD = -100
+AT_RECURSIVE = 0x8000
+MOUNT_ATTR_RDONLY = 1
 
 PR_SET_PDEATHSIG = 1
 PR_SET_DUMPABLE = 4
@@ -121,10 +135,132 @@ def _enter_namespaces(libc: ctypes.CDLL, network: bool) -> None:
     _write_file("/proc/self/gid_map", f"{gid} {gid} 1\n")
 
 
-def _private_proc(libc: ctypes.CDLL) -> None:
+def _mount(libc: ctypes.CDLL, source: str | None, target: str, fstype: str | None, flags: int, data: str | None = None) -> None:
     libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_char_p]
-    _check(libc.mount(b"none", b"/", None, MS_REC | MS_PRIVATE, None), "mount --make-rprivate /")
-    _check(libc.mount(b"proc", b"/proc", b"proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, None), "mount /proc")
+    result = libc.mount(
+        source.encode() if source else None,
+        target.encode(),
+        fstype.encode() if fstype else None,
+        flags,
+        data.encode() if data else None,
+    )
+    _check(result, f"mount {fstype or 'bind'} {source or ''} -> {target}")
+
+
+class _MountAttr(ctypes.Structure):
+    _fields_ = [
+        ("attr_set", ctypes.c_uint64), ("attr_clr", ctypes.c_uint64),
+        ("propagation", ctypes.c_uint64), ("userns_fd", ctypes.c_uint64),
+    ]
+
+
+def _make_readonly(libc: ctypes.CDLL, target: str) -> None:
+    """Makes the bind mount at `target` (and the mounts below it) read-only."""
+    libc.syscall.restype = ctypes.c_long
+    attr = _MountAttr(MOUNT_ATTR_RDONLY, 0, 0, 0)
+    done = libc.syscall(
+        ctypes.c_long(SYS_MOUNT_SETATTR), ctypes.c_long(AT_FDCWD), target.encode(),
+        ctypes.c_long(AT_RECURSIVE), ctypes.byref(attr), ctypes.c_size_t(ctypes.sizeof(attr)),
+    )
+    if done == 0:
+        return
+    # older kernel: remount just this mount, keeping the flags a user namespace cannot clear
+    flags = os.statvfs(target).f_flag
+    keep = 0
+    for st_flag, ms_flag in ((2, MS_NOSUID), (4, MS_NODEV), (8, MS_NOEXEC), (1024, MS_NOATIME), (2048, MS_NODIRATIME)):
+        if flags & st_flag:
+            keep |= ms_flag
+    _mount(libc, None, target, None, MS_REMOUNT | MS_BIND | MS_RDONLY | keep)
+
+
+def _make_mounts_private(libc: ctypes.CDLL) -> None:
+    _mount(libc, "none", "/", None, MS_REC | MS_PRIVATE)
+
+
+def _build_root(libc: ctypes.CDLL, spec: dict) -> None:
+    """Builds a new root from the policy and pivots into it.
+
+    After this the host file system is gone except for the paths that were bound in. The
+    policy (`spec`) carries: root (an empty host directory to build in), read, write, hide
+    (paths shown as empty and unwritable), readonly (visible but unwritable), network.
+    """
+    root = str(spec["root"])
+    os.makedirs(root, exist_ok=True)
+    _mount(libc, "tmpfs", root, "tmpfs", MS_NOSUID | MS_NODEV, "mode=755,size=64m")
+
+    def target(path: str) -> str:
+        return root + path
+
+    def make_mountpoint(src: str, dst: str) -> None:
+        if os.path.isdir(src):
+            os.makedirs(dst, exist_ok=True)
+        else:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if not os.path.exists(dst):
+                open(dst, "a").close()
+
+    def bind(src: str, read_only: bool, recursive: bool) -> None:
+        if not os.path.lexists(src):
+            return
+        dst = target(src)
+        if os.path.islink(src):  # /bin -> usr/bin and friends: recreate the link, its target is bound too
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if not os.path.lexists(dst):
+                os.symlink(os.readlink(src), dst)
+            return
+        make_mountpoint(src, dst)
+        _mount(libc, src, dst, None, MS_BIND | (MS_REC if recursive else 0))
+        if read_only:
+            _make_readonly(libc, dst)
+
+    # the private /tmp first: granted paths that live under /tmp are bound on top of it
+    os.makedirs(target("/tmp"), exist_ok=True)
+    _mount(libc, "tmpfs", target("/tmp"), "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777,size=256m")
+    os.makedirs(target("/dev"), exist_ok=True)
+    _mount(libc, "tmpfs", target("/dev"), "tmpfs", MS_NOSUID, "mode=755,size=1m")
+    for device in _DEVICES:
+        if os.path.exists(device) and not os.path.isdir(device):
+            make_mountpoint(device, target(device))
+            _mount(libc, device, target(device), None, MS_BIND)
+
+    writes = [str(w) for w in spec.get("write", [])]
+    reads = [str(r) for r in spec.get("read", []) if str(r) not in writes]
+    # parents before children, so a writable folder inside a read-only one is bound on top of it
+    for path in sorted(reads, key=lambda q: q.count("/")):
+        bind(path, True, True)
+    for path in sorted(writes, key=lambda q: q.count("/")):
+        bind(path, False, False)  # not recursive: never carry the private root's own mount along
+    if spec.get("network") and os.path.lexists("/etc/resolv.conf"):
+        real = os.path.realpath("/etc/resolv.conf")  # on WSL and systemd it points outside /etc
+        if os.path.isfile(real) and not os.path.exists(target(real)):
+            bind(real, True, False)
+
+    for path in spec.get("hide", []):  # secrets and state the command must not see at all
+        dst = target(str(path))
+        if os.path.isdir(dst):
+            _mount(libc, "tmpfs", dst, "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "mode=000,size=4k")
+            _mount(libc, None, dst, None, MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC)
+        elif os.path.isfile(dst):
+            _mount(libc, "/dev/null", dst, None, MS_BIND)
+    for path in spec.get("readonly", []):  # visible, but not writable (a project's git hooks and config)
+        dst = target(str(path))
+        if os.path.exists(dst):
+            _mount(libc, dst, dst, None, MS_BIND | MS_REC)
+            _make_readonly(libc, dst)
+
+    os.chdir(root)
+    os.makedirs("oldroot", exist_ok=True)
+    libc.syscall.restype = ctypes.c_long
+    machine = os.uname().machine
+    if machine not in SYS_PIVOT_ROOT:
+        raise SandboxError(f"unsupported architecture for pivot_root: {machine}")
+    _check(int(libc.syscall(ctypes.c_long(SYS_PIVOT_ROOT[machine]), b".", b"oldroot")), "pivot_root")
+    os.chdir("/")
+    libc.umount2.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    _check(libc.umount2(b"/oldroot", MNT_DETACH), "umount old root")
+    os.rmdir("/oldroot")
+    os.makedirs("/proc", exist_ok=True)
+    _mount(libc, "proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC)
 
 
 # ------------------------------------------------------------------ privileges
@@ -153,8 +289,16 @@ def _drop_privileges(libc: ctypes.CDLL) -> None:
 # -------------------------------------------------------------------- landlock
 
 
+SCOPE_ABSTRACT_UNIX_SOCKET = 1 << 0  # ABI 6
+SCOPE_SIGNAL = 1 << 1
+
+
 class _RulesetAttr(ctypes.Structure):
-    _fields_ = [("handled_access_fs", ctypes.c_uint64), ("handled_access_net", ctypes.c_uint64)]
+    _fields_ = [
+        ("handled_access_fs", ctypes.c_uint64),
+        ("handled_access_net", ctypes.c_uint64),
+        ("scoped", ctypes.c_uint64),
+    ]
 
 
 class _PathBeneath(ctypes.Structure):
@@ -184,11 +328,15 @@ def _apply_landlock(libc: ctypes.CDLL, read_paths: list[str], write_paths: list[
     if abi < 1:
         raise SandboxError("Landlock is not available in this kernel (needs Linux 5.13+ with Landlock enabled)")
     handled, read, write = _landlock_masks(abi)
-    attr = _RulesetAttr(handled, 0)
+    attr = _RulesetAttr(handled, 0, 0)
     size = 8
-    if abi >= 4 and not network:
-        attr.handled_access_net = NET_BIND_TCP | NET_CONNECT_TCP  # no rules: all TCP bind/connect denied
+    if abi >= 4:
         size = 16
+        if not network:
+            attr.handled_access_net = NET_BIND_TCP | NET_CONNECT_TCP  # no rules: all TCP bind/connect denied
+    if abi >= 6:
+        size = 24
+        attr.scoped = SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL  # no abstract sockets / signals outside
     fd = int(libc.syscall(SYS_LANDLOCK_CREATE_RULESET, ctypes.byref(attr), size, 0))
     if fd < 0:
         raise SandboxError(f"landlock_create_ruleset: {os.strerror(ctypes.get_errno())}")
@@ -240,6 +388,8 @@ _DENIED_SYSCALLS: dict[str, dict[str, int]] = {
         "io_uring_enter": 426, "io_uring_register": 427, "open_by_handle_at": 304, "mount_setattr": 442,
         "move_mount": 429, "fsopen": 430, "fsconfig": 431, "fsmount": 432, "fspick": 433, "open_tree": 428,
         "syslog": 103, "iopl": 172, "ioperm": 173, "modify_ldt": 154, "quotactl": 179, "vhangup": 153,
+        "name_to_handle_at": 303, "kcmp": 312, "process_madvise": 440, "move_pages": 279,
+        "pidfd_getfd": 438, "fanotify_init": 300, "fanotify_mark": 301,
     },
     "aarch64": {
         "ptrace": 117, "process_vm_readv": 270, "process_vm_writev": 271, "mount": 40, "umount2": 39,
@@ -250,9 +400,15 @@ _DENIED_SYSCALLS: dict[str, dict[str, int]] = {
         "io_uring_enter": 426, "io_uring_register": 427, "open_by_handle_at": 265, "mount_setattr": 442,
         "move_mount": 429, "fsopen": 430, "fsconfig": 431, "fsmount": 432, "fspick": 433, "open_tree": 428,
         "syslog": 116, "quotactl": 60, "vhangup": 58,
+        "name_to_handle_at": 264, "kcmp": 272, "process_madvise": 440, "move_pages": 239,
+        "pidfd_getfd": 438, "fanotify_init": 262, "fanotify_mark": 263,
     },
 }
 _CLONE_NR = {"x86_64": 56, "aarch64": 220}
+_SOCKET_NR = {"x86_64": 41, "aarch64": 198}
+#: socket families a build tool never needs: Hyper-V/VM sockets (a path to the Windows host on
+#: WSL and to the hypervisor elsewhere) and raw packet access.
+_DENIED_SOCKET_FAMILIES = (40, 17)  # AF_VSOCK, AF_PACKET
 _EPERM = 1  # Linux errno values, fixed: this table is also built (and tested) on other systems
 _ENOSYS = 38
 _CLONE3_NR = 435
@@ -271,44 +427,56 @@ class _SockFprog(ctypes.Structure):
 def _seccomp_program(machine: str) -> list[tuple[int, int, int, int]] | None:
     """The BPF program (code, jt, jf, k) for this architecture, or None when unsupported.
 
-    Layout (N = number of denied syscalls):
-
-        0        load arch; 1 jump over 2 when it is the expected one; 2 kill otherwise
-        3        load the syscall number
-        4..N+3   one equality test per denied syscall            -> EPERM
-        N+4      clone                                           -> flag test
-        N+5      clone3 (its flags are out of reach: libc falls back to clone) -> ENOSYS
-        N+6      ALLOW everything else
-        N+7      flag test: load clone flags; any namespace flag -> EPERM, else ALLOW
-        N+9..    ALLOW (after the flag test), EPERM, ENOSYS
+    Written with labels (a jump names its target) and resolved to relative offsets at the end:
+    arch check (anything but the expected ABI is killed), one test per denied syscall (EPERM),
+    `clone` (a flag test: any namespace flag is EPERM), `clone3` (its flags are out of reach:
+    ENOSYS, libc falls back to clone), `socket` (a family test), everything else is allowed.
     """
     if machine not in AUDIT_ARCH:
         return None
-    ld, jeq, jset, ret = 0x20, 0x15, 0x45, 0x06
-    denied = sorted(_DENIED_SYSCALLS[machine].values())
-    n = len(denied)
-    clone_test = n + 7
-    allow_clone = n + 9
-    eperm = n + 10
-    enosys = n + 11
-    program: list[tuple[int, int, int, int]] = [
-        (ld, 0, 0, 4),
-        (jeq, 1, 0, AUDIT_ARCH[machine]),
-        (ret, 0, 0, SECCOMP_RET_KILL_PROCESS),  # a foreign-ABI call (x32/compat) is never legitimate
-        (ld, 0, 0, 0),
-    ]
-    for nr in denied:
-        program.append((jeq, eperm - len(program) - 1, 0, nr))
-    program.append((jeq, clone_test - len(program) - 1, 0, _CLONE_NR[machine]))
-    program.append((jeq, enosys - len(program) - 1, 0, _CLONE3_NR))
-    program.append((ret, 0, 0, SECCOMP_RET_ALLOW))
-    assert len(program) == clone_test, (len(program), clone_test)
-    program.append((ld, 0, 0, 16))  # clone flags = args[0], low word
-    program.append((jset, eperm - len(program) - 1, allow_clone - len(program) - 1, _CLONE_NS_FLAGS))
-    program.append((ret, 0, 0, SECCOMP_RET_ALLOW))
-    program.append((ret, 0, 0, SECCOMP_RET_ERRNO | _EPERM))
-    program.append((ret, 0, 0, SECCOMP_RET_ERRNO | _ENOSYS))
-    return program
+    ld, jeq, jset, ret, ja = 0x20, 0x15, 0x45, 0x06, 0x05
+    program: list[tuple[int, int | str, int | str, int]] = []
+    labels: dict[str, int] = {}
+
+    def emit(code: int, jt: int | str, jf: int | str, k: int) -> None:
+        program.append((code, jt, jf, k))
+
+    def label(name: str) -> None:
+        labels[name] = len(program)
+
+    emit(ld, 0, 0, 4)  # arch
+    emit(jeq, "arch_ok", 0, AUDIT_ARCH[machine])
+    emit(ret, 0, 0, SECCOMP_RET_KILL_PROCESS)  # a foreign-ABI call (x32/compat) is never legitimate
+    label("arch_ok")
+    emit(ld, 0, 0, 0)  # syscall number
+    for nr in sorted(_DENIED_SYSCALLS[machine].values()):
+        emit(jeq, "eperm", 0, nr)
+    emit(jeq, "clone_test", 0, _CLONE_NR[machine])
+    emit(jeq, "enosys", 0, _CLONE3_NR)
+    emit(jeq, "socket_test", 0, _SOCKET_NR[machine])
+    emit(ret, 0, 0, SECCOMP_RET_ALLOW)
+    label("clone_test")
+    emit(ld, 0, 0, 16)  # clone flags = args[0], low word
+    emit(jset, "eperm", "allow", _CLONE_NS_FLAGS)
+    label("socket_test")
+    emit(ld, 0, 0, 16)  # socket family = args[0]
+    for family in _DENIED_SOCKET_FAMILIES:
+        emit(jeq, "eperm", 0, family)
+    label("allow")
+    emit(ret, 0, 0, SECCOMP_RET_ALLOW)
+    label("eperm")
+    emit(ret, 0, 0, SECCOMP_RET_ERRNO | _EPERM)
+    label("enosys")
+    emit(ret, 0, 0, SECCOMP_RET_ERRNO | _ENOSYS)
+
+    resolved: list[tuple[int, int, int, int]] = []
+    for index, (code, jt, jf, k) in enumerate(program):
+        offsets = []
+        for jump in (jt, jf):
+            offsets.append(labels[jump] - index - 1 if isinstance(jump, str) else jump)
+        assert all(0 <= o <= 255 for o in offsets), (index, offsets)
+        resolved.append((code, offsets[0], offsets[1], k))
+    return resolved
 
 
 def _apply_seccomp(libc: ctypes.CDLL) -> bool:
@@ -338,13 +506,15 @@ def _run_confined(spec: dict, command: list[str]) -> None:
     libc = _libc()
     libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
     libc.prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)
-    _private_proc(libc)
+    _make_mounts_private(libc)
+    _build_root(libc, spec)
     os.setsid()
-    workspace = str(spec.get("workspace") or "/")
-    try:
-        os.chdir(workspace)
-    except OSError:
-        os.chdir("/")
+    for start in (spec.get("cwd"), spec.get("workspace"), "/"):
+        try:
+            os.chdir(str(start or "/"))
+            break
+        except OSError:
+            continue
     _check(libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), "prctl(NO_NEW_PRIVS)")
     _apply_landlock(libc, list(spec.get("read", [])), list(spec.get("write", [])), bool(spec.get("network")))
     _drop_privileges(libc)
@@ -389,8 +559,16 @@ def _forward(child: int, signum: int) -> None:
 
 
 def main(argv: list[str]) -> int:
+    probe_root = ""
     if len(argv) >= 2 and argv[1] == "--probe":
-        spec, command = {"workspace": "/", "read": ["/usr", "/bin", "/lib", "/lib64"], "write": [], "network": False}, ["/bin/true"]
+        import tempfile
+
+        probe_root = tempfile.mkdtemp(prefix="rbit-probe-")
+        spec = {
+            "workspace": "/", "root": probe_root, "network": False, "write": [],
+            "read": ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32"],
+        }
+        command = ["/bin/true"]
     else:
         if len(argv) < 4 or argv[2] != "--":
             sys.stderr.write("usage: _linux_exec.py '<policy json>' -- command [args...]\n")
@@ -406,6 +584,12 @@ def main(argv: list[str]) -> int:
     except (SandboxError, OSError) as exc:
         sys.stderr.write(f"rbit-sandbox: {exc}\n")
         return EXIT_UNAVAILABLE
+    finally:
+        if probe_root:
+            try:
+                os.rmdir(probe_root)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

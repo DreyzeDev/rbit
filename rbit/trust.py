@@ -53,6 +53,8 @@ STRIP_KEYS: tuple[str, ...] = (
     "shell_sandbox_read",
     "shell_sandbox_write",
     "shell_sandbox_env",
+    "shell_sandbox_desktop",
+    "shell_sandbox_memory_mb",
 )
 
 #: For these, a value that only narrows things is harmless, so it does not need trust.
@@ -66,6 +68,7 @@ SAFE_VALUES: dict[str, Any] = {
     "permission_mode": "ask",
     "shell_sandbox": "strict",
     "shell_sandbox_network": False,
+    "shell_sandbox_desktop": True,
 }
 
 #: Permission rule containers: only their `allow` rules need trust (deny/ask only narrow).
@@ -197,7 +200,7 @@ def describe(key: str, value: Any) -> str:
         for name, entry in value.items():
             if isinstance(entry, dict):
                 target = entry.get("url") or " ".join(map(str, entry.get("command") or [])) or "?"
-                parts.append(f"{name} -> {target}")
+                parts.append(f"{name} -> {target}{_mcp_reach(entry)}")
             else:
                 parts.append(f"{name} -> {entry}")
         return "starts MCP servers: " + "; ".join(parts)
@@ -220,6 +223,30 @@ def describe(key: str, value: Any) -> str:
     if key == PROFILES_KEY:
         return "profile overlays with risky settings: " + json.dumps(value, ensure_ascii=False)[:160]
     return f"sets {key} = " + json.dumps(value, ensure_ascii=False)[:120]
+
+
+def _mcp_reach(entry: dict[str, Any]) -> str:
+    """What else an MCP entry gives the server: where it starts, extra folders, network, variables.
+
+    These widen what the program can reach just as much as the command does, so the user must
+    see them before trusting the entry (values of environment variables are never printed).
+    """
+    notes: list[str] = []
+    if entry.get("cwd"):
+        notes.append(f"starts in {entry['cwd']}")
+    box = entry.get("sandbox")
+    if isinstance(box, dict):
+        if box.get("network") is True:
+            notes.append("NETWORK allowed")
+        for field_name, label in (("read", "reads"), ("write", "WRITES")):
+            if isinstance(box.get(field_name), list) and box[field_name]:
+                notes.append(f"{label} {', '.join(map(str, box[field_name]))}")
+        if isinstance(box.get("env"), list) and box["env"]:
+            notes.append("receives your variables " + ", ".join(map(str, box["env"])))
+    environment = entry.get("environment") or entry.get("env")
+    if isinstance(environment, dict) and environment:
+        notes.append("sets variables " + ", ".join(map(str, environment)))
+    return f" [{'; '.join(notes)}]" if notes else ""
 
 
 def _allow_rules_only(key: str, value: Any) -> Any:

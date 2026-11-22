@@ -23,6 +23,7 @@ from . import backend, policy_for, run_sync
 
 CANARY_ENV = "RBIT_SANDBOX_CANARY"
 SECRET_TEXT = "TOP-SECRET-OUTSIDE-THE-WORKSPACE"
+PROJECT_SECRET = '{"api_key": "sk-project-state-secret"}'
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,13 @@ def run_checks(config: dict[str, Any] | None = None, *, keep: bool = False) -> l
     outside.mkdir()
     (outside / "secret.txt").write_text(SECRET_TEXT, encoding="utf-8")
     (workspace / "hello.txt").write_text("hello", encoding="utf-8")
+    # the project's own state, as rbit leaves it in every workspace
+    state = workspace / ".rbit"
+    state.mkdir()
+    (state / "config.json").write_text(PROJECT_SECRET, encoding="utf-8")
+    hooks = workspace / ".git" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "pre-commit").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     policy = policy_for(cfg, workspace)
     os.environ[CANARY_ENV] = "canary-must-not-reach-the-sandbox"
     checks: list[Check] = []
@@ -116,7 +124,73 @@ def run_checks(config: dict[str, Any] | None = None, *, keep: bool = False) -> l
         code, out = _run("import os;print(os.environ.get('HOME') or os.environ.get('USERPROFILE'))", "-", policy)
         record("HOME points at the private scratch directory", "works", code == 0 and str(Path.home()) != out, out)
 
+        code, out = _run("import sys;print(open(sys.argv[1]).read())", str(state / "config.json"), policy)
+        record("cannot read the project's own .rbit state", "denied", "sk-project-state-secret" not in out, out)
+
+        tamper = state / "tamper.txt"
+        _run("import sys;open(sys.argv[1],'w').write('x')", str(tamper), policy)
+        record("cannot write the project's own .rbit state", "denied", not tamper.exists())
+
+        if sys.platform != "darwin":  # (the macOS profile has not been run: see docs/security)
+            hook = hooks / "post-checkout"
+            _run("import sys;open(sys.argv[1],'w').write('#!/bin/sh\\ntouch pwned\\n')", str(hook), policy)
+            record("cannot plant a git hook (it would run outside the sandbox)", "denied", not hook.exists())
+
         if sys.platform.startswith("linux"):
+            sock_path = outside / "host.sock"
+            host_socket = socket.socket(socket.AF_UNIX)
+            host_socket.bind(str(sock_path))
+            host_socket.listen(1)
+            host_socket.settimeout(0.5)
+            code, out = _run(
+                "import socket,sys;s=socket.socket(socket.AF_UNIX);s.settimeout(3);s.connect(sys.argv[1]);print('con'+'nected')",
+                str(sock_path),
+                policy,
+            )
+            accepted = False
+            try:
+                host_socket.accept()
+                accepted = True
+            except (socket.timeout, OSError):
+                pass
+            host_socket.close()
+            record("cannot connect to a unix socket outside the workspace", "denied", code != 0 and not accepted, out)
+
+            code, out = _run(
+                "import os;print([p for p in ('/run/WSL','/run/docker.sock','/run/user','/run/dbus','/run/systemd/private',"
+                "'/var/run/docker.sock','/mnt/c','/mnt/wsl','/mnt/wslg','/home','/root','/media','/srv') if os.path.lexists(p)])",
+                "-",
+                policy,
+            )
+            record("host sockets, /mnt, /home and /root do not exist inside", "denied", code == 0 and out == "[]", out)
+
+            code, out = _run("import sys;print(repr(open('/etc/shadow').read()[:16]))", "-", policy)
+            record("cannot read /etc/shadow", "denied", "root:" not in out and "$" not in out, out)
+
+            code, out = _run("import socket;socket.socket(40, socket.SOCK_STREAM);print('con'+'nected')", "-", policy)
+            record("cannot open a VM socket (AF_VSOCK)", "denied", code != 0, out)
+
+            release = tuple(int(part) for part in os.uname().release.split(".")[:2] if part.isdigit())
+            if release >= (6, 12):  # Landlock ABI 6: abstract unix sockets are scoped to the sandbox
+                abstract_name = f"rbit-selftest-{os.getpid()}"
+                abstract = socket.socket(socket.AF_UNIX)
+                abstract.bind("\0" + abstract_name)
+                abstract.listen(1)
+                abstract.settimeout(0.5)
+                code, out = _run(
+                    "import socket,sys;s=socket.socket(socket.AF_UNIX);s.settimeout(3);s.connect('\\0'+sys.argv[1]);print('con'+'nected')",
+                    abstract_name,
+                    policy.with_network(True),  # a shared network namespace is where abstract sockets leak
+                )
+                reached = False
+                try:
+                    abstract.accept()
+                    reached = True
+                except (socket.timeout, OSError):
+                    pass
+                abstract.close()
+                record("cannot reach the host's abstract unix sockets (network on)", "denied", code != 0 and not reached, out)
+
             parent = str(os.getpid())
             code, out = _run("import os,sys;print(os.path.exists('/proc/'+sys.argv[1]))", parent, policy)
             record("cannot see the parent process", "denied", code == 0 and out == "False", out)

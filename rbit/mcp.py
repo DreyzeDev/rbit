@@ -195,11 +195,15 @@ class MCPClient:
         if sandbox.enabled(self.global_config):
             # An MCP server is third-party code (often `npx -y ...`): it gets the workspace, no
             # network and no secrets unless its own "sandbox" block (or "environment") says so.
+            # The sandbox's workspace is the PROJECT workspace, never the server's `cwd`: a `cwd`
+            # elsewhere (`~/.ssh`, `~`) must not turn that folder into a writable workspace. It
+            # may only choose a folder inside the workspace to start in.
             policy = sandbox.policy_for(
                 self.global_config,
-                Path(cwd),
+                self.workspace,
                 self.config.get("sandbox"),
                 env_values={str(k): str(v) for k, v in extra_env.items()} if isinstance(extra_env, dict) else None,
+                cwd=Path(cwd),
             )
             self._proc = await sandbox.spawn(list(self.command), policy, stdin=True, stderr="pipe")
         else:

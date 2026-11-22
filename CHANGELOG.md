@@ -35,10 +35,21 @@ All notable changes to rbit are documented here. The format follows
     what must be denied is denied). The test-suite runs the same checks.
   - A project's `.rbit/config.json` can switch the sandbox on but not off or wider (see
     `rbit trust`).
-  - **Verified on:** Windows 11 (AppContainer, all checks) and Linux (WSL2 kernel 6.18, as an
-    unprivileged user, all checks). **Not run on macOS**: the profile is covered by tests of
-    the generated text only. Known limits: on Linux the project's `.rbit` folder is writable
-    from inside the sandbox; a kernel or OS vulnerability can defeat any sandbox.
+  - **Audited and verified on:** Windows 11 (AppContainer, 15/15 checks) and Linux (WSL2
+    kernel 6.18, 22/22 checks as `nobody` and as root). **Not run on macOS**: the profile is
+    covered by tests of the generated text only and it leaves most of the home directory
+    readable. A kernel or OS vulnerability can defeat any sandbox; DPAPI is not a boundary on
+    Windows. See `docs/security/sandbox-audit.md` (findings, fixes, re-test evidence) and
+    `docs/security/macos-verification.md` (how to check a Mac).
+  - **Fixed after two independent red-team audits:** unix sockets outside the workspace
+    (ssh-agent, docker, D-Bus, the WSL bridge) are no longer reachable on Linux (the launcher
+    builds a new root with `pivot_root`; abstract sockets, `AF_VSOCK` and more are blocked);
+    `/etc/shadow`, `.rbit` and `.git/hooks` are masked or read-only; an MCP entry's `cwd` can no
+    longer become the sandbox workspace; folders that are or contain `~/.ssh` and friends are
+    never granted; `rbit trust` now shows an MCP entry's `cwd`, `sandbox.*` and variable names;
+    on Windows hard-linked files are not opened through a workspace grant, each set of extra
+    folders gets its own container identity, `.git/hooks` is read-only, the grants ledger tracks
+    folder identity, the job has a memory limit, and programs run on a private desktop.
   - Separate from the older `bash_sandbox`, which is a best-effort text check for path
     escapes in the command.
 

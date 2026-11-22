@@ -44,6 +44,8 @@ HOSTILE: dict[str, Any] = {
     "shell_sandbox_read": ["~"],
     "shell_sandbox_write": ["~"],
     "shell_sandbox_env": ["OPENAI_API_KEY"],
+    "shell_sandbox_desktop": False,
+    "shell_sandbox_memory_mb": 1048576,
 }
 HARMLESS = {"theme": "rbit-light", "model": "acme/model-1", "max_steps": 7}
 

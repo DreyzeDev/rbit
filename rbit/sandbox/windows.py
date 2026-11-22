@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -29,6 +30,8 @@ from pathlib import Path
 from typing import Any
 
 from .policy import Policy, sandbox_env
+
+logger = logging.getLogger(__name__)
 
 PROFILE_NAME = "rbit.sandbox.v1"
 GRANTS_FILE = Path.home() / ".rbit" / "sandbox-grants.json"
@@ -128,6 +131,11 @@ def _build_api() -> Any:
     advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
     advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(PSID)]
     advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.CreateDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+    user32.CreateDesktopW.restype = wintypes.HANDLE
     kernel32.LocalFree.argtypes = [ctypes.c_void_p]
     kernel32.InitializeProcThreadAttributeList.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t)]
     kernel32.UpdateProcThreadAttribute.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
@@ -156,26 +164,35 @@ def _build_api() -> Any:
 # -------------------------------------------------------------- container profile
 
 
-_sid_cache: tuple[Any, str] | None = None
+_sid_cache: dict[str, tuple[Any, str]] = {}
 _sid_lock = threading.Lock()
 
 
-def container_sid() -> tuple[Any, str]:
-    """(PSID, 'S-1-15-2-...') of the rbit AppContainer, created on first use."""
-    global _sid_cache
+def profile_name(key: str = "") -> str:
+    return PROFILE_NAME + (f".{key}" if key else "")
+
+
+def container_sid(key: str = "") -> tuple[Any, str]:
+    """(PSID, 'S-1-15-2-...') of the rbit AppContainer for this widening key, created on first use.
+
+    Every distinct set of extra folders gets its OWN container identity. With one shared
+    identity a folder opened for one MCP server stayed open for every other program, because
+    the permission lives on the folder, not on the program.
+    """
     api = _load_api()
     if api is None:
         raise WindowsSandboxError("AppContainers are not available on this system")
     with _sid_lock:
-        if _sid_cache is not None:
-            return _sid_cache
+        if key in _sid_cache:
+            return _sid_cache[key]
         import ctypes
         from ctypes import wintypes
 
+        name = profile_name(key)
         sid = ctypes.c_void_p()
-        hr = api.userenv.CreateAppContainerProfile(PROFILE_NAME, "rbit sandbox", "Isolated shell commands run by rbit", None, 0, ctypes.byref(sid))
+        hr = api.userenv.CreateAppContainerProfile(name, "rbit sandbox", "Isolated programs run by rbit", None, 0, ctypes.byref(sid))
         if (hr & 0xFFFFFFFF) == 0x800700B7:  # already exists
-            hr = api.userenv.DeriveAppContainerSidFromAppContainerName(PROFILE_NAME, ctypes.byref(sid))
+            hr = api.userenv.DeriveAppContainerSidFromAppContainerName(name, ctypes.byref(sid))
         if hr != 0:
             raise WindowsSandboxError(f"cannot create the AppContainer profile (0x{hr & 0xFFFFFFFF:08x})")
         text = wintypes.LPWSTR()
@@ -183,14 +200,44 @@ def container_sid() -> tuple[Any, str]:
             raise WindowsSandboxError("cannot format the AppContainer SID")
         value = text.value or ""
         api.kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
-        _sid_cache = (sid, value)
-        return _sid_cache
+        _sid_cache[key] = (sid, value)
+        return _sid_cache[key]
+
+
+# ----------------------------------------------------------------------- desktop
+
+_desktops: dict[str, tuple[int, str]] = {}
+
+
+def _private_desktop(sid_text: str) -> str | None:
+    """A desktop only this container (and the user) can open, so a sandboxed program cannot
+    take screenshots of, or send input to, the user's real desktop. None when it cannot be made
+    (the program then starts on the default desktop; everything else about the sandbox holds)."""
+    if sid_text in _desktops:
+        return _desktops[sid_text][1]
+    api = _load_api()
+    import ctypes
+
+    descriptor = ctypes.c_void_p()
+    sddl = f"D:(A;;GA;;;AU)(A;;GA;;;{sid_text})"
+    if not api.advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), None):
+        logger.warning("sandbox: no private desktop (security descriptor): the default desktop is used")
+        return None
+    attributes = api.SECURITY_ATTRIBUTES(ctypes.sizeof(api.SECURITY_ATTRIBUTES), descriptor, False)
+    name = "rbit-sandbox-" + sid_text.rsplit("-", 1)[-1]
+    handle = api.user32.CreateDesktopW(name, None, None, 0, 0x10000000, ctypes.byref(attributes))
+    api.kernel32.LocalFree(descriptor)
+    if not handle:
+        logger.warning("sandbox: no private desktop (error %s): the default desktop is used", ctypes.get_last_error())
+        return None
+    _desktops[sid_text] = (int(handle), "WinSta0\\" + name)  # the handle stays open: it keeps the desktop alive
+    return _desktops[sid_text][1]
 
 
 # ------------------------------------------------------------------------ grants
 
 _grants_lock = threading.Lock()
-_granted_this_process: set[tuple[str, str]] = set()
+_granted_this_process: set[tuple[str, str, str]] = set()
 
 
 def _system_dirs() -> tuple[Path, ...]:
@@ -228,73 +275,146 @@ def _icacls(path: Path, *args: str) -> None:
         raise WindowsSandboxError(f"icacls {' '.join(args)} failed for {path}: {detail}")
 
 
+def _identity(path: Path) -> str:
+    """Volume and file index of `path`: a deleted and re-created folder is a different object."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ""
+    return f"{st.st_dev}:{st.st_ino}"
+
+
+def _load_ledger() -> dict[str, Any]:
+    try:
+        data = json.loads(GRANTS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _record(entry: dict[str, str]) -> None:
     with _grants_lock:
-        try:
-            data = json.loads(GRANTS_FILE.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            data = {}
+        data = _load_ledger()
         grants = data.get("grants") if isinstance(data.get("grants"), list) else []
         grants = [g for g in grants if isinstance(g, dict) and Path(str(g.get("path", ""))).exists()]
         if entry not in grants:
             grants.append(entry)
-        data = {"sid": entry["sid"], "grants": grants}
+        profiles = sorted({str(g.get("profile", "")) for g in grants if g.get("profile") is not None})
         GRANTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        GRANTS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        GRANTS_FILE.write_text(json.dumps({"grants": grants, "profiles": profiles}, indent=2), encoding="utf-8")
 
 
-def _recorded(path: Path, permission: str) -> bool:
-    try:
-        data = json.loads(GRANTS_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
+def _recorded(path: Path, permission: str, sid_text: str) -> bool:
+    """True when this grant was made for THIS container identity on THIS very folder."""
     wanted = str(path)
+    identity = _identity(path)
     return any(
-        isinstance(e, dict) and e.get("path") == wanted and e.get("permission") == permission
-        for e in (data.get("grants") if isinstance(data.get("grants"), list) else [])
+        isinstance(e, dict)
+        and e.get("path") == wanted
+        and e.get("permission") == permission
+        and e.get("sid") == sid_text
+        and e.get("id") == identity
+        for e in (_load_ledger().get("grants") or [])
     )
 
 
-def grant(path: Path, permission: str) -> None:
+#: How many directory entries are looked at when searching for hard links (a huge tree is
+#: not walked to the end: a warning is logged instead).
+_SCAN_LIMIT = 400_000
+
+
+def _multi_linked_files(root: Path) -> tuple[list[Path], bool]:
+    """Files under `root` that have more than one hard link, and whether the scan was complete.
+
+    The walk never follows symbolic links or junctions. A hard link is the same file object
+    as its other names, so a permission granted on the workspace would also be granted on the
+    copy of the file that lives OUTSIDE it.
+    """
+    found: list[Path] = []
+    stack = [root]
+    seen = 0
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > _SCAN_LIMIT:
+                        return found, False
+                    try:
+                        if entry.is_symlink() or entry.is_junction():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif os.stat(entry.path, follow_symlinks=False).st_nlink > 1:  # (DirEntry.stat leaves st_nlink 0)
+                            found.append(Path(entry.path))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return found, True
+
+
+def grant(path: Path, permission: str, key: str = "") -> None:
     """Gives the container `permission` ("M" modify, "RX" read+execute) on `path`, inherited below it."""
-    _sid, sid_text = container_sid()
-    key = (str(path), permission)
-    if key in _granted_this_process:
+    _sid, sid_text = container_sid(key)
+    memo = (str(path), permission, sid_text)
+    if memo in _granted_this_process:
         return
     _grantable(path)
     if permission == "RX" and (_is_under(path.resolve(), _system_dirs())):
         return  # already readable by "all application packages"
-    if not _recorded(path, permission):
+    if not _recorded(path, permission, sid_text):
+        linked, complete = _multi_linked_files(path) if path.is_dir() else ([], True)
+        # A grant is inherited by every file below the folder, and a hard-linked file is ONE object
+        # with several names, some of them outside the folder. Stop such files from inheriting
+        # BEFORE granting (an inherited entry cannot be removed afterwards): they stay closed to
+        # the sandbox under every name.
+        for victim in linked:
+            try:
+                _icacls(victim, "/inheritance:d")
+            except WindowsSandboxError:
+                pass
         _icacls(path, "/grant", f"*{sid_text}:(OI)(CI){permission}")
-        _record({"sid": sid_text, "path": str(path), "permission": permission})
-    _granted_this_process.add(key)
+        _record({"sid": sid_text, "profile": profile_name(key), "path": str(path), "permission": permission, "id": _identity(path)})
+        if linked:
+            logger.warning(
+                "sandbox: %d hard-linked file(s) in %s were kept closed to the sandbox (first: %s)",
+                len(linked), path, linked[0],
+            )
+        if not complete:
+            logger.warning("sandbox: %s is too large to search for hard links; some may have been opened", path)
+    _granted_this_process.add(memo)
 
 
-def protect(path: Path) -> None:
-    """Takes the container's access to `path` away again (the project's own `.rbit` state).
+def protect(path: Path, key: str = "", *, read_only: bool = False) -> None:
+    """Takes the container's access to `path` away again, or leaves it read-only.
+
+    Used for the project's own `.rbit` state (no access) and for `.git/hooks` and `.git/config`
+    (read-only: a hook written from inside would later run OUTSIDE the sandbox).
 
     A deny entry is not enough: for an AppContainer, deny entries naming the container are not
     honoured here, only the absence of an allow entry is. So the folder stops inheriting the
-    workspace's grant and the container's entry is removed: the sandbox can neither read nor
-    write nor list it, exactly like any folder outside the workspace.
+    workspace's grant and the container's entry is removed.
     """
-    _sid, sid_text = container_sid()
-    key = (str(path), "no-access")
-    if key in _granted_this_process:
+    _sid, sid_text = container_sid(key)
+    label = "read-only" if read_only else "no-access"
+    memo = (str(path), label, sid_text)
+    if memo in _granted_this_process:
         return
-    if not _recorded(path, "no-access"):
+    if not _recorded(path, label, sid_text):
         _icacls(path, "/inheritance:d")  # keep the other entries, but as explicit ones
         _icacls(path, "/remove", f"*{sid_text}")
-        _record({"sid": sid_text, "path": str(path), "permission": "no-access"})
-    _granted_this_process.add(key)
+        if read_only:
+            inherit = "(OI)(CI)" if path.is_dir() else ""
+            _icacls(path, "/grant", f"*{sid_text}:{inherit}R")
+        _record({"sid": sid_text, "profile": profile_name(key), "path": str(path), "permission": label, "id": _identity(path)})
+    _granted_this_process.add(memo)
 
 
 def revoke_all() -> int:
-    """Removes every ACE rbit added and deletes the container profile. Returns the number removed."""
-    try:
-        data = json.loads(GRANTS_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
+    """Removes every ACE rbit added and deletes every container profile. Returns the number removed."""
+    data = _load_ledger()
     removed = 0
     for entry in data.get("grants", []) if isinstance(data.get("grants"), list) else []:
         path, sid = Path(entry.get("path", "")), entry.get("sid", "")
@@ -306,10 +426,11 @@ def revoke_all() -> int:
                 pass
     api = _load_api()
     if api is not None:
-        api.userenv.DeleteAppContainerProfile(PROFILE_NAME)
+        names = {PROFILE_NAME, *(str(n) for n in (data.get("profiles") or []) if n)}
+        for name in names:
+            api.userenv.DeleteAppContainerProfile(name)
     _granted_this_process.clear()
-    global _sid_cache
-    _sid_cache = None
+    _sid_cache.clear()
     try:
         GRANTS_FILE.unlink()
     except OSError:
@@ -319,22 +440,27 @@ def revoke_all() -> int:
 
 def prepare(policy: Policy, executable: str | None) -> None:
     """Makes sure the container can reach what the policy lists (once per path and process)."""
+    key = policy.extras_key
     workspace = policy.workspace
-    grant(workspace, "M")
+    grant(workspace, "M", key)
     rbit_dir = workspace / ".rbit"
     rbit_dir.mkdir(exist_ok=True)
-    protect(rbit_dir)  # sandboxed commands must not rewrite rbit's config, audit log or sessions
+    protect(rbit_dir, key)  # sandboxed commands must not rewrite rbit's config, audit log or sessions
+    for name in ("hooks", "config"):
+        target = workspace / ".git" / name
+        if target.exists():
+            protect(target, key, read_only=True)
     for path in policy.write_paths:
         if path != workspace:
             path.mkdir(parents=True, exist_ok=True)
-            grant(path, "M")
+            grant(path, "M", key)
     for path in policy.read_paths:
         if path.exists():
-            grant(path, "RX")
+            grant(path, "RX", key)
     if executable:
         exe_dir = Path(executable).resolve().parent
         if not _is_under(exe_dir, _system_dirs()):
-            grant(exe_dir, "RX")
+            grant(exe_dir, "RX", key)
 
 
 # ----------------------------------------------------------------------- process
@@ -441,7 +567,7 @@ def _inheritable_nul() -> int:
     return int(handle)
 
 
-def _make_job() -> int:
+def _make_job(memory_mb: int = 0) -> int:
     api = _load_api()
     import ctypes
 
@@ -452,6 +578,9 @@ def _make_job() -> int:
     # kill the tree when the job closes, cap the number of processes, die on unhandled exceptions
     info.BasicLimitInformation.LimitFlags = 0x2000 | 0x8 | 0x400
     info.BasicLimitInformation.ActiveProcessLimit = 256
+    if memory_mb > 0:  # one runaway allocation must not take the machine down: cap the whole tree
+        info.BasicLimitInformation.LimitFlags |= 0x200  # JOB_OBJECT_LIMIT_JOB_MEMORY
+        info.JobMemoryLimit = memory_mb * 1024 * 1024
     api.kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))
     ui = api.JOBOBJECT_BASIC_UI_RESTRICTIONS(0xFF)  # handles, clipboard, system parameters, desktop, global atoms...
     api.kernel32.SetInformationJobObject(job, 4, ctypes.byref(ui), ctypes.sizeof(ui))
@@ -476,7 +605,7 @@ async def spawn(
     from asyncio import windows_utils
     from ctypes import wintypes
 
-    sid, _text = container_sid()
+    sid, sid_text = container_sid(policy.extras_key)
     child_env = dict(env) if env is not None else sandbox_env(policy)
     executable = _resolve_executable(argv[0], child_env)
     await asyncio.to_thread(prepare, policy, executable)
@@ -524,7 +653,9 @@ async def spawn(
         if not api.kernel32.InitializeProcThreadAttributeList(attrs, 2, 0, ctypes.byref(size)):
             raise WindowsSandboxError("InitializeProcThreadAttributeList failed")
         # Network is a capability the container does not have unless the policy asks for it:
-        # "internetClient" (S-1-15-3-1) = outbound connections to the internet and the LAN.
+        # "internetClient" (S-1-15-3-1) = outbound connections to the internet. (An audit found no
+        # reachable LAN host and no loopback, but raw ICMP/UDP sends are not refused: do not rely
+        # on this capability to keep a program away from the local network.)
         capability_sid = ctypes.c_void_p()
         capability_array = None
         if policy.network:
@@ -546,6 +677,10 @@ async def spawn(
         startup = api.STARTUPINFOEXW()
         startup.StartupInfo.cb = ctypes.sizeof(startup)
         startup.StartupInfo.dwFlags = 0x100  # STARTF_USESTDHANDLES
+        desktop_name = _private_desktop(sid_text) if policy.desktop else None
+        desktop_buffer = ctypes.create_unicode_buffer(desktop_name) if desktop_name else None
+        if desktop_buffer is not None:
+            startup.StartupInfo.lpDesktop = ctypes.cast(desktop_buffer, wintypes.LPWSTR)
         startup.StartupInfo.hStdInput, startup.StartupInfo.hStdOutput, startup.StartupInfo.hStdError = h_in, h_out, h_err
         startup.lpAttributeList = ctypes.addressof(attrs)
         info = api.PROCESS_INFORMATION()
@@ -554,7 +689,7 @@ async def spawn(
         command = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
         flags = 0x00080000 | 0x08000000 | 0x00000400 | 0x00000004  # extended startup, no window, unicode env, suspended
         ok = api.kernel32.CreateProcessW(
-            executable, command, None, None, True, flags, env_buffer, str(policy.workspace), ctypes.byref(startup), ctypes.byref(info)
+            executable, command, None, None, True, flags, env_buffer, str(policy.start_dir), ctypes.byref(startup), ctypes.byref(info)
         )
         error = ctypes.get_last_error()
         api.kernel32.DeleteProcThreadAttributeList(attrs)
@@ -562,7 +697,7 @@ async def spawn(
             api.kernel32.LocalFree(capability_sid)
         if not ok:
             raise WindowsSandboxError(f"CreateProcess failed in the sandbox (error {error}): {argv[0]}")
-        job = _make_job()
+        job = _make_job(policy.memory_mb)
         if not api.kernel32.AssignProcessToJobObject(job, info.hProcess):
             api.kernel32.TerminateProcess(info.hProcess, 1)
             raise WindowsSandboxError("cannot place the process in its job object")

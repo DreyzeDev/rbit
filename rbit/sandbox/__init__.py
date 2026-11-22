@@ -5,6 +5,8 @@
     "shell_sandbox_read":  ["/path", ...]           extra read-only locations
     "shell_sandbox_write": ["/path", ...]           extra writable locations
     "shell_sandbox_env":   ["NAME", ...]            extra environment variables to pass through
+    "shell_sandbox_memory_mb": 8192                 memory limit for one program tree (Windows)
+    "shell_sandbox_desktop": true                   private desktop for programs (Windows)
 
 * `off`     - programs run as before.
 * `auto`    - programs run inside the sandbox when this machine has a backend, else as before.
@@ -28,14 +30,17 @@ not loaded.
 
 Known limits (also in the CHANGELOG):
 
-* Linux: the project's own `.rbit/` folder is inside the writable workspace, so a confined
-  command can modify it (Landlock rules are additive, a folder cannot be carved out). On
-  Windows it is closed to the sandbox.
+* Linux: no process, memory or disk limits (they need cgroups). Code can still run from memory
+  (`memfd_create` + exec), but it stays confined.
 * Linux/macOS: the PATH directories are readable by confined programs.
-* macOS: not run on a Mac. The Seatbelt profile is covered by tests of the generated text only.
+* macOS: NOT run on a Mac. The Seatbelt profile is covered by tests of the generated text only,
+  and it leaves most of the home directory readable (only the credential folders are denied).
+  See docs/security/macos-verification.md.
 * Windows: access is granted with persistent ACL entries (recorded in
-  `~/.rbit/sandbox-grants.json`, removed by `rbit sandbox cleanup`), and loopback is never
-  reachable from the container.
+  `~/.rbit/sandbox-grants.json`, removed by `rbit sandbox cleanup`), loopback is never
+  reachable from the container, and DPAPI (`CryptUnprotectData`) is NOT a boundary: keep
+  protected blobs out of workspaces.
+* Every platform: see docs/security/sandbox-audit.md for the audit and the full list.
 * A kernel or OS vulnerability can defeat any of these; the sandbox narrows what a mistaken
   or hostile command can do, it is not a hypervisor.
 """
@@ -103,6 +108,7 @@ def policy_for(
     workspace: Path,
     options: dict[str, Any] | None = None,
     env_values: dict[str, str] | None = None,
+    cwd: Path | None = None,
 ) -> Policy:
     """The policy for one program, from the global settings plus that program's own options.
 
@@ -111,6 +117,7 @@ def policy_for(
     own options can open things for that program only, never loosen the global switch.
     """
     options = options if isinstance(options, dict) else {}
+    # (a `cwd` in the program's own configuration is passed by the caller as `cwd=`)
 
     def paths(key: str) -> tuple[Path, ...]:
         raw = options.get(key)
@@ -121,15 +128,19 @@ def policy_for(
         return tuple(Path(_os.path.expanduser(str(p))) for p in raw if isinstance(p, str) and p.strip())
 
     env_names = options.get("env")
-    return policy_from_config(
-        config,
-        workspace,
-        network=True if options.get("network") is True else None,
-        extra_read=paths("read"),
-        extra_write=paths("write"),
-        env_names=tuple(str(n) for n in env_names if isinstance(n, str)) if isinstance(env_names, list) else (),
-        env_values=env_values,
-    )
+    try:
+        return policy_from_config(
+            config,
+            workspace,
+            network=True if options.get("network") is True else None,
+            extra_read=paths("read"),
+            extra_write=paths("write"),
+            env_names=tuple(str(n) for n in env_names if isinstance(n, str)) if isinstance(env_names, list) else (),
+            env_values=env_values,
+            cwd=cwd,
+        )
+    except ValueError as exc:  # a workspace or working directory the sandbox must not use
+        raise SandboxUnavailable(str(exc)) from exc
 
 
 def plugins_allowed(config: dict[str, Any] | None) -> bool:
@@ -183,7 +194,7 @@ async def spawn(
     err = {"pipe": pipe, "stdout": asyncio.subprocess.STDOUT, "null": null}[stderr]
     return await asyncio.create_subprocess_exec(
         *wrapped,
-        cwd=str(policy.workspace),
+        cwd=str(policy.start_dir),
         env=child_env,
         stdin=pipe if stdin else null,
         stdout=pipe if stdout else null,
