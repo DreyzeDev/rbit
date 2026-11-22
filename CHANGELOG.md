@@ -25,6 +25,12 @@ All notable changes to rbit are documented here. The format follows
   `rbit watch --run` no longer lets the agent run mutating shell commands unless the project
   is configured to allow them.
 
+- **The daily budget binds every client, not only the TUI.** `daily_budget_usd`,
+  `model_budgets` and `daily_token_limit` (with `budget_mode: strict`) were checked only in
+  the TUI, and only the TUI booked spend in the usage ledger, so `rbit run`, `serve`, ACP and
+  `watch` ignored the cap and `/usage` under-counted. The engine now always uses the
+  workspace ledger and checks the guard before a turn.
+
 ### Fixed
 
 - **Files that are not UTF-8 can be edited.** `edit` read such a file as UTF-8 with

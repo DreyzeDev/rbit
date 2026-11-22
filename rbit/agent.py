@@ -293,8 +293,9 @@ class AgentEngine:
         self.executor = executor
         self.get_config = get_config
         self.storage = storage or StorageManager(workspace)
-        # Ledger is optional so tests and the CLI can construct a bare engine.
-        self.usage = usage
+        # Every client (TUI, `rbit run`, serve, ACP, watch...) shares the workspace's daily
+        # ledger: spend is booked in one place and the daily budget binds all of them.
+        self.usage = usage if usage is not None else UsageLedger(workspace)
         self.http_client = http_client
         self.extra_models: list[ModelInfo] = []
         self.ollama_online: bool | None = None
@@ -711,6 +712,17 @@ class AgentEngine:
     ) -> ChatMessage:
         t0 = time.perf_counter()
         cfg = self.get_config()
+        # Daily cap / per-model caps / token cap: checked here so that headless runs, the
+        # server and ACP are bound too (the TUI also checks earlier to show a notice).
+        allowed, guard_msg = BudgetGuard(self.usage, cfg).check(model_id)
+        if not allowed:
+            return ChatMessage(
+                id=short_id(),
+                role="assistant",
+                content=f"**Budget guard:** {guard_msg}",
+                agent=agent_mode,
+                model=model_id,
+            )
         budget = float(cfg.get("budget_usd") or 0)
         # One parser for the mode everywhere ("none"/"off" disable it); a bare
         # per-session `budget_usd` without a mode stays strict, as it always was.
