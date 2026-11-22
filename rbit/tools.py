@@ -2914,9 +2914,13 @@ class ToolExecutor:
         max_per_file = max(1, raw_per_file) if raw_per_file else 0
         if not pattern:
             return ToolResult(False, "empty pattern", "Regex pattern is required.")
-        rg_result = self._grep_with_ripgrep(pattern, include, files_only, context, max_per_file)
-        if rg_result is not None:
-            return rg_result
+        # ripgrep reads UTF-8 (and BOM'd UTF-16) only: a legacy-encoded file (cp1251...) never
+        # matches a non-ASCII pattern and silently drops out of the results. The built-in
+        # search decodes every file with the same detection as `read`, so use it for those.
+        if pattern.isascii():
+            rg_result = self._grep_with_ripgrep(pattern, include, files_only, context, max_per_file)
+            if rg_result is not None:
+                return rg_result
         try:
             regex = re.compile(pattern, re.IGNORECASE)
         except re.error as exc:

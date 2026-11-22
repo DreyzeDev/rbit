@@ -224,3 +224,47 @@ def test_atomic_write_text_keeps_the_encoding_of_an_existing_file(tmp_path: Path
 
 def _unused(_: Any) -> None:  # keeps `Any` imported for type checkers without noise
     return None
+
+
+# --- grep: ripgrep cannot read legacy code pages ---------------------------------
+
+
+def _legacy_workspace(tmp_path: Path) -> Path:
+    (tmp_path / "utf8.txt").write_text("привет мир\n", encoding="utf-8")
+    (tmp_path / "cp1251.txt").write_bytes("привет мир\n".encode("cp1251"))
+    return tmp_path
+
+
+def test_non_ascii_grep_skips_ripgrep_so_legacy_encoded_files_are_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ex = ToolExecutor(workspace=_legacy_workspace(tmp_path), session=Session())
+    calls: list[str] = []
+
+    def spy(self: Any, pattern: str, *_a: Any, **_k: Any) -> None:
+        calls.append(pattern)
+        return None
+
+    monkeypatch.setattr(ToolExecutor, "_grep_with_ripgrep", spy)
+
+    result = ex._tool_grep({"pattern": "привет"})
+
+    assert calls == []  # ripgrep was not even tried
+    assert "cp1251.txt" in result.output and "utf8.txt" in result.output
+    assert "cp1251.txt" in ex._tool_grep({"pattern": "привет", "filesOnly": True}).output
+
+
+def test_ascii_grep_still_uses_ripgrep(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ex = ToolExecutor(workspace=_legacy_workspace(tmp_path), session=Session())
+    calls: list[str] = []
+
+    def spy(self: Any, pattern: str, *_a: Any, **_k: Any) -> Any:
+        from rbit.tools import ToolResult
+
+        calls.append(pattern)
+        return ToolResult(True, "1 lines (rg)", "x.txt:1:hello")
+
+    monkeypatch.setattr(ToolExecutor, "_grep_with_ripgrep", spy)
+
+    assert ex._tool_grep({"pattern": "hello"}).output == "x.txt:1:hello"
+    assert calls == ["hello"]

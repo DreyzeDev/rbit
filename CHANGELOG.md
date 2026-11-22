@@ -40,6 +40,10 @@ All notable changes to rbit are documented here. The format follows
 
 ### Fixed
 
+- **`grep` finds text in legacy-encoded files.** With ripgrep installed, a Cyrillic (or any
+  non-ASCII) pattern silently skipped cp1251/cp1252 files, because ripgrep reads UTF-8 only.
+  Non-ASCII patterns now use the built-in search, which decodes each file the same way
+  `read` does; ASCII patterns still use ripgrep.
 - **Files that are not UTF-8 can be edited.** `edit` read such a file as UTF-8 with
   escapes, so the model's text (real Cyrillic) never matched the bytes. The file's
   encoding is now detected (UTF-8, UTF-8/16/32 with BOM, otherwise cp1251 for Cyrillic
