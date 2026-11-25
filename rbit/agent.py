@@ -1234,6 +1234,33 @@ class AgentEngine:
                 await on_stream_chunk("\n\n".join(p for p in parts if p))
 
             for _step in range(max_steps):
+                if _step > 0 and cfg_limits.get("auto_compact", True) and len(api_messages) > 6:
+                    threshold = int(cfg_limits.get("auto_compact_at", 85))
+                    cur_tokens = sum(self._message_tokens(m) for m in api_messages) + self._tool_schema_tokens()
+                    if window and cur_tokens / window * 100 >= threshold:
+                        cut = max(2, len(api_messages) - 4)
+                        while cut < len(api_messages) - 1 and api_messages[cut].get("role") == "tool":
+                            cut += 1
+                        middle = api_messages[2:cut]
+                        if len(middle) >= 2:
+                            if on_status is not None:
+                                await on_status(f"Предиктивная компакция шага ({cur_tokens}/{window} токенов)...")
+                            bullets: list[str] = []
+                            for mm in middle[-12:]:
+                                role = mm.get("role", "")
+                                txt = str(mm.get("content") or "").strip().replace("\n", " ")
+                                if txt:
+                                    bullets.append(f"- [{role}] {txt[:180]}")
+                            summary_note = (
+                                "**[Compacted mid-turn]** Earlier tool steps condensed:\n"
+                                + ("\n".join(bullets) if bullets else "- (earlier tool calls)")
+                            )
+                            api_messages[:] = [
+                                api_messages[0],
+                                api_messages[1],
+                                {"role": "assistant", "content": summary_note},
+                                *api_messages[cut:],
+                            ]
                 self._step_usage = None
                 if on_thinking is not None:
                     await on_thinking(True)
@@ -2929,14 +2956,30 @@ class AgentEngine:
             logger.debug("memory generation failed", exc_info=True)
             return []
 
+    def _tool_schema_tokens(self) -> int:
+        cached = getattr(self, "_cached_base_schema_tokens", None)
+        if cached is None:
+            try:
+                cached = count_tokens(json.dumps(OPENAI_TOOLS_SCHEMA, ensure_ascii=False))
+            except (TypeError, ValueError):
+                cached = 2500
+            self._cached_base_schema_tokens = cached
+        mcp_schemas = self.executor.mcp_tool_schemas() if hasattr(self.executor, "mcp_tool_schemas") else []
+        if mcp_schemas:
+            try:
+                return cached + count_tokens(json.dumps(mcp_schemas, ensure_ascii=False))
+            except (TypeError, ValueError):
+                return cached + len(mcp_schemas) * 150
+        return cached
+
     def estimate_request_tokens(
         self,
         session: Session,
         user_msg: ChatMessage | None = None,
         agent_mode: str = "build",
     ) -> int:
-        """Estimates total prompt + history tokens before sending an LLM request."""
-        total = count_tokens(SYSTEM_PROMPT_TEMPLATE)
+        """Estimates total prompt + tool schemas + history tokens before sending an LLM request."""
+        total = count_tokens(SYSTEM_PROMPT_TEMPLATE) + self._tool_schema_tokens()
         project_mem = self.storage.load_project_memory()
         if project_mem:
             total += count_tokens(project_mem)

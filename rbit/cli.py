@@ -31,7 +31,7 @@ from .models import _migrate_session_dict
 from .app import RbitApp
 from .models import ChatMessage, Session, ToolCallRecord, get_model_info, short_id
 from .storage import StorageManager
-from .tools import ToolExecutor, detect_test_command
+from .tools import MUTATING_TOOLS, ToolExecutor, detect_test_command
 from .widgets import detect_git_branch
 
 
@@ -384,6 +384,58 @@ async def _run_headless(args: argparse.Namespace) -> int:
         return 1
     session.messages.append(reply)
     storage.save_session(session)
+
+    if (
+        cfg.get("test_gate", True)
+        and cfg.get("self_check", True)
+        and not executor.session_readonly
+        and any(tc.name in MUTATING_TOOLS for tc in reply.tool_calls)
+    ):
+        mutated_files: list[str] = []
+        for tc in reply.tool_calls:
+            if tc.name not in MUTATING_TOOLS:
+                continue
+            raw_path = (tc.arguments or {}).get("filePath") or (tc.arguments or {}).get("path")
+            if raw_path:
+                mutated_files.append(str(raw_path))
+        code_exts = (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java")
+        if any(p.endswith(code_exts) for p in mutated_files):
+            test_cmd = detect_test_command(workspace)
+            if test_cmd:
+                if jsonl_mode:
+                    _jsonl({"event": "test_gate", "command": test_cmd})
+                elif not json_mode:
+                    console.print(f"[#808080]  ~ test_gate: {markup_escape(test_cmd)}[/]")
+                gate_res = await executor.execute("bash", {"command": test_cmd, "timeout": 300}, agent_mode)
+                if not gate_res.ok:
+                    tail = "\n".join(gate_res.output.splitlines()[-25:])
+                    fix_msg = ChatMessage(
+                        id=short_id(),
+                        role="user",
+                        content=(
+                            f"[auto] Test gate failed (`{test_cmd}`):\n\n{tail}\n\n"
+                            "Fix the failing tests. Do not touch unrelated files."
+                        ),
+                        agent=agent_mode,
+                    )
+                    session.messages.append(fix_msg)
+                    storage.save_session(session)
+                    try:
+                        reply = await engine.run_turn(
+                            session=session,
+                            user_msg=fix_msg,
+                            agent_mode=agent_mode,
+                            model_id=model_id,
+                            on_tool_start=on_tool_start,
+                            on_tool_end=on_tool_end,
+                            on_status=on_status,
+                            on_reasoning_chunk=on_reasoning_chunk if (show_thinking or jsonl_mode) else None,
+                        )
+                        session.messages.append(reply)
+                        storage.save_session(session)
+                    except Exception as exc:  # noqa: BLE001 - keep initial reply if fix round fails
+                        if not json_mode and not jsonl_mode:
+                            console.print(f"[yellow]Test gate auto-fix failed:[/] {markup_escape(str(exc))}")
 
     if jsonl_mode:
         _jsonl(

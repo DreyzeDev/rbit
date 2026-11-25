@@ -216,7 +216,8 @@ rbit/
 
 ## Дорожная карта
 
-Актуальный приоритизированный бэклог — в [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md).
+Публичный roadmap (P0–P3, статусы `Completed` / `In Progress` / `Planned` и результаты проверок) — в [docs/ROADMAP.md](docs/ROADMAP.md).
+Актуальный внутренний бэклог — в [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md) и [docs/IMPROVEMENTS-2.md](docs/IMPROVEMENTS-2.md).
 
 - [x] Real-time SSE-стриминг
 - [x] Чекпоинты без Git + `/rewind`

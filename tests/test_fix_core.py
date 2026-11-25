@@ -1134,3 +1134,87 @@ async def test_predictive_compact_skips_when_under_threshold_or_disabled(tmp_pat
 
     engine.get_config = lambda: {"auto_compact": False, "auto_compact_at": 1}  # type: ignore[method-assign]
     assert await engine.predictive_compact(session, "huge/model") is False
+
+
+def test_estimate_request_tokens_counts_tool_schemas(tmp_path: Path) -> None:
+    from rbit.agent import AgentEngine
+    from rbit.models import ChatMessage, Session
+    from rbit.storage import StorageManager
+    from rbit.tools import ToolExecutor
+
+    storage = StorageManager(workspace=tmp_path)
+    session = Session(id="s3", title="t", messages=[ChatMessage(id="m1", role="user", content="hello")])
+    executor = ToolExecutor(workspace=tmp_path, session=session, storage=storage, get_config=lambda: {})
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: {}, storage=storage)
+
+    tokens = engine.estimate_request_tokens(session)
+    assert tokens > engine._tool_schema_tokens()
+    assert engine._tool_schema_tokens() >= 500
+
+
+@pytest.mark.asyncio
+async def test_headless_run_triggers_test_gate_fix_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import argparse
+    from rbit.agent import AgentEngine
+    from rbit.cli import _run_headless
+    from rbit.models import ChatMessage, ToolCallRecord
+
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (tmp_path / "calc.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+    (tmp_path / "test_calc.py").write_text(
+        "from calc import add\n\ndef test_add():\n    assert add(2, 2) == 4\n",
+        encoding="utf-8",
+    )
+
+    calls = {"n": 0}
+
+    async def fake_run_turn(self, session, user_msg, agent_mode, model_id, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ChatMessage(
+                id="a1",
+                role="assistant",
+                content="edited calc.py",
+                agent=agent_mode,
+                model=model_id,
+                tool_calls=[
+                    ToolCallRecord(
+                        id="t1",
+                        name="edit",
+                        arguments={"filePath": "calc.py"},
+                        status="success",
+                    )
+                ],
+            )
+        return ChatMessage(
+            id="a2",
+            role="assistant",
+            content="fixed calc.py",
+            agent=agent_mode,
+            model=model_id,
+        )
+
+    monkeypatch.setattr(AgentEngine, "run_turn", fake_run_turn)
+    args = argparse.Namespace(
+        dir=str(tmp_path),
+        prompt="fix add",
+        stdin=False,
+        model=None,
+        agent="build",
+        session=None,
+        continue_last=False,
+        json=True,
+        output_format="text",
+        allow_outside=False,
+        readonly=False,
+        thinking=False,
+        effort=None,
+        fork=None,
+        title=None,
+        archived=False,
+    )
+    rc = await _run_headless(args)
+    assert rc == 0
+    assert calls["n"] == 2
