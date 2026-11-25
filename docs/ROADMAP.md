@@ -50,7 +50,7 @@
 | Windows Sandbox (AppContainer + Job Object) | **Completed** | Верифицировано на Windows 11 (15/15 проверок `rbit sandbox check`, `tests/test_sandbox_isolation.py`) |
 | Linux Sandbox (namespaces + Landlock + seccomp + `pivot_root`) | **Completed** | Верифицировано на Linux / WSL2 kernel 6.18 (22/22 проверки; см. `docs/security/sandbox-audit.md`) |
 | Trust-модель проектных конфигов (`rbit trust`) и очистка env | **Completed** | Недоверенные `.rbit/config.json` не запускают код; секреты LLM вычищаются через `rbit/envscrub.py` |
-| Нативная проверка macOS (`sandbox-exec`) | **In Progress** | Профиль `rbit/sandbox/macos.py` защищает `.rbit`/`.git/hooks`; в `.github/workflows/ci.yml` добавлен прогон `rbit sandbox check` и `pytest` на `macos-latest` |
+| Нативная проверка macOS (`sandbox-exec`) | **Completed** | Профиль `rbit/sandbox/macos.py` изолирует чтение/запись в `HOME`, `/private/tmp`, `/private/var/folders`, `.rbit` и `.git/hooks`; `rbit sandbox check` и `pytest` пройдены на `macos-latest` (`arm64`) в GitHub Actions (`45714289238`) |
 | Независимый penetration test и public security report | **In Progress** | Обновлён `SECURITY.md` (responsible disclosure, SLA, scope); аудит `docs/security/sandbox-audit.md` |
 | Проверка происхождения и целостности плагинов (provenance + SHA-256) | **Completed** | `install_plugin` и `verify_sources` в `rbit/install.py` фиксируют и проверяют SHA-256 манифестов и удалённые источники (`tests/test_fix_core.py`, `tests/test_fix_install.py`) |
 
