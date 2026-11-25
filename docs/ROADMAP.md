@@ -73,7 +73,7 @@
 | Направление | Статус | Детали и результаты проверки |
 |---|---|---|
 | CI на Windows, Linux и macOS (`pytest` + `ruff` + `mypy`) | **Completed** | `.github/workflows/ci.yml` |
-| Интеграционные тесты длинных автономных задач и параллельных агентов | **In Progress** | Базовые тесты в `tests/test_fix_core.py`, `tests/test_app.py`; расширение long-horizon сценариев |
+| Интеграционные тесты длинных автономных задач и параллельных агентов | **Completed** | `tests/test_long_horizon.py` (14-шаговый цикл с mid-turn компакцией, параллельные субагенты с общим бюджетом) + `tests/test_fix_core.py`, `tests/test_app.py` |
 | Внешние бенчмарки (SWE-bench Verified, Terminal-Bench, Aider Polyglot) | **Planned** | В `benchmarks/agent_bench.py` есть базовый харнесс; интеграция публичных сьютов в планах |
 | Отдельный Security benchmark для Sandbox | **In Progress** | База в `rbit/sandbox/selftest.py` и `tests/test_sandbox_isolation.py` |
 
