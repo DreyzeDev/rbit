@@ -3500,7 +3500,8 @@ class ToolExecutor:
             elif action in ("content", "snapshot"):
                 result = await asyncio.to_thread(session.content)
             elif action == "screenshot":
-                result = await asyncio.to_thread(session.screenshot, str(args.get("path") or "screenshot.png"))
+                target_path = self.resolve_path(str(args.get("path") or "screenshot.png"))
+                result = await asyncio.to_thread(session.screenshot, str(target_path))
             elif action == "close":
                 result = await asyncio.to_thread(session.close)
                 self._browser_session = None
