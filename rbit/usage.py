@@ -19,7 +19,6 @@ Two blueprint rules are enforced here rather than at the call site:
 
 from __future__ import annotations
 
-import asyncio
 import csv
 import io
 import json

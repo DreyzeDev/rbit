@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover - Python < 3.11
 import httpx
 
 from .formatters import build_formatters, format_file, formatter_enabled, formatter_is_custom
-from .guard import guarded as guard_untrusted, risk_level, scan as scan_untrusted
+from .guard import guarded as guard_untrusted, risk_level
 from .models import CheckpointMeta, FileChangeStat, FileSnapshot, Session, TodoItem, short_id
 from .permissions import (
     EDIT_ACTIONS,

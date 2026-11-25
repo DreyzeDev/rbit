@@ -490,7 +490,6 @@ class StorageManager:
         if trust_all_requested():
             return cfg, {}
         shown = self.load_config()  # exactly what the user saw (also refreshes untrusted_keys)
-        untrusted = set(self.untrusted_keys)
         raw = self._read_raw_config()
         to_write = dict(cfg)
         updates: dict[str, str] = {}

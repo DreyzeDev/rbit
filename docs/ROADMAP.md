@@ -21,7 +21,7 @@
 
 | Направление | Статус | Детали и результаты проверки |
 |---|---|---|
-| Длинные автономные задачи (`max_steps`, `max_cost_usd`, budget guard) | **Completed** | Многошаговый цикл с лимитами шагов и стоимости, стриминг tool-вызовов и защита бюджета во всех клиентах |
+| Длинные автономные задачи, 6 режимов (`ask`/`plan`/`build`/`debug`/`review`/`autopilot`) и защита от зацикливания | **Completed** | Многошаговый цикл с `Loop guard`, лимитами шагов/стоимости и защитой бюджета во всех клиентах (`tests/test_long_horizon.py`) |
 | Test Gate (TUI + headless `rbit run`) | **Completed** | Автозапуск `pytest`/`npm test`/`cargo test` после правок кода + 1 круг авто-фикса (`tests/test_app.py::test_test_gate_feeds_failures_to_fix_round`) |
 | Predictive Compaction (до запроса и внутри длинных циклов) | **Completed** | Подсчёт токенов промпта, tool-схем, памяти, diff и вложений; сжатие до 400 overflow и на длинных сериях tool-вызовов (`tests/test_fix_core.py`) |
 | Авто-память проекта (`.rbit/memory.md`) | **Completed** | Автоматическая выжимка фактов после хода с дедупликацией (`tests/test_app.py::test_append_project_memory_dedups`) |
@@ -35,7 +35,7 @@
 | Направление | Статус | Детали и результаты проверки |
 |---|---|---|
 | Файлы, diff, AST-символы, Git, LSP, форматтеры | **Completed** | `read`/`write`/`edit`/`multi_edit`/`apply_patch`, сохранение кодировок (cp1251/UTF-16/UTF-8), `symbols`, `lsp`, `diagnostics`, `lint` |
-| Субагенты (`subagent`, фоновый режим) | **Completed** | Параллельные и фоновые субагенты с передачей результата карточкой |
+| Субагенты (`explore`, `researcher`, `coder`, `tester`, `reviewer`, `debugger`, фоновый режим + отмена) | **Completed** | Ролевые субагенты, обнаружение конфликтов файлов (`_turn_subagent_files`) и отмена фоновых субагентов (`cancel_background_subagent`) (`tests/test_long_horizon.py`) |
 | Общий бюджет и изоляция прав для нескольких субагентов | **Completed** | Общий лимит `subagent_turn_budget_usd` / `max_subagents_per_turn`, ролевая модель `model_router.roles.subagent` и запрет рекурсивного/мутирующего доступа в read-only режиме (`tests/test_fix_core.py`) |
 | Браузерный агент с защитой от prompt injection | **In Progress** | `rbit/browser.py`: SSRF-защита (`check_url_safe`), workspace-ограничение для скриншотов, санитайзер невидимых символов, детектор prompt-injection маркеров и `<untrusted_web_content>` обёртка |
 | Docker, SSH и удалённые среды разработки | **Completed** | `rbit/remote.py` и инструмент `remote` (`docker_ps`, `docker_exec`, `ssh_exec`) с защитой от option-injection, очисткой ключей и permission-гейтами (`tests/test_fix_core.py`) |

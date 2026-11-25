@@ -436,7 +436,7 @@ def _seccomp_program(machine: str) -> list[tuple[int, int, int, int]] | None:
     """
     if machine not in AUDIT_ARCH:
         return None
-    ld, jeq, jset, ret, ja = 0x20, 0x15, 0x45, 0x06, 0x05
+    ld, jeq, jset, ret = 0x20, 0x15, 0x45, 0x06
     program: list[tuple[int, int | str, int | str, int]] = []
     labels: dict[str, int] = {}
 

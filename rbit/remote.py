@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any
 
 from .envscrub import sanitized_env
 

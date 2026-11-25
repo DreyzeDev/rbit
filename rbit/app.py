@@ -59,10 +59,8 @@ from .models import (
 from .audit import default_audit_log
 from .usage import BudgetGuard, UsageLedger
 from .permissions import (
-    describe_permission_mode,
     mode_label,
     normalize_permission_mode,
-    permission_mode_from_config,
 )
 from .storage import StorageManager
 from .themes import RBIT_DARK, RBIT_HIGH_CONTRAST, RBIT_LIGHT

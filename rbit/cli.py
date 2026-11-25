@@ -1932,7 +1932,7 @@ def _run_init(workspace: Path, force: bool = False, as_json: bool = False) -> in
     return 0
 
 
-from .completion import COMMANDS, COMPLETION_SCRIPTS, completion_script as _completion_script
+from .completion import COMPLETION_SCRIPTS, completion_script as _completion_script
 
 
 
@@ -5596,7 +5596,6 @@ def _run_watch(workspace: Path, run_prompt: str | None, interval: float) -> int:
     console.print(f"[bold #7fd88f]Watching[/] {markup_escape(str(workspace))} (Ctrl+C to stop)")
     storage = StorageManager(workspace)
     cfg = storage.load_config()
-    engine_holder: dict[str, object] = {}
 
     async def react(changed: list[str]) -> None:
         from rbit.agent import AgentEngine
