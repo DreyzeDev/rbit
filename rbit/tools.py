@@ -3548,16 +3548,20 @@ class ToolExecutor:
                     "blocked: read-only mode",
                     "Remote mutating command refused in plan/readonly mode.",
                 )
-            if not readonly_cmd and self.needs_shell_approval(command):
-                if self.ask_permission is None:
-                    return ToolResult(
-                        False,
-                        "denied: no approval channel",
-                        "Remote mutating command requires interactive approval or allow rule.",
-                    )
-                allowed = await self.ask_permission("remote", f"{action} {target}: {command[:120]}")
-                if not allowed:
-                    return ToolResult(False, "denied by user", "Remote command was not approved.")
+            if not readonly_cmd and not self.always_allow_bash:
+                effect = self.resolve_permission_effect("shell", command, agent_mode)
+                if effect == "deny":
+                    return ToolResult(False, "denied by permission rule", "Remote command denied by policy.")
+                if effect != "allow":
+                    if self.permission_cb is None:
+                        return ToolResult(
+                            False,
+                            "denied: no approval channel",
+                            "Remote mutating command requires interactive approval or allow rule.",
+                        )
+                    allowed = await self.permission_cb("remote", f"{action} {target}: {command[:120]}")
+                    if not allowed:
+                        return ToolResult(False, "denied by user", "Remote command was not approved.")
             try:
                 if action == "docker_exec":
                     argv = build_docker_exec_cmd(target, command, workdir=workdir)
