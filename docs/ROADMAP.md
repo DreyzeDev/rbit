@@ -38,7 +38,7 @@
 | Субагенты (`subagent`, фоновый режим) | **Completed** | Параллельные и фоновые субагенты с передачей результата карточкой |
 | Общий бюджет и изоляция прав для нескольких субагентов | **Completed** | Общий лимит `subagent_turn_budget_usd` / `max_subagents_per_turn`, ролевая модель `model_router.roles.subagent` и запрет рекурсивного/мутирующего доступа в read-only режиме (`tests/test_fix_core.py`) |
 | Браузерный агент с защитой от prompt injection | **In Progress** | `rbit/browser.py`: SSRF-защита (`check_url_safe`), workspace-ограничение для скриншотов, санитайзер невидимых символов, детектор prompt-injection маркеров и `<untrusted_web_content>` обёртка |
-| Docker, SSH и удалённые среды разработки | **Planned** | Удалённое выполнение команд и работа с контейнерами |
+| Docker, SSH и удалённые среды разработки | **Completed** | `rbit/remote.py` и инструмент `remote` (`docker_ps`, `docker_exec`, `ssh_exec`) с защитой от option-injection, очисткой ключей и permission-гейтами (`tests/test_fix_core.py`) |
 | Глубокая интеграция GitHub Issues и Pull Requests | **Planned** | Чтение контекста задач, ревью и создание PR из агента |
 
 ---

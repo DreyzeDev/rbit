@@ -1402,3 +1402,41 @@ def test_apply_live_route_policy_cheapest_respects_context_window() -> None:
     )
     assert dec.model == "cheap-large"
     assert "cheapest" in dec.reason
+
+
+@pytest.mark.asyncio
+async def test_remote_tool_validation_readonly_and_mocked_exec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rbit import remote as remote_mod
+    from rbit.models import Session
+    from rbit.remote import build_docker_exec_cmd, build_ssh_exec_cmd, validate_remote_target
+    from rbit.storage import StorageManager
+    from rbit.tools import ToolExecutor
+
+    with pytest.raises(ValueError):
+        validate_remote_target("-oProxyCommand=evil", "host")
+    assert build_docker_exec_cmd("app_web", "pytest -q", workdir="/app") == [
+        "docker", "exec", "-w", "/app", "app_web", "sh", "-lc", "pytest -q"
+    ]
+    assert build_ssh_exec_cmd("dev@host", "git status", port=2222)[:7] == [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-p", "2222"
+    ]
+
+    storage = StorageManager(workspace=tmp_path)
+    executor = ToolExecutor(workspace=tmp_path, session=Session(), storage=storage, get_config=lambda: {})
+
+    # Mutating remote command in plan mode must be blocked
+    blocked = await executor.execute(
+        "remote", {"action": "docker_exec", "target": "app", "command": "rm -rf build"}, agent_mode="plan"
+    )
+    assert blocked.ok is False
+    assert "read-only" in blocked.summary
+
+    async def fake_run(argv, *, timeout=60.0, extra_env=None):
+        return 0, f"ran: {' '.join(argv)}"
+
+    monkeypatch.setattr(remote_mod, "run_remote_argv", fake_run)
+    res = await executor.execute("remote", {"action": "docker_ps"})
+    assert res.ok is True
+    assert "docker ps" in res.output

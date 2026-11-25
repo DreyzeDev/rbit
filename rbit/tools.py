@@ -2096,6 +2096,8 @@ class ToolExecutor:
                 res = await self._tool_lsp(args, agent_mode=agent_mode)
             elif name == "browser":
                 res = await self._tool_browser(args)
+            elif name == "remote":
+                res = await self._tool_remote(args, agent_mode=agent_mode)
             elif name == "lint":
                 res = await self._tool_lint(args)
             elif name == "notebook":
@@ -3515,6 +3517,75 @@ class ToolExecutor:
             return ToolResult(False, "browser failed", f"{type(exc).__name__}: {exc}")
         return ToolResult(result.ok, result.summary, result.output)
 
+    async def _tool_remote(self, args: dict[str, Any], *, agent_mode: str = "build") -> ToolResult:
+        from .remote import (
+            build_docker_exec_cmd,
+            build_docker_ps_cmd,
+            build_ssh_exec_cmd,
+            run_remote_argv,
+        )
+
+        action = str(args.get("action") or "").strip().lower()
+        target = str(args.get("target") or "").strip()
+        command = str(args.get("command") or "").strip()
+        workdir = str(args.get("workdir") or "").strip()
+        timeout = min(300.0, max(1.0, float(args.get("timeout") or 60.0)))
+
+        if action == "docker_ps":
+            argv = build_docker_ps_cmd()
+        elif action in ("docker_exec", "ssh_exec"):
+            if not command:
+                return ToolResult(False, "missing command", "`command` is required.")
+            danger = is_dangerous_command(command)
+            if danger:
+                return ToolResult(False, "blocked: dangerous command", danger)
+            readonly_cmd = is_readonly_bash_command(command)
+            if (agent_mode == "plan" or self.session_readonly) and not readonly_cmd:
+                return ToolResult(
+                    False,
+                    "blocked: read-only mode",
+                    "Remote mutating command refused in plan/readonly mode.",
+                )
+            if not readonly_cmd and self.needs_shell_approval(command):
+                if self.ask_permission is None:
+                    return ToolResult(
+                        False,
+                        "denied: no approval channel",
+                        "Remote mutating command requires interactive approval or allow rule.",
+                    )
+                allowed = await self.ask_permission("remote", f"{action} {target}: {command[:120]}")
+                if not allowed:
+                    return ToolResult(False, "denied by user", "Remote command was not approved.")
+            try:
+                if action == "docker_exec":
+                    argv = build_docker_exec_cmd(target, command, workdir=workdir)
+                else:
+                    raw_port = args.get("port")
+                    port = int(raw_port) if raw_port is not None else None
+                    argv = build_ssh_exec_cmd(
+                        target,
+                        command,
+                        port=port,
+                        identity_file=str(args.get("identity_file") or ""),
+                    )
+            except ValueError as exc:
+                return ToolResult(False, "invalid remote target", str(exc))
+        else:
+            return ToolResult(
+                False,
+                f"unknown remote action: {action}",
+                "Use docker_ps|docker_exec|ssh_exec.",
+            )
+
+        try:
+            rc, out = await run_remote_argv(argv, timeout=timeout)
+        except FileNotFoundError:
+            bin_name = argv[0]
+            return ToolResult(False, f"{bin_name} not found", f"`{bin_name}` is not installed or not in PATH.")
+        cleaned = redact_secrets(strip_ansi(out))[:20_000]
+        summary = f"{action} (exit {rc})"
+        return ToolResult(rc == 0, summary, cleaned or f"(exit {rc}, no output)")
+
     def browser_tool_schema(self) -> dict[str, Any] | None:
         from .browser import BrowserSession
 
@@ -4861,6 +4932,29 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {"url": {"type": "string"}},
                 "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remote",
+            "description": "Run commands in Docker containers or over SSH (docker_ps, docker_exec, ssh_exec).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["docker_ps", "docker_exec", "ssh_exec"],
+                    },
+                    "target": {"type": "string", "description": "Container name/ID or user@host."},
+                    "command": {"type": "string", "description": "Shell command to run remotely."},
+                    "workdir": {"type": "string", "description": "Container working directory."},
+                    "port": {"type": "integer", "description": "Optional SSH port."},
+                    "identity_file": {"type": "string", "description": "Optional SSH identity file."},
+                    "timeout": {"type": "number", "description": "Timeout in seconds (default 60)."},
+                },
+                "required": ["action"],
             },
         },
     },
