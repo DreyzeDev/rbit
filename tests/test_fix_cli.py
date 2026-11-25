@@ -355,7 +355,7 @@ def test_workflows_default_to_read_only_token(name: str) -> None:
 
 
 def test_pyproject_declares_crypto_and_all_extras() -> None:
-    import tomllib
+    tomllib = pytest.importorskip("tomllib")
 
     data = tomllib.loads(_read("pyproject.toml"))
     extras = data["project"]["optional-dependencies"]

@@ -399,13 +399,15 @@ async def test_auto_diagnostics_on_write_edit_and_self_heal_turn(tmp_path: Path)
     assert "JSONDecodeError" in bad_json.output
 
     bad_toml = await executor.execute("write", {"filePath": "cfg.toml", "content": "[server\nport = 80\n"})
-    assert "TOMLDecodeError" in bad_toml.output
+    if sys.version_info >= (3, 11):
+        assert "TOMLDecodeError" in bad_toml.output
 
     ws_diag = await executor.execute("diagnostics", {"filePath": "."})
     assert ws_diag.ok is True
-    assert "2 issues" in ws_diag.summary
+    assert ("2 issues" if sys.version_info >= (3, 11) else "1 issue") in ws_diag.summary
     assert "cfg.json" in ws_diag.output
-    assert "cfg.toml" in ws_diag.output
+    if sys.version_info >= (3, 11):
+        assert "cfg.toml" in ws_diag.output
 
     # 3. Full agent self-heal loop: step 1 writes broken Python -> receives Diagnostics -> step 2 edits & fixes
     await executor.execute("write", {"filePath": "cfg.json", "content": '{"port": 8080}\n'})

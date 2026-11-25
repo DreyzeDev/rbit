@@ -4472,8 +4472,7 @@ class ToolExecutor:
             root = str(sandbox_root).replace("'", "''")
             prefix += (
                 f"if (Get-Command New-PSDrive -ErrorAction SilentlyContinue) "
-                f"{{ New-PSDrive -Name rbit -PSProvider FileSystem -Root '{root}' -Scope Global | Out-Null; Set-Location rbit:\\ }} "
-                f"else {{ Set-Location '{root}' }};"
+                f"{{ New-PSDrive -Name rbit -PSProvider FileSystem -Root '{root}' -Scope Global | Out-Null; Set-Location rbit:\\ }};"
             )
         return ["powershell", "-NoProfile", "-NonInteractive", "-Command", prefix + command]
 
