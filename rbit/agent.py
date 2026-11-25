@@ -792,6 +792,8 @@ class AgentEngine:
         self.executor.begin_turn()
         self._turn_in = 0
         self._turn_out = 0
+        self._turn_subagent_spent = 0.0
+        self._turn_subagent_count = 0
         self._step_usage = None
         model_info = get_model_info(model_id, self.extra_models)
         api_key = self.storage.resolve_api_key(cfg).strip()
@@ -2587,7 +2589,10 @@ class AgentEngine:
     ) -> str:
         definition = subagent or load_subagents(self.workspace, self.get_config())["explore"]
         headers = self._build_headers(api_key)
-        allowed = definition.tools if definition.tools is not None else set(READONLY_TOOL_NAMES)
+        raw_allowed = definition.tools if definition.tools is not None else set(READONLY_TOOL_NAMES)
+        allowed = set(raw_allowed) - {"subagent"}
+        if definition.read_only:
+            allowed -= {"write", "edit", "multi_edit", "apply_patch", "bash", "terminal"}
         tools = [t for t in OPENAI_TOOLS_SCHEMA if t["function"]["name"] in allowed]
         system_prompt = definition.prompt.replace("{workspace}", f"Workspace: {self.workspace}")
         if str(self.workspace) not in system_prompt:
@@ -2608,6 +2613,8 @@ class AgentEngine:
         max_steps = max(1, int(cfg.get("subagent_max_steps", 5) or 5))
         max_cost = cfg.get("subagent_max_cost_usd")
         max_cost = float(max_cost) if isinstance(max_cost, (int, float)) and max_cost > 0 else None
+        raw_shared = cfg.get("subagent_turn_budget_usd") or cfg.get("max_cost_usd")
+        shared_cap = float(raw_shared) if isinstance(raw_shared, (int, float)) and raw_shared > 0 else None
         spent = 0.0
         cost_per_1k = get_model_info(model_id, self.extra_models).cost_per_1k
         try:
@@ -2653,11 +2660,16 @@ class AgentEngine:
                         tokens = int(usage.get("prompt_tokens") or 0) + int(
                             usage.get("completion_tokens") or 0
                         )
-                    spent += (tokens / 1000.0) * cost_per_1k
-                if max_cost is not None and spent >= max_cost:
+                    step_cost = (tokens / 1000.0) * cost_per_1k
+                    spent += step_cost
+                    self._turn_subagent_spent = getattr(self, "_turn_subagent_spent", 0.0) + step_cost
+                if (max_cost is not None and spent >= max_cost) or (
+                    shared_cap is not None and getattr(self, "_turn_subagent_spent", 0.0) >= shared_cap
+                ):
+                    cap_val = max_cost if (max_cost is not None and spent >= max_cost) else shared_cap
                     last_content = (
                         (last_content or "Subagent stopped.")
-                        + f"\n\n(subagent budget cap ${max_cost:.4f} reached after {steps} step(s))"
+                        + f"\n\n(subagent budget cap ${cap_val:.4f} reached after {steps} step(s))"
                     )
                     finished = True
                     break
@@ -2763,7 +2775,8 @@ class AgentEngine:
         if not goal:
             return ToolResult(False, "missing goal", "`goal` is required for subagent.")
         kind = str(args.get("agent") or "explore").strip().lower()
-        definitions = load_subagents(self.workspace, self.get_config())
+        cfg = self.get_config() or {}
+        definitions = load_subagents(self.workspace, cfg)
         definition = definitions.get(kind)
         if definition is None:
             return ToolResult(
@@ -2772,11 +2785,37 @@ class AgentEngine:
                 "Available subagents: " + ", ".join(subagent_names(definitions)),
             )
 
-        if args.get("background"):
-            return self._start_background_subagent(goal, model_id, api_base, api_key, session, definition)
+        max_subagents = max(1, int(cfg.get("max_subagents_per_turn", 8) or 8))
+        cur_count = getattr(self, "_turn_subagent_count", 0)
+        if cur_count >= max_subagents:
+            return ToolResult(
+                False,
+                "subagent limit reached",
+                f"Reached max_subagents_per_turn ({max_subagents}). Complete the turn without spawning more subagents.",
+            )
+        raw_shared = cfg.get("subagent_turn_budget_usd") or cfg.get("max_cost_usd")
+        shared_cap = float(raw_shared) if isinstance(raw_shared, (int, float)) and raw_shared > 0 else None
+        if shared_cap is not None and getattr(self, "_turn_subagent_spent", 0.0) >= shared_cap:
+            return ToolResult(
+                False,
+                "subagent shared budget reached",
+                f"Shared subagent turn budget (${shared_cap:.4f}) reached.",
+            )
+        self._turn_subagent_count = cur_count + 1
 
-        if model_id and api_base:
-            text = await self._explore_with_llm(goal, model_id, api_base, api_key, subagent=definition)
+        effective_model = model_id
+        if definition.model:
+            effective_model = definition.model
+        elif router_enabled(cfg):
+            role_model = (cfg.get("model_router") or {}).get("roles", {}).get("subagent")
+            if isinstance(role_model, str) and role_model.strip():
+                effective_model = role_model.strip()
+
+        if args.get("background"):
+            return self._start_background_subagent(goal, effective_model, api_base, api_key, session, definition)
+
+        if effective_model and api_base:
+            text = await self._explore_with_llm(goal, effective_model, api_base, api_key, subagent=definition)
         elif definition.name == "explore":
             text = await self._explore_deterministic(goal)
         else:

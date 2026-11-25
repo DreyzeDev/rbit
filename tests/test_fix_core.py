@@ -1289,3 +1289,51 @@ async def test_agent_run_turn_failover_on_rate_limit(tmp_path: Path) -> None:
     assert reply.content == "ok from fallback"
     assert reply.model == "openai/gpt-4o-mini"
     assert any("Failover:" in s for s in statuses)
+
+
+@pytest.mark.asyncio
+async def test_subagent_shared_budget_limit_and_role_model(tmp_path: Path) -> None:
+    from rbit.agent import AgentEngine
+    from rbit.models import Session
+    from rbit.storage import StorageManager
+    from rbit.tools import ToolExecutor
+
+    storage = StorageManager(workspace=tmp_path)
+    session = Session(id="s_sub", title="t", messages=[])
+    executor = ToolExecutor(workspace=tmp_path, session=session, storage=storage, get_config=lambda: {})
+    cfg = {
+        "max_subagents_per_turn": 2,
+        "subagent_turn_budget_usd": 0.05,
+        "model_router": {"enabled": True, "roles": {"subagent": "openai/gpt-4o-mini"}},
+    }
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg, storage=storage)
+    engine._turn_subagent_spent = 0.0
+    engine._turn_subagent_count = 0
+
+    called_models: list[str] = []
+
+    async def fake_explore(goal, model_id, api_base, api_key, subagent=None):
+        called_models.append(model_id)
+        engine._turn_subagent_spent += 0.03
+        return "found"
+
+    engine._explore_with_llm = fake_explore  # type: ignore[method-assign]
+
+    res1 = await engine._run_subagent(
+        {"goal": "scan 1"}, model_id="openai/gpt-4o", api_base="https://api.example/v1", api_key="k"
+    )
+    assert res1.ok is True
+    assert called_models == ["openai/gpt-4o-mini"]
+
+    res2 = await engine._run_subagent(
+        {"goal": "scan 2"}, model_id="openai/gpt-4o", api_base="https://api.example/v1", api_key="k"
+    )
+    assert res2.ok is True
+    assert engine._turn_subagent_spent == pytest.approx(0.06)
+
+    # Third call is blocked both by max_subagents_per_turn (2) and shared budget (0.06 >= 0.05)
+    res3 = await engine._run_subagent(
+        {"goal": "scan 3"}, model_id="openai/gpt-4o", api_base="https://api.example/v1", api_key="k"
+    )
+    assert res3.ok is False
+    assert "limit" in res3.summary or "budget" in res3.summary

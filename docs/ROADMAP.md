@@ -36,7 +36,7 @@
 |---|---|---|
 | Файлы, diff, AST-символы, Git, LSP, форматтеры | **Completed** | `read`/`write`/`edit`/`multi_edit`/`apply_patch`, сохранение кодировок (cp1251/UTF-16/UTF-8), `symbols`, `lsp`, `diagnostics`, `lint` |
 | Субагенты (`subagent`, фоновый режим) | **Completed** | Параллельные и фоновые субагенты с передачей результата карточкой |
-| Общий бюджет и изоляция прав для нескольких субагентов | **In Progress** | Контроль доступа и единый бюджет на дерево субагентов |
+| Общий бюджет и изоляция прав для нескольких субагентов | **Completed** | Общий лимит `subagent_turn_budget_usd` / `max_subagents_per_turn`, ролевая модель `model_router.roles.subagent` и запрет рекурсивного/мутирующего доступа в read-only режиме (`tests/test_fix_core.py`) |
 | Браузерный агент с защитой от prompt injection | **In Progress** | Базовый `rbit/browser.py` на Playwright; в работе усиленная изоляция контента и скриншоты |
 | Docker, SSH и удалённые среды разработки | **Planned** | Удалённое выполнение команд и работа с контейнерами |
 | Глубокая интеграция GitHub Issues и Pull Requests | **Planned** | Чтение контекста задач, ревью и создание PR из агента |
