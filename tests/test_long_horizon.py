@@ -259,3 +259,98 @@ async def test_ask_and_review_modes_block_file_mutations(tmp_path: Path) -> None
         res = await ex.execute("write", {"filePath": "x.py", "content": "1"}, agent_mode=mode)
         assert res.ok is False
         assert not (tmp_path / "x.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_builtin_subagent_roles_file_conflict_and_cancel(tmp_path: Path) -> None:
+    import httpx
+    from rbit.subagents import load_subagents
+
+    (tmp_path / "shared.py").write_text("V = 1\n", encoding="utf-8")
+    defs = load_subagents(tmp_path, {})
+    for role in ("explore", "researcher", "coder", "tester", "reviewer", "debugger"):
+        assert role in defs
+    assert defs["researcher"].read_only is True
+    assert defs["reviewer"].read_only is True
+    assert defs["coder"].read_only is False
+
+    storage = StorageManager(workspace=tmp_path)
+    session = Session(id="s_conf", title="conf", messages=[])
+    ex = ToolExecutor(workspace=tmp_path, session=session, storage=storage, get_config=lambda: {})
+    engine = AgentEngine(workspace=tmp_path, executor=ex, get_config=lambda: {"api_key": "k"}, storage=storage)
+    engine._turn_subagent_files = {}
+
+    seen_tool_outputs: list[str] = []
+
+    def make_handler(tag: str):
+        step = {"n": 0}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            step["n"] += 1
+            body = json.loads(req.content.decode("utf-8"))
+            for m in body.get("messages") or []:
+                if m.get("role") == "tool":
+                    seen_tool_outputs.append(str(m.get("content") or ""))
+            if step["n"] == 1:
+                return httpx.Response(
+                    200,
+                    json={
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": f"e_{tag}",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "edit",
+                                                "arguments": json.dumps(
+                                                    {"filePath": "shared.py", "oldString": "V = 1", "newString": f"V = '{tag}'"}
+                                                ),
+                                            },
+                                        }
+                                    ],
+                                }
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(200, json={"choices": [{"message": {"content": f"done {tag}"}}]})
+
+        return handler
+
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(make_handler("c1")))
+    try:
+        r1 = await engine._run_subagent(
+            {"goal": "edit shared", "agent": "coder"}, model_id="openai/gpt-4o", api_base="https://api.example/v1", api_key="k"
+        )
+        assert r1.ok is True
+    finally:
+        await engine.http_client.aclose()
+
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(make_handler("c2")))
+    try:
+        r2 = await engine._run_subagent(
+            {"goal": "edit shared again", "agent": "coder"}, model_id="openai/gpt-4o", api_base="https://api.example/v1", api_key="k"
+        )
+        assert r2.ok is True
+    finally:
+        await engine.http_client.aclose()
+
+    assert any("Conflict:" in out and "shared.py" in out for out in seen_tool_outputs)
+
+    # Background subagent cancellation
+    async def slow_explore(*_a: Any, **_kw: Any) -> str:
+        await asyncio.sleep(10)
+        return "never"
+
+    engine._explore_with_llm = slow_explore  # type: ignore[method-assign]
+    bg_res = await engine._run_subagent(
+        {"goal": "slow bg", "background": True}, model_id="openai/gpt-4o", api_base="https://api.example/v1", api_key="k"
+    )
+    assert bg_res.ok is True
+    bg_id = next(iter(engine._bg_subagent_tasks))
+    assert engine.cancel_background_subagent(bg_id) is True
+    await asyncio.sleep(0)
+    assert engine.cancel_background_subagent(bg_id) is False

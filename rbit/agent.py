@@ -810,6 +810,7 @@ class AgentEngine:
         self._turn_subagent_spent = 0.0
         self._turn_subagent_reserved = 0.0
         self._turn_subagent_count = 0
+        self._turn_subagent_files: dict[str, str] = {}
         self._subagent_budget_lock = asyncio.Lock()
         self._step_usage = None
         model_info = get_model_info(model_id, self.extra_models)
@@ -2751,9 +2752,37 @@ class AgentEngine:
                         )
                         continue
                     used.append(fn_name)
+                    parsed_args = self._parse_tool_args(fn.get("arguments"))
+                    if fn_name in ("write", "edit", "multi_edit", "apply_patch"):
+                        raw_fp = parsed_args.get("filePath") or parsed_args.get("path")
+                        if raw_fp:
+                            try:
+                                rel_fp = self.executor.rel_display(self.executor.resolve_path(str(raw_fp)))
+                            except Exception:
+                                rel_fp = str(raw_fp)
+                            files_map = getattr(self, "_turn_subagent_files", None)
+                            if files_map is None:
+                                files_map = {}
+                                self._turn_subagent_files = files_map
+                            sub_tag = f"{definition.name}:{id(messages)}"
+                            owner = files_map.get(rel_fp)
+                            if owner is not None and owner != sub_tag:
+                                messages.append(
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": tc_id,
+                                        "name": fn_name,
+                                        "content": (
+                                            f"Conflict: `{rel_fp}` was already modified by subagent `{owner}` "
+                                            "in this turn; do not overwrite concurrent edits."
+                                        ),
+                                    }
+                                )
+                                continue
+                            files_map[rel_fp] = sub_tag
                     res = await self.executor.execute(
                         fn_name,
-                        self._parse_tool_args(fn.get("arguments")),
+                        parsed_args,
                         agent_mode="plan" if definition.read_only else "build",
                     )
                     messages.append(
@@ -2959,17 +2988,39 @@ class AgentEngine:
                 except Exception:
                     logger.debug("background done callback failed", exc_info=True)
 
+        task_id = short_id()
         task = asyncio.create_task(runner())
         self._bg_tasks.add(task)
-        task.add_done_callback(self._bg_tasks.discard)
+        bg_map = getattr(self, "_bg_subagent_tasks", None)
+        if bg_map is None:
+            bg_map = {}
+            self._bg_subagent_tasks = bg_map
+        bg_map[task_id] = task
+
+        def _cleanup(done_task: asyncio.Task[None]) -> None:
+            self._bg_tasks.discard(done_task)
+            bg_map.pop(task_id, None)
+
+        task.add_done_callback(_cleanup)
         return ToolResult(
             True,
-            f"background subagent started ({time.strftime('%H:%M')})",
-            f"Subagent {definition.name} started in the BACKGROUND for: {goal}\n"
+            f"background subagent started ({task_id} · {time.strftime('%H:%M')})",
+            f"Subagent {definition.name} (id={task_id}) started in the BACKGROUND for: {goal}\n"
             "The current turn continues without waiting. The result will be posted "
             "to the chat (and saved to the session) when the subagent finishes.",
             duration_ms=0,
         )
+
+    def cancel_background_subagent(self, task_id: str) -> bool:
+        """Cancels a running background subagent by its id; True if found and cancelled."""
+        bg_map = getattr(self, "_bg_subagent_tasks", None)
+        if not isinstance(bg_map, dict):
+            return False
+        task = bg_map.get(task_id)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
 
     @staticmethod
     def _is_model_unavailable(content: str) -> bool:

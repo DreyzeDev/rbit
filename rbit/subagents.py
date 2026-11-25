@@ -55,7 +55,54 @@ def builtin_subagents() -> dict[str, SubagentDef]:
             prompt=EXPLORE_PROMPT,
             tools=set(READONLY_TOOL_NAMES),
             read_only=True,
-        )
+        ),
+        "researcher": SubagentDef(
+            name="researcher",
+            description="Read-only researcher: inspects codebase, docs, and web references.",
+            prompt=EXPLORE_PROMPT,
+            tools=set(READONLY_TOOL_NAMES),
+            read_only=True,
+        ),
+        "reviewer": SubagentDef(
+            name="reviewer",
+            description="Read-only code reviewer: checks diffs, bugs, and security risks.",
+            prompt=(
+                "You are a code reviewer subagent inside rbit. {workspace}\n"
+                "Inspect code and git diffs; report findings with file:line references. Never modify files."
+            ),
+            tools=set(READONLY_TOOL_NAMES),
+            read_only=True,
+        ),
+        "coder": SubagentDef(
+            name="coder",
+            description="Implementation subagent: edits code and runs diagnostics.",
+            prompt=(
+                "You are a coder subagent inside rbit. {workspace}\n"
+                "Implement the assigned scoped change cleanly and verify with diagnostics/lint."
+            ),
+            tools=set(READONLY_TOOL_NAMES) | {"write", "edit", "multi_edit", "apply_patch"},
+            read_only=False,
+        ),
+        "tester": SubagentDef(
+            name="tester",
+            description="Testing subagent: writes and runs tests, reports failures.",
+            prompt=(
+                "You are a tester subagent inside rbit. {workspace}\n"
+                "Run relevant tests and add regression tests for the assigned scope."
+            ),
+            tools=set(READONLY_TOOL_NAMES) | {"write", "edit", "bash"},
+            read_only=False,
+        ),
+        "debugger": SubagentDef(
+            name="debugger",
+            description="Debugging subagent: reproduces errors, isolates root cause, and fixes.",
+            prompt=(
+                "You are a debugger subagent inside rbit. {workspace}\n"
+                "Reproduce the failure, isolate root cause, apply a minimal fix, and verify."
+            ),
+            tools=set(READONLY_TOOL_NAMES) | {"write", "edit", "bash"},
+            read_only=False,
+        ),
     }
 
 
