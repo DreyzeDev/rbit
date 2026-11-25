@@ -619,3 +619,87 @@ def test_project_cannot_widen_the_sandbox_without_trust(tmp_path: Path, monkeypa
     cfg = storage.load_config()
     assert storage.untrusted_keys == ["shell_sandbox_env", "shell_sandbox_read", "shell_sandbox_write"]
     assert "shell_sandbox_read" not in cfg and "shell_sandbox_env" not in cfg
+
+
+@needs_backend
+@pytest.mark.asyncio
+async def test_subagent_is_confined_under_strict_sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+    from rbit.agent import AgentEngine
+    from rbit.storage import StorageManager
+
+    workspace = tmp_path / "ws"
+    outside = tmp_path / "outside"
+    state = workspace / ".rbit"
+    state.mkdir(parents=True)
+    outside.mkdir()
+    (outside / "secret.txt").write_text(SECRET, encoding="utf-8")
+    (state / "config.json").write_text('{"api_key": "sk-subagent-secret"}', encoding="utf-8")
+    script = _probe_script(workspace)
+    monkeypatch.setenv("RBIT_SANDBOX_CANARY", "subagent-canary")
+
+    cfg = {
+        "shell_sandbox": "strict",
+        "agents": {
+            "worker": {
+                "description": "build worker",
+                "mode": "build",
+                "tools": ["bash", "read"],
+            }
+        },
+    }
+    storage = StorageManager(workspace)
+    ex = ToolExecutor(workspace=workspace, session=Session(), storage=storage, get_config=lambda: cfg)
+    ex.always_allow_bash = True
+    engine = AgentEngine(workspace=workspace, executor=ex, get_config=lambda: cfg, storage=storage)
+
+    step = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        step["n"] += 1
+        if step["n"] == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "s1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "bash",
+                                            "arguments": json.dumps({"command": _shell(script, "read", outside / "secret.txt")}),
+                                        },
+                                    },
+                                    {
+                                        "id": "s2",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "bash",
+                                            "arguments": json.dumps({"command": _shell(script, "env", "RBIT_SANDBOX_CANARY")}),
+                                        },
+                                    },
+                                ],
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"choices": [{"message": {"content": "subagent done"}}]})
+
+    engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        res = await engine._run_subagent(
+            {"goal": "test confinement", "agent": "worker"},
+            model_id="openai/gpt-4o",
+            api_base="https://api.example/v1",
+            api_key="test-key",
+        )
+    finally:
+        await engine.http_client.aclose()
+    assert res.ok is True
+    assert SECRET not in res.output
+    assert "subagent-canary" not in res.output

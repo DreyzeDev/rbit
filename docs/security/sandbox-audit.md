@@ -127,3 +127,11 @@ Automated re-verification after hardening macOS Seatbelt (`rbit/sandbox/macos.py
 - **Prompt injection (Browser / `webfetch` / GitHub Issues & PRs)**: Stripped zero-width characters, flagged injection directives, and fenced inside `<untrusted_web_content>`.
 - **Plugin code tampering**: Full-tree SHA-256 digest (`_plugin_manifest_digest` in `rbit/install.py`) detects modifications to any `.py` or manifest file after install.
 - **Concurrent subagent budget overspend**: Prevented via `asyncio.Lock` atomic reservation (`_run_subagent` in `rbit/agent.py`).
+
+### Tool Coverage Verification
+- **`bash`** (`rbit/tools.py` `_spawn_shell`): Confined via `sandbox.spawn` (verified on Windows 11, Windows Server 2022, Linux, macOS).
+- **`terminal`** (`rbit/terminal.py` `PersistentShell`): Confined via `sandbox.spawn` with `sandbox.policy_for(cfg, workspace)` and `sandbox.ensure(cfg)` (`test_persistent_terminal_is_confined_too`).
+- **`mcp`** (`rbit/mcp.py` `McpClient`): Confined via `sandbox.spawn` with project workspace (ignores untrusted `cwd`, `test_an_mcp_server_is_confined_and_still_gets_its_declared_environment`, `test_audit_mcp_server_with_a_cwd_outside_the_workspace_never_runs`).
+- **`plugins`** (`rbit/plugins.py`, `rbit/install.py`): Blocked from loading when `shell_sandbox == "strict"` (`test_plugins_are_not_loaded_under_strict_because_the_os_cannot_confine_them`); full-tree SHA-256 provenance verified on disk (`test_plugin_provenance_detects_manifest_tampering`).
+- **`subagents`** (`rbit/agent.py` `_run_subagent`): Dispatches all tool calls through `ToolExecutor` under the active `strict` sandbox policy (`test_subagent_is_confined_under_strict_sandbox`) with atomic `asyncio.Lock` budget reservation (`test_parallel_subagents_respect_shared_turn_budget`).
+- **Release Verdict**: Zero known sandbox bypasses in all tested scenarios across Windows 11, Windows Server 2022, Linux (`landlock`/`bwrap`), and macOS (`sandbox-exec`).
