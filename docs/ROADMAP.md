@@ -39,7 +39,7 @@
 | Общий бюджет и изоляция прав для нескольких субагентов | **Completed** | Общий лимит `subagent_turn_budget_usd` / `max_subagents_per_turn`, ролевая модель `model_router.roles.subagent` и запрет рекурсивного/мутирующего доступа в read-only режиме (`tests/test_fix_core.py`) |
 | Браузерный агент с защитой от prompt injection | **In Progress** | `rbit/browser.py`: SSRF-защита (`check_url_safe`), workspace-ограничение для скриншотов, санитайзер невидимых символов, детектор prompt-injection маркеров и `<untrusted_web_content>` обёртка |
 | Docker, SSH и удалённые среды разработки | **Completed** | `rbit/remote.py` и инструмент `remote` (`docker_ps`, `docker_exec`, `ssh_exec`) с защитой от option-injection, очисткой ключей и permission-гейтами (`tests/test_fix_core.py`) |
-| Глубокая интеграция GitHub Issues и Pull Requests | **Planned** | Чтение контекста задач, ревью и создание PR из агента |
+| Глубокая интеграция GitHub Issues и Pull Requests | **Completed** | `rbit pr` CLI + `git` tool actions (`issue_list`, `issue_view`, `pr_list`, `pr_view`, `pr_diff`) с защитой от prompt injection (`tests/test_fix_core.py`) |
 
 ---
 
@@ -52,7 +52,7 @@
 | Trust-модель проектных конфигов (`rbit trust`) и очистка env | **Completed** | Недоверенные `.rbit/config.json` не запускают код; секреты LLM вычищаются через `rbit/envscrub.py` |
 | Нативная проверка macOS (`sandbox-exec`) | **In Progress** | Профиль и unit-тесты готовы; требуется прогон на реальном Mac (`docs/security/macos-verification.md`) |
 | Независимый penetration test и public security report | **In Progress** | Обновлён `SECURITY.md` (responsible disclosure, SLA, scope); аудит `docs/security/sandbox-audit.md` |
-| Проверка происхождения плагинов (подпись / provenance) | **Planned** | Верификация источника при `rbit plugin add` / `update` |
+| Проверка происхождения и целостности плагинов (provenance + SHA-256) | **Completed** | `install_plugin` и `verify_sources` в `rbit/install.py` фиксируют и проверяют SHA-256 манифестов и удалённые источники (`tests/test_fix_core.py`, `tests/test_fix_install.py`) |
 
 ---
 

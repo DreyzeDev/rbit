@@ -289,6 +289,14 @@ def validate_plugin_manifest(root: Path) -> dict[str, Any]:
     return data
 
 
+def _plugin_manifest_digest(plugin_dir: Path) -> str:
+    for fname in ("plugin.json", "rbit-plugin.json"):
+        cand = plugin_dir / fname
+        if cand.is_file():
+            return _digest(cand)
+    return ""
+
+
 def install_plugin(
     source: str,
     *,
@@ -312,7 +320,7 @@ def install_plugin(
         if replaced:
             _rmtree(target_dir)
         shutil.copytree(root, target_dir, dirs_exist_ok=True, ignore=_ignore_links_and_git)
-        write_origin(plugins_dir, name, source, "plugin", "")
+        write_origin(plugins_dir, name, source, "plugin", _plugin_manifest_digest(target_dir))
     if approve:
         _set_plugin_enabled(workspace, name, True)
     else:
@@ -423,4 +431,14 @@ def verify_sources(workspace: Path) -> list[str]:
                 warnings.append(f"skill `{name}` changed on disk since install")
             if meta.get("remote"):
                 warnings.append(f"skill `{name}` came from a remote source: {meta.get('source')}")
+    plugins = workspace / ".rbit" / "plugins"
+    if plugins.is_dir():
+        origins = read_origins(plugins)
+        for name, meta in origins.items():
+            digest = str(meta.get("digest") or "")
+            cur_digest = _plugin_manifest_digest(plugins / name)
+            if digest and cur_digest and cur_digest != digest:
+                warnings.append(f"plugin `{name}` manifest changed on disk since install")
+            if meta.get("remote"):
+                warnings.append(f"plugin `{name}` came from a remote source: {meta.get('source')}")
     return warnings

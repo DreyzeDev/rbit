@@ -3153,6 +3153,8 @@ class ToolExecutor:
 
         if action == "bisect":
             return await self._git_bisect(args, agent_mode=agent_mode)
+        if action in ("issue_list", "issue_view", "pr_list", "pr_view", "pr_diff"):
+            return await self._tool_github(action, args, limit=limit)
 
         if action == "status":
             cmd = ["status", "--short"]
@@ -3585,6 +3587,36 @@ class ToolExecutor:
         cleaned = redact_secrets(strip_ansi(out))[:20_000]
         summary = f"{action} (exit {rc})"
         return ToolResult(rc == 0, summary, cleaned or f"(exit {rc}, no output)")
+
+    async def _tool_github(self, action: str, args: dict[str, Any], *, limit: int = 20) -> ToolResult:
+        from .browser import wrap_untrusted_web_content
+        from .remote import run_remote_argv
+
+        num = self._int_arg(args.get("number"), 0) or 0
+        if action == "issue_list":
+            argv = ["gh", "issue", "list", "--limit", str(limit)]
+        elif action == "pr_list":
+            argv = ["gh", "pr", "list", "--limit", str(limit)]
+        elif action in ("issue_view", "pr_view", "pr_diff"):
+            if num <= 0:
+                return ToolResult(False, f"{action} needs number", f"`number` (> 0) is required for {action}.")
+            if action == "issue_view":
+                argv = ["gh", "issue", "view", str(num)]
+            elif action == "pr_view":
+                argv = ["gh", "pr", "view", str(num)]
+            else:
+                argv = ["gh", "pr", "diff", str(num)]
+        else:
+            return ToolResult(False, f"unsupported github action: {action}", "Invalid action.")
+
+        try:
+            rc, out = await run_remote_argv(argv, timeout=30.0)
+        except FileNotFoundError:
+            return ToolResult(False, "gh not found", "GitHub CLI (`gh`) is not installed or not in PATH.")
+        cleaned = redact_secrets(strip_ansi(out))[:20_000]
+        if rc == 0 and cleaned:
+            cleaned = wrap_untrusted_web_content(cleaned, f"github:{action}")
+        return ToolResult(rc == 0, f"gh {action} (exit {rc})", cleaned or f"(exit {rc}, no output)")
 
     def browser_tool_schema(self) -> dict[str, Any] | None:
         from .browser import BrowserSession
@@ -4720,8 +4752,21 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "diff", "log", "show", "blame", "bisect"],
+                        "enum": [
+                            "status",
+                            "diff",
+                            "log",
+                            "show",
+                            "blame",
+                            "bisect",
+                            "issue_list",
+                            "issue_view",
+                            "pr_list",
+                            "pr_view",
+                            "pr_diff",
+                        ],
                     },
+                    "number": {"type": "integer", "description": "GitHub issue or PR number for issue_view/pr_view/pr_diff."},
                     "subaction": {
                         "type": "string",
                         "enum": ["status", "start", "good", "bad", "skip", "reset", "log"],
