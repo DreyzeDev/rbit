@@ -2143,6 +2143,10 @@ class ToolExecutor:
         res.output = redact_secrets(res.output, code=name in ("read", "read_many_files", "symbols"))
         if res.diff:
             res.diff = redact_secrets(res.diff)
+        if not res.ok and self.audit is not None and res.summary.startswith(
+            ("blocked:", "denied", "sandbox:", "path outside workspace:")
+        ):
+            self.audit.record("policy_violation", tool=name, reason=res.summary, detail=res.output[:400])
         if res.ok and name in ("write", "edit", "multi_edit", "apply_patch"):
             try:
                 formatted = await self._format_mutated_files(name, args, agent_mode)

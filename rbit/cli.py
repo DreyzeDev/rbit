@@ -480,8 +480,8 @@ async def _run_headless(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_sandbox(workspace: Path, action: str) -> int:
-    """`rbit sandbox status|check|cleanup`."""
+def _run_sandbox(workspace: Path, action: str, as_json: bool = False) -> int:
+    """`rbit sandbox status|check|policy|cleanup`."""
     from . import sandbox
 
     cfg = StorageManager(workspace).load_config()
@@ -493,6 +493,28 @@ def _run_sandbox(workspace: Path, action: str) -> int:
         print(f"Removed {removed} permission entries and the rbit sandbox profile.")
         return 0
     info = sandbox.status(cfg)
+    if action == "policy":
+        policy = sandbox.policy_for(cfg, workspace)
+        payload = {
+            "platform": info["platform"],
+            "backend": info["backend"],
+            "mode": info["mode"],
+            "enabled": sandbox.enabled(cfg),
+            "plugins_allowed": sandbox.plugins_allowed(cfg),
+            "network": policy.network,
+            "workspace": str(policy.workspace),
+            "read_paths": [str(p) for p in policy.read_paths],
+            "write_paths": [str(p) for p in policy.write_paths],
+            "env_names": sorted(sandbox.ENV_ALLOWLIST | set(policy.env_names)),
+            "memory_mb": policy.memory_mb,
+            "desktop": policy.desktop,
+        }
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            for k, v in payload.items():
+                print(f"{k}: {v}")
+        return 1 if info["mode"] == "strict" and info["backend"] is None else 0
     print(f"platform: {info['platform']}   backend: {info['backend'] or 'none'}   mode: {info['mode']}   network: {'allowed' if info['network'] else 'blocked'}")
     if action == "status":
         if info["backend"] is None:
@@ -2114,10 +2136,11 @@ def main(argv: list[str] | None = None) -> int:
             p = argparse.ArgumentParser(
                 prog="rbit sandbox", description="OS-level sandbox for shell commands, MCP servers and tools"
             )
-            p.add_argument("action", nargs="?", choices=["status", "check", "cleanup"], default="status")
+            p.add_argument("action", nargs="?", choices=["status", "check", "policy", "cleanup"], default="status")
             p.add_argument("dir", nargs="?", help="Workspace directory")
+            p.add_argument("--json", action="store_true", help="Output JSON (for policy)")
             parsed = p.parse_args(rest)
-            return _run_sandbox(_resolve_workspace(parsed.dir), parsed.action)
+            return _run_sandbox(_resolve_workspace(parsed.dir), parsed.action, as_json=parsed.json)
 
         if sub == "trust":
             p = argparse.ArgumentParser(

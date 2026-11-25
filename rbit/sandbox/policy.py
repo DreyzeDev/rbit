@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-MODES = ("off", "auto", "strict")
+MODES = ("off", "auto", "standard", "strict")
 
 #: Memory one sandboxed program tree may use (Windows job limit). Generous on purpose: language
 #: servers and bundlers need a lot; the point is a runaway process, not a tight budget.

@@ -174,3 +174,48 @@ def test_a_project_cannot_switch_the_sandbox_off_or_open_the_network(
     narrowed = StorageManager(tmp_path)
     assert sandbox.mode(narrowed.load_config()) == "strict"
     assert narrowed.untrusted_keys == []  # narrowing needs no trust
+
+
+def test_standard_sandbox_mode_is_supported(monkeypatch: pytest.MonkeyPatch) -> None:
+    from rbit import sandbox
+
+    monkeypatch.setattr(sandbox, "backend", lambda: "appcontainer")
+    assert sandbox.mode({"shell_sandbox": "standard"}) == "standard"
+    assert sandbox.enabled({"shell_sandbox": "standard"}) is True
+
+
+def test_cli_sandbox_policy_json_prints_active_policy(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    import json
+    from rbit.cli import main
+
+    (tmp_path / ".rbit").mkdir()
+    rc = main(["sandbox", "policy", str(tmp_path), "--json"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert "backend" in data and "env_names" in data
+    assert data["workspace"] == str(tmp_path.resolve())
+
+
+@pytest.mark.asyncio
+async def test_policy_violation_is_recorded_in_audit_log(tmp_path: Path) -> None:
+    import json
+    from rbit.audit import AuditLog
+    from rbit.models import Session
+    from rbit.storage import StorageManager
+    from rbit.tools import ToolExecutor
+
+    (tmp_path / ".rbit").mkdir()
+    audit = AuditLog(tmp_path)
+    ex = ToolExecutor(
+        workspace=tmp_path,
+        session=Session(),
+        storage=StorageManager(tmp_path),
+        get_config=lambda: {},
+        audit=audit,
+    )
+    res = await ex.execute("bash", {"command": "rm -rf /"})
+    assert res.ok is False
+    files = list((tmp_path / ".rbit" / "audit").glob("*.jsonl"))
+    assert files
+    entries = [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert any(e.get("event") == "policy_violation" and e.get("tool") == "bash" for e in entries)

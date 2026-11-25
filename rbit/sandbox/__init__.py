@@ -94,7 +94,7 @@ def unavailable_message() -> str:
 
 def enabled(config: dict[str, Any] | None) -> bool:
     """True when programs must be started through the sandbox right now."""
-    return mode(config) in ("auto", "strict") and backend() is not None
+    return mode(config) in ("auto", "standard", "strict") and backend() is not None
 
 
 def ensure(config: dict[str, Any] | None) -> None:
