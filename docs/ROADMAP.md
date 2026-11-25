@@ -61,8 +61,9 @@
 | Направление | Статус | Детали и результаты проверки |
 |---|---|---|
 | Smart-роутер по сложности, тирам и `never_switch_mid_task` | **Completed** | Активен в `AgentEngine.run_turn` (`rbit/router.py`) |
-| Автопереключение при rate limit / outage и проверка capabilities | **In Progress** | Retry/backoff и fallback на `rbit/smart-local` есть; в планах роутинг по цене/скорости/размеру контекста и авто-failover между провайдерами |
-| Разные модели для Plan / Code / Review / Subagents | **Planned** | Специализация моделей по ролям |
+| Автопереключение при rate limit / outage (429/502/503/504/404) | **Completed** | `failover_candidates` в `rbit/router.py` и автоматический failover в `AgentEngine.run_turn` до fallback на `rbit/smart-local` |
+| Разные модели для Plan / Code / Review / Subagents | **Completed** | Поддержка `model_router.roles` (`plan`, `build`, `review`, `subagent`) в `rbit/router.py` (`tests/test_fix_core.py`) |
+| Роутинг по цене, скорости, качеству и размеру контекста | **In Progress** | Базовые политики `cheapest` / `best_value` / `balanced` и `check_capabilities` в `rbit/policy.py` |
 | Точный учёт стоимости всех запросов (включая фоновые) | **In Progress** | Единый `UsageLedger` и `BudgetGuard` (`tests/test_fix_budget.py`) |
 
 ---

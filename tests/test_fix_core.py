@@ -1218,3 +1218,74 @@ async def test_headless_run_triggers_test_gate_fix_round(
     rc = await _run_headless(args)
     assert rc == 0
     assert calls["n"] == 2
+
+
+def test_router_role_mapping_and_failover_candidates() -> None:
+    from rbit.router import failover_candidates, route
+
+    cfg = {
+        "model_router": {
+            "enabled": True,
+            "roles": {"plan": "o3-mini", "build": "gpt-4o"},
+            "tiers": {"balanced": "gpt-4o", "fast": "gpt-4o-mini"},
+            "fallback_models": ["claude-3-5-sonnet", "gpt-4o-mini"],
+        }
+    }
+    dec = route("inspect architecture", "gpt-4o", cfg, role="plan")
+    assert dec.model == "o3-mini"
+    assert dec.tier == "role:plan"
+
+    assert failover_candidates("gpt-4o", cfg) == ["claude-3-5-sonnet", "gpt-4o-mini"]
+
+
+@pytest.mark.asyncio
+async def test_agent_run_turn_failover_on_rate_limit(tmp_path: Path) -> None:
+    from rbit.agent import AgentEngine
+    from rbit.models import ChatMessage, Session
+    from rbit.storage import StorageManager
+    from rbit.tools import ToolExecutor
+
+    storage = StorageManager(workspace=tmp_path)
+    session = Session(id="s_fb", title="t", messages=[])
+    user = ChatMessage(id="u1", role="user", content="explain main.py")
+    session.messages.append(user)
+    executor = ToolExecutor(workspace=tmp_path, session=session, storage=storage, get_config=lambda: {})
+    cfg = {
+        "api_key": "test-key",
+        "model_router": {
+            "enabled": True,
+            "fallback_models": ["openai/gpt-4o-mini"],
+        },
+    }
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg, storage=storage)
+
+    seen_models: list[str] = []
+
+    async def fake_openai(**kwargs):
+        seen_models.append(kwargs["model_id"])
+        if len(seen_models) == 1:
+            return "Ошибка API (429): rate limit"
+        return "ok from fallback"
+
+    engine._run_openai_compatible = fake_openai  # type: ignore[method-assign]
+    statuses: list[str] = []
+
+    async def noop(*_a, **_kw) -> None:
+        return None
+
+    async def on_status(msg: str) -> None:
+        statuses.append(msg)
+
+    reply = await engine.run_turn(
+        session=session,
+        user_msg=user,
+        agent_mode="build",
+        model_id="openai/gpt-4o",
+        on_tool_start=noop,
+        on_tool_end=noop,
+        on_status=on_status,
+    )
+    assert seen_models == ["openai/gpt-4o", "openai/gpt-4o-mini"]
+    assert reply.content == "ok from fallback"
+    assert reply.model == "openai/gpt-4o-mini"
+    assert any("Failover:" in s for s in statuses)

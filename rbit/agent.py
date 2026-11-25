@@ -25,7 +25,7 @@ from .models import (
     get_model_info,
     short_id,
 )
-from .router import apply_live_route, router_enabled
+from .router import apply_live_route, failover_candidates, router_enabled
 from .rules import load_rules
 from . import sandbox
 from .envscrub import sanitized_env
@@ -766,7 +766,11 @@ class AgentEngine:
             routed_by_router = True
             has_history = any(message is not user_msg for message in session.messages)
             decision = apply_live_route(
-                getattr(user_msg, "content", "") or "", model_id, cfg, has_history=has_history
+                getattr(user_msg, "content", "") or "",
+                model_id,
+                cfg,
+                has_history=has_history,
+                role=agent_mode,
             )
             if decision.model and decision.model != model_id:
                 if on_status is not None:
@@ -871,6 +875,57 @@ class AgentEngine:
             protocol in ("gemini", "google") or "generativelanguage.googleapis.com" in effective_base
         )
 
+        async def _dispatch_remote(target_model: str) -> str:
+            target_clean, _ = self._split_model_variant(target_model)
+            if target_clean.startswith("opencode-go/"):
+                target_clean = target_clean.split("/", 1)[1]
+            target_info = get_model_info(target_clean, self.extra_models)
+            t_ollama = (
+                target_clean.startswith("ollama/")
+                or "ollama" in target_info.provider.lower()
+                or "localhost:11434" in api_base
+            )
+            t_remote_id = target_clean.split("/", 1)[1] if target_clean.startswith("ollama/") else target_clean
+            t_base = "http://localhost:11434/v1" if t_ollama and "openrouter.ai" in api_base else api_base
+            t_key = api_key or "ollama"
+            if native_gemini:
+                return await self._run_gemini_compatible(
+                    session=session,
+                    user_msg=user_msg,
+                    agent_mode=agent_mode,
+                    model_id=t_remote_id,
+                    api_base=t_base,
+                    api_key=api_key,
+                    invoke_tool=invoke_tool,
+                    on_status=on_status,
+                    on_stream_chunk=on_stream_chunk,
+                )
+            if native_anthropic:
+                return await self._run_anthropic_compatible(
+                    session=session,
+                    user_msg=user_msg,
+                    agent_mode=agent_mode,
+                    model_id=t_remote_id,
+                    api_base=t_base,
+                    api_key=api_key,
+                    invoke_tool=invoke_tool,
+                    on_status=on_status,
+                    on_stream_chunk=on_stream_chunk,
+                )
+            return await self._run_openai_compatible(
+                session=session,
+                user_msg=user_msg,
+                agent_mode=agent_mode,
+                model_id=t_remote_id,
+                api_base=t_base,
+                api_key=t_key,
+                invoke_tool=invoke_tool,
+                on_status=on_status,
+                on_stream_chunk=on_stream_chunk,
+                on_thinking=on_thinking,
+                on_reasoning_chunk=on_reasoning_chunk,
+            )
+
         if use_remote:
             await self.predictive_compact(
                 session,
@@ -879,45 +934,7 @@ class AgentEngine:
                 user_msg=user_msg,
                 on_status=on_status,
             )
-
-        if native_gemini:
-            content = await self._run_gemini_compatible(
-                session=session,
-                user_msg=user_msg,
-                agent_mode=agent_mode,
-                model_id=remote_model_id,
-                api_base=effective_base,
-                api_key=api_key,
-                invoke_tool=invoke_tool,
-                on_status=on_status,
-                on_stream_chunk=on_stream_chunk,
-            )
-        elif native_anthropic:
-            content = await self._run_anthropic_compatible(
-                session=session,
-                user_msg=user_msg,
-                agent_mode=agent_mode,
-                model_id=remote_model_id,
-                api_base=effective_base,
-                api_key=api_key,
-                invoke_tool=invoke_tool,
-                on_status=on_status,
-                on_stream_chunk=on_stream_chunk,
-            )
-        elif use_remote:
-            content = await self._run_openai_compatible(
-                session=session,
-                user_msg=user_msg,
-                agent_mode=agent_mode,
-                model_id=remote_model_id,
-                api_base=effective_base,
-                api_key=api_key or "ollama",
-                invoke_tool=invoke_tool,
-                on_status=on_status,
-                on_stream_chunk=on_stream_chunk,
-                on_thinking=on_thinking,
-                on_reasoning_chunk=on_reasoning_chunk,
-            )
+            content = await _dispatch_remote(model_id)
         else:
             if not model_info.is_local_smart and not api_key:
                 await on_status("API-ключ не задан — используется встроенный Smart-агент (/connect для API)")
@@ -929,18 +946,21 @@ class AgentEngine:
                 on_status=on_status,
             )
 
+        mutated_tools = {"write", "edit", "multi_edit", "apply_patch"}
+        already_wrote = any(
+            rec.name in mutated_tools or (rec.name == "bash" and rec.status != "denied")
+            for rec in tool_records
+        )
+        if use_remote and not already_wrote and self._is_failover_error(content):
+            for fb_model in failover_candidates(model_id, cfg):
+                await on_status(f"Failover: {model_id} → {fb_model}...")
+                fb_content = await _dispatch_remote(fb_model)
+                if not self._is_failover_error(fb_content) and not self._is_model_unavailable(fb_content):
+                    model_id = fb_model
+                    content = fb_content
+                    break
+
         if use_remote and self._is_model_unavailable(content):
-            mutated = {
-                "write",
-                "edit",
-                "multi_edit",
-                "apply_patch",
-            }
-            # bash can change files too, so any executed bash call also blocks the fallback.
-            already_wrote = any(
-                rec.name in mutated or (rec.name == "bash" and rec.status != "denied")
-                for rec in tool_records
-            )
             api_error = content.strip().splitlines()[0][:240] if content.strip() else ""
             is_401 = content.startswith("Ошибка API (401")
             reason = "401: ключ недействителен или не подходит к этому API" if is_401 else "404"
@@ -2836,6 +2856,18 @@ class AgentEngine:
     @staticmethod
     def _is_model_unavailable(content: str) -> bool:
         return content.startswith(("Ошибка API (401", "Ошибка API (404"))
+
+    @staticmethod
+    def _is_failover_error(content: str) -> bool:
+        return content.startswith(
+            (
+                "Ошибка API (404",
+                "Ошибка API (429",
+                "Ошибка API (502",
+                "Ошибка API (503",
+                "Ошибка API (504",
+            )
+        )
 
     @staticmethod
     def _transcript_for_summary(messages: list[ChatMessage]) -> str:

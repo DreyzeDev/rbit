@@ -135,11 +135,50 @@ def _model_available(model: str, available: list[str] | None) -> bool:
     return model in available
 
 
+def _role_map(config: dict[str, Any] | None) -> dict[str, str]:
+    """Reads `model_router.roles` (plan/build/review/subagent -> model id)."""
+    config = config or {}
+    block = config.get("model_router")
+    if not isinstance(block, dict):
+        return {}
+    roles = block.get("roles")
+    if not isinstance(roles, dict):
+        return {}
+    mapping: dict[str, str] = {}
+    for role, model in roles.items():
+        if isinstance(role, str) and isinstance(model, str) and model.strip():
+            mapping[role.strip().lower()] = model.strip()
+    return mapping
+
+
+def failover_candidates(current_model: str, config: dict[str, Any] | None) -> list[str]:
+    """Ordered fallback models from `model_router.fallback_models` and configured tiers."""
+    config = config or {}
+    block = config.get("model_router")
+    block = block if isinstance(block, dict) else {}
+    seen: set[str] = {current_model}
+    out: list[str] = []
+    raw_list = block.get("fallback_models")
+    if isinstance(raw_list, list):
+        for item in raw_list:
+            m = str(item or "").strip()
+            if m and m not in seen:
+                seen.add(m)
+                out.append(m)
+    for tier in ("balanced", "fast", "deep"):
+        m = _tier_map(config).get(tier)
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
 def route(
     text: str,
     current_model: str,
     config: dict[str, Any] | None = None,
     available_models: list[str] | None = None,
+    role: str | None = None,
 ) -> RoutingDecision:
     """Recommends a model for `text`.
 
@@ -170,6 +209,15 @@ def route(
             reason="router disabled",
             fallback=True,
         )
+
+    if role:
+        role_target = _role_map(config).get(role.strip().lower())
+        if role_target and _model_available(role_target, available_models):
+            return RoutingDecision(
+                model=role_target,
+                tier=f"role:{role.strip().lower()}",
+                reason=f"configured for '{role.strip().lower()}' role",
+            )
 
     tier, reason = classify_task(text)
     mapping = _tier_map(config)
@@ -267,6 +315,7 @@ def apply_live_route(
     config: dict[str, Any],
     available_models: list[str] | None = None,
     has_history: bool = True,
+    role: str | None = None,
 ) -> RoutingDecision:
     """Like `route`, but respects `never_switch_mid_task`.
 
@@ -279,7 +328,7 @@ def apply_live_route(
     keep = block.get("never_switch_mid_task")
     if keep is None:
         keep = True
-    decision = route(text, current_model, config, available_models)
+    decision = route(text, current_model, config, available_models, role=role)
     if keep and has_history and not decision.pinned and decision.model != current_model:
         return RoutingDecision(
             model=current_model,
