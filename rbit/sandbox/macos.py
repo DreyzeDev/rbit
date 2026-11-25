@@ -38,6 +38,9 @@ def profile(policy: Policy) -> str:
     ]
     for rel in SECRET_HOME_DIRS:
         rules.append(f"(deny file-read* (subpath {quote(f'{home}/{rel}')}))")
+    ws_resolved = str(policy.workspace.resolve()) if policy.workspace.exists() else str(policy.workspace)
+    rules.append(f"(deny file-write* (subpath {quote(f'{ws_resolved}/.rbit')}))")
+    rules.append(f"(deny file-write* (subpath {quote(f'{ws_resolved}/.git/hooks')}))")
     if not policy.network:
         rules.append("(deny network*)")
     return "\n".join(rules)
