@@ -10,7 +10,7 @@ engine asked for.
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Mapping
 
 #: (id, label, description) — shown by `/permissions` and `rbit permissions mode`.
 PERMISSION_MODES: tuple[tuple[str, str, str], ...] = (
@@ -92,19 +92,19 @@ def mode_decision(mode: str, action: str) -> str | None:
 
 def permission_mode_from_config(
     cfg: dict[str, Any] | None,
-    env: dict[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> str:
     """Resolves the effective mode: env override > legacy auto flags > config."""
-    env = os.environ if env is None else env
+    env_map: Mapping[str, str] = os.environ if env is None else env
     cfg = cfg or {}
 
-    override = env.get("RBIT_PERMISSION_MODE")
+    override = env_map.get("RBIT_PERMISSION_MODE")
     if isinstance(override, str) and override.strip():
         return normalize_permission_mode(override)
 
     # `RBIT_AUTO_APPROVE=1` (the --auto/--yolo flag) and `auto_approve` in the
     # config both predate modes and mean exactly "never prompt".
-    if env.get("RBIT_AUTO_APPROVE") == "1" or config_flag(cfg.get("auto_approve")):
+    if env_map.get("RBIT_AUTO_APPROVE") == "1" or config_flag(cfg.get("auto_approve")):
         return "auto"
 
     return normalize_permission_mode(cfg.get("permission_mode"), DEFAULT_MODE)

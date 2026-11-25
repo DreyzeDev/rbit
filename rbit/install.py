@@ -290,11 +290,21 @@ def validate_plugin_manifest(root: Path) -> dict[str, Any]:
 
 
 def _plugin_manifest_digest(plugin_dir: Path) -> str:
-    for fname in ("plugin.json", "rbit-plugin.json"):
-        cand = plugin_dir / fname
-        if cand.is_file():
-            return _digest(cand)
-    return ""
+    """Computes a deterministic SHA-256 tree digest across all files in `plugin_dir`."""
+    if not plugin_dir.is_dir():
+        return ""
+    h = hashlib.sha256()
+    files = sorted(
+        (p for p in plugin_dir.rglob("*") if p.is_file() and "__pycache__" not in p.parts and ".git" not in p.parts),
+        key=lambda p: p.relative_to(plugin_dir).as_posix(),
+    )
+    for p in files:
+        rel = p.relative_to(plugin_dir).as_posix().encode("utf-8")
+        h.update(rel)
+        h.update(b"\x00")
+        h.update(p.read_bytes())
+        h.update(b"\x00")
+    return h.hexdigest() if files else ""
 
 
 def install_plugin(
@@ -438,7 +448,7 @@ def verify_sources(workspace: Path) -> list[str]:
             digest = str(meta.get("digest") or "")
             cur_digest = _plugin_manifest_digest(plugins / name)
             if digest and cur_digest and cur_digest != digest:
-                warnings.append(f"plugin `{name}` manifest changed on disk since install")
+                warnings.append(f"plugin `{name}` files changed on disk since install")
             if meta.get("remote"):
                 warnings.append(f"plugin `{name}` came from a remote source: {meta.get('source')}")
     return warnings

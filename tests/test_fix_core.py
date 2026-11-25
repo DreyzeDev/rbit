@@ -1312,7 +1312,7 @@ async def test_subagent_shared_budget_limit_and_role_model(tmp_path: Path) -> No
 
     called_models: list[str] = []
 
-    async def fake_explore(goal, model_id, api_base, api_key, subagent=None):
+    async def fake_explore(goal, model_id, api_base, api_key, subagent=None, call_budget_usd=None):
         called_models.append(model_id)
         engine._turn_subagent_spent += 0.03
         return "found"
@@ -1456,9 +1456,10 @@ def test_plugin_provenance_detects_manifest_tampering(tmp_path: Path) -> None:
     install_plugin(str(src), workspace=ws)
     assert verify_sources(ws) == []
 
-    # Tamper with installed plugin manifest
+    # Tamper with installed plugin code file (not only manifest)
+    (ws / ".rbit" / "plugins" / "demo-plug" / "plugin.py").write_text("print('evil')\n", encoding="utf-8")
     (ws / ".rbit" / "plugins" / "demo-plug" / "plugin.json").write_text(
-        _json.dumps({"name": "demo-plug", "version": "9.9.9"}), encoding="utf-8"
+        _json.dumps({"name": "demo-plug", "version": "1.0.0"}), encoding="utf-8"
     )
     warnings = verify_sources(ws)
     assert any("demo-plug" in w and "changed on disk" in w for w in warnings)

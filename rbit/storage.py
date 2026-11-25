@@ -51,7 +51,10 @@ def _pid_alive(pid: int) -> bool:
         try:
             import ctypes
 
-            kernel32 = ctypes.windll.kernel32
+            windll = getattr(ctypes, "windll", None)
+            if windll is None:
+                return True
+            kernel32 = windll.kernel32
             handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
             if not handle:
                 return False

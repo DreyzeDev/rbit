@@ -291,7 +291,8 @@ class TrustStore:
         if not isinstance(workspaces, dict):
             workspaces = {}
         key = self.workspace_key(workspace)
-        entry = workspaces.get(key) if isinstance(workspaces.get(key), dict) else {}
+        raw_entry = workspaces.get(key)
+        entry: dict[str, Any] = dict(raw_entry) if isinstance(raw_entry, dict) else {}
         entry.update(fingerprints)
         workspaces[key] = entry
         data["workspaces"] = workspaces

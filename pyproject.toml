@@ -68,3 +68,7 @@ exclude = ["build", "dist", ".venv"]
 [[tool.mypy.overrides]]
 module = ["tiktoken", "keyring", "keyring.*", "cryptography", "cryptography.*", "pypdf", "pypdf.*", "playwright", "playwright.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["rbit.sandbox.windows"]
+disable_error_code = ["attr-defined", "union-attr"]

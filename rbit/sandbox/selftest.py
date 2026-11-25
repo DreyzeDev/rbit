@@ -131,10 +131,23 @@ def run_checks(config: dict[str, Any] | None = None, *, keep: bool = False) -> l
         _run("import sys;open(sys.argv[1],'w').write('x')", str(tamper), policy)
         record("cannot write the project's own .rbit state", "denied", not tamper.exists())
 
-        if sys.platform != "darwin":  # (the macOS profile has not been run: see docs/security)
-            hook = hooks / "post-checkout"
-            _run("import sys;open(sys.argv[1],'w').write('#!/bin/sh\\ntouch pwned\\n')", str(hook), policy)
-            record("cannot plant a git hook (it would run outside the sandbox)", "denied", not hook.exists())
+        hook = hooks / "post-checkout"
+        _run("import sys;open(sys.argv[1],'w').write('#!/bin/sh\\ntouch pwned\\n')", str(hook), policy)
+        record("cannot plant a git hook (it would run outside the sandbox)", "denied", not hook.exists())
+
+        escape_link = workspace / "escape_secret.txt"
+        try:
+            escape_link.symlink_to(outside / "secret.txt")
+            code, out = _run("import sys;print(open(sys.argv[1]).read())", str(escape_link), policy)
+            record(
+                "cannot read outside secret via workspace symlink",
+                "denied",
+                code != 0 and SECRET_TEXT not in out,
+                out,
+            )
+        except OSError:
+            # Windows without Developer Mode may disallow creating symlinks for unprivileged users.
+            pass
 
         if sys.platform.startswith("linux"):
             sock_path = outside / "host.sock"

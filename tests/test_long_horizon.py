@@ -107,7 +107,7 @@ async def test_long_horizon_multi_step_with_midturn_compaction(tmp_path: Path) -
 
 @pytest.mark.asyncio
 async def test_parallel_subagents_respect_shared_turn_budget(tmp_path: Path) -> None:
-    """Runs multiple subagents concurrently and verifies shared budget + concurrency limits."""
+    """Runs multiple subagents concurrently and verifies atomic reservation never overspends."""
     storage = StorageManager(workspace=tmp_path)
     storage.ensure_dirs()
     session = Session(id="s_par", title="par", messages=[])
@@ -115,30 +115,92 @@ async def test_parallel_subagents_respect_shared_turn_budget(tmp_path: Path) -> 
     cfg = {
         "max_subagents_per_turn": 4,
         "subagent_turn_budget_usd": 0.10,
+        "subagent_max_cost_usd": 0.05,
     }
     engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: cfg, storage=storage)
     engine._turn_subagent_spent = 0.0
+    engine._turn_subagent_reserved = 0.0
     engine._turn_subagent_count = 0
+    engine._subagent_budget_lock = asyncio.Lock()
 
-    async def fake_explore(goal: str, model_id: str, api_base: str, api_key: str, subagent: Any = None) -> str:
-        await asyncio.sleep(0.01)
-        engine._turn_subagent_spent += 0.04
+    async def fake_explore(
+        goal: str,
+        model_id: str,
+        api_base: str,
+        api_key: str,
+        subagent: Any = None,
+        call_budget_usd: float | None = None,
+    ) -> str:
+        await asyncio.sleep(0.02)
+        spend = min(0.04, call_budget_usd) if call_budget_usd is not None else 0.04
+        engine._turn_subagent_spent += spend
         return f"result for {goal}"
 
     engine._explore_with_llm = fake_explore  # type: ignore[method-assign]
 
+    # With $0.10 shared cap and $0.05 per-call reserve, at most 2 concurrent subagents can reserve at once;
+    # the 3rd concurrent call is blocked atomically before launch, so spend never exceeds $0.10!
     results = await asyncio.gather(
         engine._run_subagent({"goal": "a"}, model_id="m", api_base="https://api.example/v1", api_key="k"),
         engine._run_subagent({"goal": "b"}, model_id="m", api_base="https://api.example/v1", api_key="k"),
         engine._run_subagent({"goal": "c"}, model_id="m", api_base="https://api.example/v1", api_key="k"),
     )
-    assert all(r.ok for r in results)
-    assert engine._turn_subagent_count == 3
-    assert engine._turn_subagent_spent == pytest.approx(0.12)
+    succeeded = [r for r in results if r.ok]
+    rejected = [r for r in results if not r.ok]
+    assert len(succeeded) == 2
+    assert len(rejected) == 1
+    assert "budget" in rejected[0].summary
+    assert engine._turn_subagent_spent <= 0.10 + 1e-9
+    assert engine._turn_subagent_reserved == pytest.approx(0.0)
 
-    # Next subagent must be blocked because shared budget (0.12 >= 0.10) is exhausted
-    blocked = await engine._run_subagent(
-        {"goal": "d"}, model_id="m", api_base="https://api.example/v1", api_key="k"
+
+@pytest.mark.asyncio
+async def test_autonomous_turn_recovers_from_tool_failure(tmp_path: Path) -> None:
+    """Verifies an autonomous loop recovers when a tool call fails and completes the task."""
+    (tmp_path / "target.py").write_text("X = 10\n", encoding="utf-8")
+    storage = StorageManager(workspace=tmp_path)
+    storage.ensure_dirs()
+    session = Session(id="s_err", title="err", messages=[])
+    user = ChatMessage(id="u1", role="user", content="update target.py")
+    session.messages.append(user)
+    executor = ToolExecutor(workspace=tmp_path, session=session, storage=storage, get_config=lambda: {})
+    engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: {"api_key": "k"}, storage=storage)
+
+    step = {"n": 0}
+
+    async def fake_step(**kwargs: Any) -> tuple[bool, str, list[dict[str, Any]]]:
+        step["n"] += 1
+        if step["n"] == 1:
+            return (
+                True,
+                "trying missing file",
+                [{"id": "c1", "type": "function", "function": {"name": "read", "arguments": '{"filePath": "missing.py"}'}}],
+            )
+        if step["n"] == 2:
+            return (
+                True,
+                "reading target.py instead",
+                [{"id": "c2", "type": "function", "function": {"name": "edit", "arguments": '{"filePath": "target.py", "oldString": "X = 10", "newString": "X = 20"}'}}],
+            )
+        return True, "Recovered and updated target.py.", []
+
+    engine._non_stream_chat_step = fake_step  # type: ignore[method-assign]
+
+    async def noop(*_a: Any, **_kw: Any) -> None:
+        return None
+
+    reply = await engine.run_turn(
+        session=session,
+        user_msg=user,
+        agent_mode="build",
+        model_id="openai/gpt-4o",
+        on_tool_start=noop,
+        on_tool_end=noop,
+        on_status=noop,
+        on_stream_chunk=None,
     )
-    assert blocked.ok is False
-    assert "budget" in blocked.summary
+    assert step["n"] == 3
+    assert reply.tool_calls[0].status == "error"
+    assert reply.tool_calls[1].status == "success"
+    assert "X = 20" in (tmp_path / "target.py").read_text(encoding="utf-8")
+    assert "Recovered" in reply.content

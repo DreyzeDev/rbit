@@ -808,7 +808,9 @@ class AgentEngine:
         self._turn_in = 0
         self._turn_out = 0
         self._turn_subagent_spent = 0.0
+        self._turn_subagent_reserved = 0.0
         self._turn_subagent_count = 0
+        self._subagent_budget_lock = asyncio.Lock()
         self._step_usage = None
         model_info = get_model_info(model_id, self.extra_models)
         api_key = self.storage.resolve_api_key(cfg).strip()
@@ -2601,6 +2603,7 @@ class AgentEngine:
         api_base: str,
         api_key: str,
         subagent: SubagentDef | None = None,
+        call_budget_usd: float | None = None,
     ) -> str:
         definition = subagent or load_subagents(self.workspace, self.get_config())["explore"]
         headers = self._build_headers(api_key)
@@ -2628,6 +2631,8 @@ class AgentEngine:
         max_steps = max(1, int(cfg.get("subagent_max_steps", 5) or 5))
         max_cost = cfg.get("subagent_max_cost_usd")
         max_cost = float(max_cost) if isinstance(max_cost, (int, float)) and max_cost > 0 else None
+        if call_budget_usd is not None and call_budget_usd > 0:
+            max_cost = call_budget_usd if max_cost is None else min(max_cost, call_budget_usd)
         raw_shared = cfg.get("subagent_turn_budget_usd") or cfg.get("max_cost_usd")
         shared_cap = float(raw_shared) if isinstance(raw_shared, (int, float)) and raw_shared > 0 else None
         spent = 0.0
@@ -2801,22 +2806,40 @@ class AgentEngine:
             )
 
         max_subagents = max(1, int(cfg.get("max_subagents_per_turn", 8) or 8))
-        cur_count = getattr(self, "_turn_subagent_count", 0)
-        if cur_count >= max_subagents:
-            return ToolResult(
-                False,
-                "subagent limit reached",
-                f"Reached max_subagents_per_turn ({max_subagents}). Complete the turn without spawning more subagents.",
-            )
         raw_shared = cfg.get("subagent_turn_budget_usd") or cfg.get("max_cost_usd")
         shared_cap = float(raw_shared) if isinstance(raw_shared, (int, float)) and raw_shared > 0 else None
-        if shared_cap is not None and getattr(self, "_turn_subagent_spent", 0.0) >= shared_cap:
-            return ToolResult(
-                False,
-                "subagent shared budget reached",
-                f"Shared subagent turn budget (${shared_cap:.4f}) reached.",
-            )
-        self._turn_subagent_count = cur_count + 1
+        lock = getattr(self, "_subagent_budget_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._subagent_budget_lock = lock
+
+        reserve_amt = 0.0
+        async with lock:
+            cur_count = getattr(self, "_turn_subagent_count", 0)
+            if cur_count >= max_subagents:
+                return ToolResult(
+                    False,
+                    "subagent limit reached",
+                    f"Reached max_subagents_per_turn ({max_subagents}). Complete the turn without spawning more subagents.",
+                )
+            if shared_cap is not None:
+                spent_now = getattr(self, "_turn_subagent_spent", 0.0)
+                reserved_now = getattr(self, "_turn_subagent_reserved", 0.0)
+                remaining = shared_cap - (spent_now + reserved_now)
+                if remaining <= 1e-9:
+                    return ToolResult(
+                        False,
+                        "subagent shared budget reached",
+                        f"Shared subagent turn budget (${shared_cap:.4f}) reached.",
+                    )
+                per_call_cfg = cfg.get("subagent_max_cost_usd")
+                if isinstance(per_call_cfg, (int, float)) and per_call_cfg > 0:
+                    reserve_amt = min(remaining, float(per_call_cfg))
+                else:
+                    slots_left = max(1, max_subagents - cur_count)
+                    reserve_amt = min(remaining, remaining / slots_left)
+                self._turn_subagent_reserved = reserved_now + reserve_amt
+            self._turn_subagent_count = cur_count + 1
 
         effective_model = model_id
         if definition.model:
@@ -2826,19 +2849,33 @@ class AgentEngine:
             if isinstance(role_model, str) and role_model.strip():
                 effective_model = role_model.strip()
 
-        if args.get("background"):
-            return self._start_background_subagent(goal, effective_model, api_base, api_key, session, definition)
+        try:
+            if args.get("background"):
+                return self._start_background_subagent(goal, effective_model, api_base, api_key, session, definition)
 
-        if effective_model and api_base:
-            text = await self._explore_with_llm(goal, effective_model, api_base, api_key, subagent=definition)
-        elif definition.name == "explore":
-            text = await self._explore_deterministic(goal)
-        else:
-            return ToolResult(
-                False,
-                f"subagent {definition.name} requires a remote model",
-                "Custom subagents need an API model; the built-in explore agent can run locally.",
-            )
+            if effective_model and api_base:
+                text = await self._explore_with_llm(
+                    goal,
+                    effective_model,
+                    api_base,
+                    api_key,
+                    subagent=definition,
+                    call_budget_usd=reserve_amt if shared_cap is not None else None,
+                )
+            elif definition.name == "explore":
+                text = await self._explore_deterministic(goal)
+            else:
+                return ToolResult(
+                    False,
+                    f"subagent {definition.name} requires a remote model",
+                    "Custom subagents need an API model; the built-in explore agent can run locally.",
+                )
+        finally:
+            if reserve_amt > 0:
+                async with lock:
+                    self._turn_subagent_reserved = max(
+                        0.0, getattr(self, "_turn_subagent_reserved", 0.0) - reserve_amt
+                    )
 
         duration = int((time.perf_counter() - t0) * 1000)
         return ToolResult(

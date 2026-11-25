@@ -75,7 +75,8 @@ def _alive(pid: int) -> bool:
         handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
             # Access denied still means the process exists.
-            return ctypes.get_last_error() == 5
+            get_last_err = getattr(ctypes, "get_last_error", None)
+            return bool(get_last_err is not None and get_last_err() == 5)
         try:
             code = ctypes.c_ulong()
             if not kernel32.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code)):
@@ -251,7 +252,10 @@ class ServiceManager:
             "env": {**os.environ, "RBIT_SERVER_TOKEN": token},
         }
         if os.name == "nt":
-            kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            kwargs["creationflags"] = (
+                getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
         else:
             kwargs["start_new_session"] = True
         process = subprocess.Popen(command, **kwargs)

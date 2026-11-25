@@ -814,10 +814,12 @@ async def _kill_process_tree(proc: Any) -> None:
             except Exception:
                 pass
         else:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)  # type: ignore[attr-defined]
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
+            killpg = getattr(os, "killpg", None)
+            if killpg is not None:
+                try:
+                    killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
     try:
         proc.kill()
     except (ProcessLookupError, OSError):
@@ -871,7 +873,7 @@ async def check_url_safe(url: str, *, allow_private: bool = False) -> str | None
         return None  # unresolvable: the request itself will fail
     for info in infos:
         try:
-            ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+            ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
         except ValueError:
             continue
         if _is_blocked_ip(ip):
@@ -971,7 +973,7 @@ async def _resolve_pinned_ips(host: str) -> list[str]:
     addresses: list[str] = []
     for info in infos:
         try:
-            ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+            ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
         except ValueError:
             continue
         if _is_blocked_ip(ip):
