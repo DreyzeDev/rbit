@@ -94,6 +94,10 @@ def bwrap_argv(argv: list[str], policy: Policy) -> list[str]:
     for path in policy.write_paths:
         out += ["--bind-try", str(path), str(path)]
     out += ["--bind", ws, ws]  # after the tmpfs: a workspace inside $HOME stays visible
+    if (policy.workspace / ".rbit").exists():
+        out += ["--tmpfs", str(policy.workspace / ".rbit")]
+    if (policy.workspace / ".git" / "hooks").exists():
+        out += ["--ro-bind-try", str(policy.workspace / ".git" / "hooks"), str(policy.workspace / ".git" / "hooks")]
     out += ["--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent", "--new-session",
             "--cap-drop", "ALL"]
     if not policy.network:

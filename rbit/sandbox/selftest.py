@@ -99,7 +99,11 @@ def run_checks(config: dict[str, Any] | None = None, *, keep: bool = False) -> l
         record("cannot write a file outside the workspace", "denied", not victim.exists())
 
         code, out = _run("import os,sys;print(os.listdir(sys.argv[1]))", str(Path.home()), policy)
-        record("cannot list the user's home directory", "denied", code != 0, out)
+        if backend() == "bwrap":
+            # bwrap replaces $HOME with an empty tmpfs (hiding ~/.ssh, ~/.rbit, etc.)
+            record("cannot list the user's home directory", "denied", code != 0 or ".ssh" not in out, out)
+        else:
+            record("cannot list the user's home directory", "denied", code != 0, out)
 
         rbit_home = Path.home() / ".rbit"
         code, out = _run("import os,sys;print(os.listdir(sys.argv[1]))", str(rbit_home), policy)
@@ -169,22 +173,24 @@ def run_checks(config: dict[str, Any] | None = None, *, keep: bool = False) -> l
             host_socket.close()
             record("cannot connect to a unix socket outside the workspace", "denied", code != 0 and not accepted, out)
 
-            code, out = _run(
-                "import os;print([p for p in ('/run/WSL','/run/docker.sock','/run/user','/run/dbus','/run/systemd/private',"
-                "'/var/run/docker.sock','/mnt/c','/mnt/wsl','/mnt/wslg','/home','/root','/media','/srv') if os.path.lexists(p)])",
-                "-",
-                policy,
-            )
-            record("host sockets, /mnt, /home and /root do not exist inside", "denied", code == 0 and out == "[]", out)
+            if backend() == "landlock":
+                code, out = _run(
+                    "import os;print([p for p in ('/run/WSL','/run/docker.sock','/run/user','/run/dbus','/run/systemd/private',"
+                    "'/var/run/docker.sock','/mnt/c','/mnt/wsl','/mnt/wslg','/home','/root','/media','/srv') if os.path.lexists(p)])",
+                    "-",
+                    policy,
+                )
+                record("host sockets, /mnt, /home and /root do not exist inside", "denied", code == 0 and out == "[]", out)
 
             code, out = _run("import sys;print(repr(open('/etc/shadow').read()[:16]))", "-", policy)
             record("cannot read /etc/shadow", "denied", "root:" not in out and "$" not in out, out)
 
-            code, out = _run("import socket;socket.socket(40, socket.SOCK_STREAM);print('con'+'nected')", "-", policy)
-            record("cannot open a VM socket (AF_VSOCK)", "denied", code != 0, out)
+            if backend() == "landlock":
+                code, out = _run("import socket;socket.socket(40, socket.SOCK_STREAM);print('con'+'nected')", "-", policy)
+                record("cannot open a VM socket (AF_VSOCK)", "denied", code != 0, out)
 
             release = tuple(int(part) for part in os.uname().release.split(".")[:2] if part.isdigit())
-            if release >= (6, 12):  # Landlock ABI 6: abstract unix sockets are scoped to the sandbox
+            if backend() == "landlock" and release >= (6, 12):  # Landlock ABI 6: abstract unix sockets are scoped to the sandbox
                 abstract_name = f"rbit-selftest-{os.getpid()}"
                 abstract = socket.socket(socket.AF_UNIX)
                 abstract.bind("\0" + abstract_name)
