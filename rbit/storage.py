@@ -655,6 +655,97 @@ class StorageManager:
         # An ambiguous prefix must not silently pick "the first" session.
         return matches[0] if len(matches) == 1 else None
 
+    def search_sessions(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        include_archived: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Ranks past sessions with BM25 (and optional local sentence-transformers embeddings)."""
+        import math
+        from collections import Counter
+
+        q_text = (query or "").strip()
+        if not q_text:
+            return []
+        tokens = re.findall(r"\w+", q_text.lower())
+        if not tokens:
+            return []
+
+        sessions = self.list_sessions(include_archived=include_archived)
+        if not sessions:
+            return []
+
+        docs_tokens: list[list[str]] = []
+        docs_text: list[str] = []
+        snippets: list[str] = []
+        for s in sessions:
+            parts: list[str] = []
+            if s.title:
+                parts.extend([s.title, s.title])  # boost title
+            best_snip = s.title or ""
+            for m in s.messages:
+                if m.content:
+                    parts.append(m.content[:2000])
+                    if any(t in m.content.lower() for t in tokens):
+                        best_snip = m.content.strip().splitlines()[0][:140]
+                for tc in m.tool_calls:
+                    if tc.summary:
+                        parts.append(tc.summary)
+            for path in s.modified_files:
+                parts.append(path)
+            joined = "\n".join(parts)
+            docs_text.append(joined[:4000])
+            docs_tokens.append(re.findall(r"\w+", joined.lower()))
+            snippets.append(best_snip[:140])
+
+        n_docs = len(docs_tokens)
+        avgdl = sum(len(d) for d in docs_tokens) / max(1, n_docs)
+        df: Counter[str] = Counter()
+        for d in docs_tokens:
+            for term in set(d):
+                df[term] += 1
+
+        k1 = 1.5
+        b = 0.75
+        bm25_scores: list[float] = []
+        for d in docs_tokens:
+            tf = Counter(d)
+            dl = len(d) or 1
+            score = 0.0
+            for term in tokens:
+                if term not in tf:
+                    continue
+                idf = math.log(1.0 + (n_docs - df[term] + 0.5) / (df[term] + 0.5))
+                freq = tf[term]
+                score += idf * (freq * (k1 + 1.0)) / (freq + k1 * (1.0 - b + b * dl / max(1.0, avgdl)))
+            bm25_scores.append(score)
+
+        # Optional local embeddings boost when sentence-transformers is installed.
+        emb_scores = [0.0] * n_docs
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
+
+            model = SentenceTransformer("all-MiniLM-L6-v2")
+            vecs = model.encode([q_text, *docs_text], normalize_embeddings=True)
+            q_vec = vecs[0]
+            for idx in range(n_docs):
+                emb_scores[idx] = max(0.0, float(sum(a * b_val for a, b_val in zip(q_vec, vecs[idx + 1]))))
+        except Exception:
+            pass
+
+        max_bm25 = max(bm25_scores) if bm25_scores else 0.0
+        ranked: list[dict[str, Any]] = []
+        for idx, s in enumerate(sessions):
+            norm_bm25 = (bm25_scores[idx] / max_bm25) if max_bm25 > 0 else 0.0
+            combined = norm_bm25 + 0.6 * emb_scores[idx]
+            if combined <= 0:
+                continue
+            ranked.append({"session": s, "score": round(combined, 4), "snippet": snippets[idx]})
+        ranked.sort(key=lambda item: -item["score"])
+        return ranked[: max(1, limit)]
+
     def delete_session(self, session_id: str) -> bool:
         sid = (session_id or "").strip()
         if not _SAFE_ID_RE.match(sid):

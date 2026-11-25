@@ -2721,12 +2721,38 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--prune", metavar="AGE", help="Delete sessions/checkpoints older than e.g. 30d, 12h, 2w")
             p.add_argument("-y", "--yes", action="store_true", help="Do not ask for confirmation (needed for --prune 0)")
             p.add_argument("-n", "--max-count", type=_nonneg_int, default=None, help="Limit to N most recent sessions")
+            p.add_argument("--search", metavar="QUERY", help="Search past sessions by content/title")
             p.add_argument("--json", action="store_true", help="Output JSON")
             p.add_argument("--all", action="store_true", help="Include archived sessions")
             parsed = p.parse_args(rest)
             workspace = _resolve_workspace(parsed.dir)
             if parsed.prune:
                 return _run_sessions_prune(workspace, parsed.prune, parsed.yes)
+            if parsed.search:
+                storage = StorageManager(workspace)
+                hits = storage.search_sessions(
+                    parsed.search, limit=parsed.max_count or 10, include_archived=parsed.all
+                )
+                if parsed.json:
+                    payload = [
+                        {
+                            "id": h["session"].id,
+                            "title": h["session"].title,
+                            "score": h["score"],
+                            "snippet": h["snippet"],
+                        }
+                        for h in hits
+                    ]
+                    print(json.dumps(payload, ensure_ascii=False, indent=2))
+                    return 0
+                c = Console()
+                if not hits:
+                    c.print("[#808080]No matching sessions found.[/]")
+                    return 0
+                for h in hits:
+                    s = h["session"]
+                    c.print(f"[bold]{s.id}[/] ({h['score']}) — {markup_escape(s.title)}  [dim]{markup_escape(h['snippet'])}[/]")
+                return 0
             return _run_sessions_list(
                 workspace,
                 max_count=parsed.max_count,

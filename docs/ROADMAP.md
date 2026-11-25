@@ -26,7 +26,7 @@
 | Predictive Compaction (до запроса и внутри длинных циклов) | **Completed** | Подсчёт токенов промпта, tool-схем, памяти, diff и вложений; сжатие до 400 overflow и на длинных сериях tool-вызовов (`tests/test_fix_core.py`) |
 | Авто-память проекта (`.rbit/memory.md`) | **Completed** | Автоматическая выжимка фактов после хода с дедупликацией (`tests/test_app.py::test_append_project_memory_dedups`) |
 | Восстановление сессий после падений и ошибок API | **Completed** | Атомарная запись, восстановление незавершённых сессий при старте TUI, retry на 429/5xx и fallback при 401/404 |
-| Локальные embeddings для поиска по прошлым сессиям | **Planned** | Опциональный семантический поиск поверх `/search` |
+| Локальные embeddings / BM25 для поиска по прошлым сессиям | **Completed** | `StorageManager.search_sessions` (BM25 + опциональные `sentence-transformers` embeddings) и `rbit sessions --search <query>` (`tests/test_fix_core.py`) |
 
 ---
 

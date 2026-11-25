@@ -1354,3 +1354,29 @@ def test_browser_prompt_injection_sanitization_and_boundary() -> None:
     assert wrapped.startswith('<untrusted_web_content source="https://example.com">')
     assert wrapped.endswith("</untrusted_web_content>")
     assert "potential prompt-injection markers detected" in wrapped
+
+
+def test_storage_search_sessions_ranks_relevant_session(tmp_path: Path) -> None:
+    from rbit.models import ChatMessage, Session
+    from rbit.storage import StorageManager
+
+    storage = StorageManager(workspace=tmp_path)
+    storage.ensure_dirs()
+    s1 = Session(
+        id="s_auth",
+        title="Fix OAuth2 token refresh",
+        messages=[ChatMessage(id="m1", role="user", content="OAuth2 refresh token expired in auth.py")],
+    )
+    s2 = Session(
+        id="s_css",
+        title="Update sidebar colors",
+        messages=[ChatMessage(id="m2", role="user", content="Make sidebar border darker")],
+    )
+    storage.save_session(s1)
+    storage.save_session(s2)
+
+    hits = storage.search_sessions("OAuth2 refresh")
+    assert len(hits) == 1
+    assert hits[0]["session"].id == "s_auth"
+    assert hits[0]["score"] > 0
+    assert "OAuth2" in hits[0]["snippet"]
