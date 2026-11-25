@@ -4470,7 +4470,10 @@ class ToolExecutor:
         prefix = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;$OutputEncoding=[System.Text.Encoding]::UTF8;"
         if sandbox_root is not None:
             root = str(sandbox_root).replace("'", "''")
-            prefix += f"New-PSDrive -Name rbit -PSProvider FileSystem -Root '{root}' -Scope Global | Out-Null;Set-Location rbit:\\;"
+            prefix += (
+                f"New-PSDrive -Name rbit -PSProvider FileSystem -Root '{root}' -Scope Global | Out-Null;"
+                f"Set-Location rbit:\\;[Environment]::CurrentDirectory='{root}';"
+            )
         return ["powershell", "-NoProfile", "-NonInteractive", "-Command", prefix + command]
 
     def _config_or_empty(self) -> dict[str, Any]:
@@ -4509,9 +4512,16 @@ class ToolExecutor:
         cfg = self._config_or_empty()
         if sandbox.enabled(cfg):
             boxed_argv = self._shell_argv(command, self.workspace) or ["/bin/sh", "-c", command]
+            policy = sandbox.policy_for(cfg, self.workspace)
+            if os.name == "nt":
+                from dataclasses import replace as _dc_replace
+
+                sys32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+                if sys32.is_dir():
+                    policy = _dc_replace(policy, cwd=sys32)
             return await sandbox.spawn(
                 boxed_argv,
-                sandbox.policy_for(cfg, self.workspace),
+                policy,
                 stdin=False,
                 stdout=capture,
                 stderr="pipe" if capture else "null",
