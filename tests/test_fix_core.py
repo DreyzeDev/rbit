@@ -1380,3 +1380,25 @@ def test_storage_search_sessions_ranks_relevant_session(tmp_path: Path) -> None:
     assert hits[0]["session"].id == "s_auth"
     assert hits[0]["score"] > 0
     assert "OAuth2" in hits[0]["snippet"]
+
+
+def test_apply_live_route_policy_cheapest_respects_context_window() -> None:
+    from rbit.policy import Candidate
+    from rbit.router import apply_live_route
+
+    cfg = {"model_router": {"enabled": True, "policy": "cheapest"}}
+    candidates = [
+        Candidate(model="cheap-small", cost_per_1k=0.0001, context_window=4000, tools=True),
+        Candidate(model="cheap-large", cost_per_1k=0.0005, context_window=128_000, tools=True),
+        Candidate(model="pricey-large", cost_per_1k=0.015, context_window=200_000, tools=True),
+    ]
+    dec = apply_live_route(
+        "analyze repo",
+        "pricey-large",
+        cfg,
+        has_history=False,
+        candidates=candidates,
+        required_context=16_000,
+    )
+    assert dec.model == "cheap-large"
+    assert "cheapest" in dec.reason

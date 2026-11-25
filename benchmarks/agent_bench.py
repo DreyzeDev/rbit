@@ -77,6 +77,25 @@ SCENARIOS = {
             _msg("Typo fixed."),
         ],
     },
+    "long_horizon_12": {
+        "prompt": "Perform a 12-step inspection and update README.md.",
+        "steps": [
+            *[
+                _msg(
+                    f"step {i}",
+                    tool_calls=[
+                        {
+                            "id": f"lh_{i}",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": '{"filePath": "README.md"}'},
+                        }
+                    ],
+                )
+                for i in range(1, 12)
+            ],
+            _msg("Long-horizon 12-step task completed."),
+        ],
+    },
 }
 
 

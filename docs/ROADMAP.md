@@ -51,7 +51,7 @@
 | Linux Sandbox (namespaces + Landlock + seccomp + `pivot_root`) | **Completed** | Верифицировано на Linux / WSL2 kernel 6.18 (22/22 проверки; см. `docs/security/sandbox-audit.md`) |
 | Trust-модель проектных конфигов (`rbit trust`) и очистка env | **Completed** | Недоверенные `.rbit/config.json` не запускают код; секреты LLM вычищаются через `rbit/envscrub.py` |
 | Нативная проверка macOS (`sandbox-exec`) | **In Progress** | Профиль и unit-тесты готовы; требуется прогон на реальном Mac (`docs/security/macos-verification.md`) |
-| Независимый penetration test и public security report | **Planned** | Внешний аудит, regression-тесты на каждую находку и процесс responsible disclosure |
+| Независимый penetration test и public security report | **In Progress** | Обновлён `SECURITY.md` (responsible disclosure, SLA, scope); аудит `docs/security/sandbox-audit.md` |
 | Проверка происхождения плагинов (подпись / provenance) | **Planned** | Верификация источника при `rbit plugin add` / `update` |
 
 ---
@@ -63,7 +63,7 @@
 | Smart-роутер по сложности, тирам и `never_switch_mid_task` | **Completed** | Активен в `AgentEngine.run_turn` (`rbit/router.py`) |
 | Автопереключение при rate limit / outage (429/502/503/504/404) | **Completed** | `failover_candidates` в `rbit/router.py` и автоматический failover в `AgentEngine.run_turn` до fallback на `rbit/smart-local` |
 | Разные модели для Plan / Code / Review / Subagents | **Completed** | Поддержка `model_router.roles` (`plan`, `build`, `review`, `subagent`) в `rbit/router.py` (`tests/test_fix_core.py`) |
-| Роутинг по цене, скорости, качеству и размеру контекста | **In Progress** | Базовые политики `cheapest` / `best_value` / `balanced` и `check_capabilities` в `rbit/policy.py` |
+| Роутинг по цене, скорости, качеству и размеру контекста | **Completed** | Политики `cheapest` / `best_value` / `balanced`, `check_capabilities` и учёт `required_context` подключены в `apply_live_route` и `AgentEngine.run_turn` (`tests/test_fix_core.py`) |
 | Точный учёт стоимости всех запросов (включая фоновые) | **In Progress** | Единый `UsageLedger` и `BudgetGuard` (`tests/test_fix_budget.py`) |
 
 ---
@@ -74,7 +74,8 @@
 |---|---|---|
 | CI на Windows, Linux и macOS (`pytest` + `ruff` + `mypy`) | **Completed** | `.github/workflows/ci.yml` |
 | Интеграционные тесты длинных автономных задач и параллельных агентов | **Completed** | `tests/test_long_horizon.py` (14-шаговый цикл с mid-turn компакцией, параллельные субагенты с общим бюджетом) + `tests/test_fix_core.py`, `tests/test_app.py` |
-| Внешние бенчмарки (SWE-bench Verified, Terminal-Bench, Aider Polyglot) | **Planned** | В `benchmarks/agent_bench.py` есть базовый харнесс; интеграция публичных сьютов в планах |
+| Собственный Long-horizon benchmark | **Completed** | Сценарий `long_horizon_12` в `benchmarks/agent_bench.py` + `tests/test_long_horizon.py` |
+| Внешние бенчмарки (SWE-bench Verified, Terminal-Bench, Aider Polyglot) | **Planned** | Интеграция публичных сьютов поверх `benchmarks/agent_bench.py` |
 | Отдельный Security benchmark для Sandbox | **In Progress** | База в `rbit/sandbox/selftest.py` и `tests/test_sandbox_isolation.py` |
 
 ---

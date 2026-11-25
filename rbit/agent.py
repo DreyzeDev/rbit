@@ -763,14 +763,29 @@ class AgentEngine:
         # an explicit pin).
         routed_by_router = False
         if router_enabled(cfg):
+            from .policy import Candidate
+
             routed_by_router = True
             has_history = any(message is not user_msg for message in session.messages)
+            candidates = [
+                Candidate(
+                    model=m.id,
+                    cost_per_1k=float(m.cost_per_1k or 0.0),
+                    context_window=int(m.context_window or 128_000),
+                    tools=model_supports_tools(m.id, cfg),
+                )
+                for m in self.extra_models
+                if not m.is_local_smart
+            ]
+            req_ctx = self.estimate_request_tokens(session, user_msg=user_msg, agent_mode=agent_mode)
             decision = apply_live_route(
                 getattr(user_msg, "content", "") or "",
                 model_id,
                 cfg,
                 has_history=has_history,
                 role=agent_mode,
+                candidates=candidates or None,
+                required_context=req_ctx,
             )
             if decision.model and decision.model != model_id:
                 if on_status is not None:

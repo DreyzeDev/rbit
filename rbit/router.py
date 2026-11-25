@@ -316,6 +316,8 @@ def apply_live_route(
     available_models: list[str] | None = None,
     has_history: bool = True,
     role: str | None = None,
+    candidates: list[Candidate] | None = None,
+    required_context: int = 0,
 ) -> RoutingDecision:
     """Like `route`, but respects `never_switch_mid_task`.
 
@@ -328,7 +330,18 @@ def apply_live_route(
     keep = block.get("never_switch_mid_task")
     if keep is None:
         keep = True
-    decision = route(text, current_model, config, available_models, role=role)
+    policy = normalize_router_policy(block.get("policy"))
+    if candidates and policy != "balanced" and not role:
+        decision = route_with_policy(
+            text,
+            current_model,
+            config,
+            available_models=available_models,
+            candidates=candidates,
+            required_context=required_context,
+        )
+    else:
+        decision = route(text, current_model, config, available_models, role=role)
     if keep and has_history and not decision.pinned and decision.model != current_model:
         return RoutingDecision(
             model=current_model,
