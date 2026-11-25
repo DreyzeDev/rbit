@@ -2001,7 +2001,7 @@ class ToolExecutor:
                 duration_ms=int((time.perf_counter() - t0) * 1000),
             )
         notebook_mutation = name == "notebook" and str(args.get("action", "read")).lower() != "read"
-        if agent_mode == "plan" and (name in ("write", "edit", "multi_edit", "apply_patch") or notebook_mutation):
+        if agent_mode in ("ask", "plan", "review") and (name in ("write", "edit", "multi_edit", "apply_patch") or notebook_mutation):
             return ToolResult(
                 ok=False,
                 summary=f"{name} blocked in Plan mode",
@@ -2014,7 +2014,7 @@ class ToolExecutor:
             "remove",
             "delete",
         )
-        if schedule_mutation and (agent_mode == "plan" or self.session_readonly):
+        if schedule_mutation and (agent_mode in ("ask", "plan", "review") or self.session_readonly):
             why = "read-only session" if self.session_readonly else "Plan mode"
             return ToolResult(
                 ok=False,
@@ -3228,7 +3228,7 @@ class ToolExecutor:
 
         if sub in self._BISECT_MUTATING:
             # Bisect moves HEAD and rewrites refs: never in Plan or read-only sessions.
-            if agent_mode == "plan" or self.session_readonly:
+            if agent_mode in ("ask", "plan", "review") or self.session_readonly:
                 why = "read-only session" if self.session_readonly else "Plan mode"
                 return ToolResult(
                     False,
@@ -3441,7 +3441,7 @@ class ToolExecutor:
         path = self.resolve_path(raw)
         line = max(1, int(args.get("line") or 1))
         column = max(1, int(args.get("column") or 1))
-        if action == "rename" and (self.session_readonly or agent_mode == "plan"):
+        if action == "rename" and (self.session_readonly or agent_mode in ("ask", "plan", "review")):
             return ToolResult(False, "rename blocked", "LSP rename is disabled in read-only/Plan mode.")
         try:
             if action == "definition":
@@ -3548,7 +3548,7 @@ class ToolExecutor:
             if danger:
                 return ToolResult(False, "blocked: dangerous command", danger)
             readonly_cmd = is_readonly_bash_command(command)
-            if (agent_mode == "plan" or self.session_readonly) and not readonly_cmd:
+            if (agent_mode in ("ask", "plan", "review") or self.session_readonly) and not readonly_cmd:
                 return ToolResult(
                     False,
                     "blocked: read-only mode",
@@ -4422,7 +4422,7 @@ class ToolExecutor:
             )
 
         is_readonly = is_readonly_bash_command(command)
-        if agent_mode == "plan" and not is_readonly:
+        if agent_mode in ("ask", "plan", "review") and not is_readonly:
             return ToolResult(
                 False,
                 f"blocked in Plan mode: {command[:36]}",

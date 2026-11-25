@@ -56,7 +56,10 @@ async def test_long_horizon_multi_step_with_midturn_compaction(tmp_path: Path) -
                     {
                         "id": f"call_{step_counter['n']}",
                         "type": "function",
-                        "function": {"name": "read", "arguments": json.dumps({"filePath": "app.py"})},
+                        "function": {
+                            "name": "read",
+                            "arguments": json.dumps({"filePath": "app.py", "offset": step_counter["n"]}),
+                        },
                     }
                 ],
             )
@@ -204,3 +207,55 @@ async def test_autonomous_turn_recovers_from_tool_failure(tmp_path: Path) -> Non
     assert reply.tool_calls[1].status == "success"
     assert "X = 20" in (tmp_path / "target.py").read_text(encoding="utf-8")
     assert "Recovered" in reply.content
+
+
+@pytest.mark.asyncio
+async def test_repeat_loop_guard_breaks_identical_tool_cycle(tmp_path: Path) -> None:
+    """Prevents infinite loops when the model repeats the exact same tool call."""
+    (tmp_path / "a.py").write_text("A = 1\n", encoding="utf-8")
+    storage = StorageManager(workspace=tmp_path)
+    session = Session(id="s_loop", title="loop", messages=[])
+    user = ChatMessage(id="u1", role="user", content="loop test")
+    session.messages.append(user)
+    executor = ToolExecutor(workspace=tmp_path, session=session, storage=storage, get_config=lambda: {})
+    engine = AgentEngine(
+        workspace=tmp_path, executor=executor, get_config=lambda: {"api_key": "k", "max_steps": 20}, storage=storage
+    )
+
+    calls = {"n": 0}
+
+    async def stuck_step(**kwargs: Any) -> tuple[bool, str, list[dict[str, Any]]]:
+        calls["n"] += 1
+        return (
+            True,
+            "re-reading",
+            [{"id": f"c_{calls['n']}", "type": "function", "function": {"name": "read", "arguments": '{"filePath": "a.py"}'}}],
+        )
+
+    engine._non_stream_chat_step = stuck_step  # type: ignore[method-assign]
+
+    async def noop(*_a: Any, **_kw: Any) -> None:
+        return None
+
+    reply = await engine.run_turn(
+        session=session,
+        user_msg=user,
+        agent_mode="build",
+        model_id="openai/gpt-4o",
+        on_tool_start=noop,
+        on_tool_end=noop,
+        on_status=noop,
+        on_stream_chunk=None,
+    )
+    assert calls["n"] == 4
+    assert "Loop guard" in reply.content
+
+
+@pytest.mark.asyncio
+async def test_ask_and_review_modes_block_file_mutations(tmp_path: Path) -> None:
+    storage = StorageManager(workspace=tmp_path)
+    ex = ToolExecutor(workspace=tmp_path, session=Session(), storage=storage, get_config=lambda: {})
+    for mode in ("ask", "review"):
+        res = await ex.execute("write", {"filePath": "x.py", "content": "1"}, agent_mode=mode)
+        assert res.ok is False
+        assert not (tmp_path / "x.py").exists()

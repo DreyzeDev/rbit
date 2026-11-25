@@ -227,7 +227,7 @@ async def _run_headless(args: argparse.Namespace) -> int:
 
     model_id = args.model or cfg.get("model", "rbit/smart-local")
     agent_mode = args.agent or "build"
-    if agent_mode not in ("build", "plan"):
+    if agent_mode not in ("ask", "plan", "build", "debug", "review", "autopilot"):
         from rbit.subagents import load_subagents, subagent_names
 
         definitions = load_subagents(workspace, cfg)
@@ -2878,7 +2878,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-c", "--continue", dest="continue_last", action="store_true", help="Continue most recent session")
     parser.add_argument("-s", "--session", help="Resume specific session by ID")
     parser.add_argument("-m", "--model", help="Override active model ID")
-    parser.add_argument("-a", "--agent", choices=["build", "plan"], default="build", help="Initial agent mode")
+    parser.add_argument("-a", "--agent", choices=["ask", "plan", "build", "debug", "review", "autopilot"], default="build", help="Initial agent mode")
     parser.add_argument(
         "-e",
         "--effort",

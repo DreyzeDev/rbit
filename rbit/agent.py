@@ -1092,11 +1092,15 @@ class AgentEngine:
         on_thinking: ThinkingHook | None = None,
         on_reasoning_chunk: StreamHook | None = None,
     ) -> str:
-        mode_note = (
-            "PLAN MODE ACTIVE: Do NOT modify files (`write`/`edit`/`multi_edit`/`apply_patch` disabled). Read code, analyze, and create a plan + `todowrite`."
-            if agent_mode == "plan"
-            else "BUILD MODE ACTIVE: Full access to read, search, edit/write files, fetch URLs, run commands, and manage todos."
-        )
+        _mode_notes = {
+            "ask": "ASK MODE ACTIVE: Answer questions and analyze code using read-only tools only. Do NOT modify files or run mutating commands.",
+            "plan": "PLAN MODE ACTIVE: Do NOT modify files (`write`/`edit`/`multi_edit`/`apply_patch` disabled). Read code, analyze, and create a plan + `todowrite`.",
+            "review": "REVIEW MODE ACTIVE: Read-only code review. Inspect diffs, code, and tests; report bugs, security risks, and regressions with file:line references. Do NOT modify files.",
+            "debug": "DEBUG MODE ACTIVE: Reproduce the bug first, inspect logs/diagnostics/tests, isolate root cause, apply minimal fix, and verify with tests.",
+            "autopilot": "AUTOPILOT MODE ACTIVE: Plan with `todowrite`, implement changes, run tests (`pytest`/`npm test`/etc.), fix failures, and verify before reporting completion. Respect all sandbox and budget limits.",
+            "build": "BUILD MODE ACTIVE: Full access to read, search, edit/write files, fetch URLs, run commands, and manage todos.",
+        }
+        mode_note = _mode_notes.get(agent_mode.lower(), _mode_notes["build"])
         project_mem = self.storage.load_project_memory()
         memory_section = f"\nProject Rules & Memory:\n{project_mem}\n" if project_mem else ""
         rules_text = await load_rules(self.workspace, self.get_config())
@@ -1265,6 +1269,8 @@ class AgentEngine:
             nonlocal spent_usd
             await on_status(f"Запрос к {model_id}...")
             step_texts: list[str] = []
+            last_call_sig = ""
+            repeat_streak = 0
 
             async def cumulative_chunk(partial: str) -> None:
                 # The app renders ONE live card per turn: feed it the text of
@@ -1351,6 +1357,27 @@ class AgentEngine:
 
                 if content and content.strip():
                     step_texts.append(content)
+
+                call_sig = json.dumps(
+                    [
+                        (
+                            (tc.get("function") or {}).get("name", ""),
+                            (tc.get("function") or {}).get("arguments", ""),
+                        )
+                        for tc in tool_calls
+                    ],
+                    sort_keys=True,
+                )
+                if call_sig == last_call_sig:
+                    repeat_streak += 1
+                else:
+                    last_call_sig = call_sig
+                    repeat_streak = 1
+                if repeat_streak >= 4:
+                    parts = [*step_texts, content] if content and content.strip() else list(step_texts)
+                    full = "\n\n".join(p for p in parts if p and p.strip())
+                    note = "\n\n[Loop guard] Stopped after 4 identical consecutive tool-call steps."
+                    return (full + note) if full else note.strip()
 
                 self._ensure_call_ids(tool_calls)
                 api_messages.append(
