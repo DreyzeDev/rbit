@@ -1060,3 +1060,77 @@ def test_daily_budget_resets_at_local_midnight(tmp_path: Path, monkeypatch: pyte
         assert allowed is True  # a fresh day starts with a fresh budget
     finally:
         _FakeClock.local = datetime(2026, 11, 22, 0, 30)
+
+
+@pytest.mark.asyncio
+async def test_predictive_compact_triggers_before_overflow_and_keeps_pinned(tmp_path: Path) -> None:
+    from rbit.agent import AgentEngine
+    from rbit.models import ChatMessage, ModelInfo, Session
+    from rbit.storage import StorageManager
+    from rbit.tools import ToolExecutor
+
+    storage = StorageManager(workspace=tmp_path)
+    storage.ensure_dirs()
+    session = Session(id="s1", title="t", messages=[])
+    executor = ToolExecutor(workspace=tmp_path, session=session, storage=storage, get_config=lambda: {})
+    engine = AgentEngine(
+        workspace=tmp_path,
+        executor=executor,
+        get_config=lambda: {"auto_compact": True, "auto_compact_at": 85},
+        storage=storage,
+    )
+    engine.extra_models = [ModelInfo(id="tiny/model", name="Tiny", provider="test", context_window=2000)]
+
+    for i in range(6):
+        session.messages.append(
+            ChatMessage(
+                id=f"m{i}",
+                role="user" if i % 2 == 0 else "assistant",
+                content=("token padding " * 80) + f"#{i}",
+                pinned=(i == 1),
+            )
+        )
+
+    async def fake_summarize(messages, model_id):
+        return f"summary of {len(messages)} msgs"
+
+    engine.summarize_session = fake_summarize  # type: ignore[method-assign]
+    statuses: list[str] = []
+
+    async def on_status(msg: str) -> None:
+        statuses.append(msg)
+
+    compacted = await engine.predictive_compact(session, "tiny/model", on_status=on_status)
+    assert compacted is True
+    assert any("Предиктивная компакция" in s for s in statuses)
+    assert session.messages[0].content.startswith("**[Compacted]** 4 message(s)")
+    assert any(m.id == "m1" and m.pinned for m in session.messages)
+    assert [m.id for m in session.messages[-2:]] == ["m4", "m5"]
+
+
+@pytest.mark.asyncio
+async def test_predictive_compact_skips_when_under_threshold_or_disabled(tmp_path: Path) -> None:
+    from rbit.agent import AgentEngine
+    from rbit.models import ChatMessage, ModelInfo, Session
+    from rbit.storage import StorageManager
+    from rbit.tools import ToolExecutor
+
+    storage = StorageManager(workspace=tmp_path)
+    session = Session(
+        id="s2",
+        title="t",
+        messages=[ChatMessage(id=f"m{i}", role="user", content="hi") for i in range(5)],
+    )
+    executor = ToolExecutor(workspace=tmp_path, session=session, storage=storage, get_config=lambda: {})
+    engine = AgentEngine(
+        workspace=tmp_path,
+        executor=executor,
+        get_config=lambda: {"auto_compact": True, "auto_compact_at": 85},
+        storage=storage,
+    )
+    engine.extra_models = [ModelInfo(id="huge/model", name="Huge", provider="test", context_window=128_000)]
+
+    assert await engine.predictive_compact(session, "huge/model") is False
+
+    engine.get_config = lambda: {"auto_compact": False, "auto_compact_at": 1}  # type: ignore[method-assign]
+    assert await engine.predictive_compact(session, "huge/model") is False

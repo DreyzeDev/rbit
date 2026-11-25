@@ -3325,8 +3325,11 @@ class RbitApp(App[None]):
             # because the conversation no longer fits, compact once and retry.
             compact_retried = False
             while True:
+                msg_count_before = len(session.messages)
                 try:
                     reply = await run_engine_once(user_msg)
+                    if len(session.messages) < msg_count_before:
+                        self._rebuild_chat_view()
                     break
                 except Exception as exc:
                     if compact_retried or not self.config_data.get("auto_compact", True):

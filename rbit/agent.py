@@ -871,6 +871,15 @@ class AgentEngine:
             protocol in ("gemini", "google") or "generativelanguage.googleapis.com" in effective_base
         )
 
+        if use_remote:
+            await self.predictive_compact(
+                session,
+                model_id,
+                agent_mode=agent_mode,
+                user_msg=user_msg,
+                on_status=on_status,
+            )
+
         if native_gemini:
             content = await self._run_gemini_compatible(
                 session=session,
@@ -2919,6 +2928,77 @@ class AgentEngine:
         except Exception:
             logger.debug("memory generation failed", exc_info=True)
             return []
+
+    def estimate_request_tokens(
+        self,
+        session: Session,
+        user_msg: ChatMessage | None = None,
+        agent_mode: str = "build",
+    ) -> int:
+        """Estimates total prompt + history tokens before sending an LLM request."""
+        total = count_tokens(SYSTEM_PROMPT_TEMPLATE)
+        project_mem = self.storage.load_project_memory()
+        if project_mem:
+            total += count_tokens(project_mem)
+        messages = list(session.messages)
+        if user_msg is not None and not any(m is user_msg for m in messages):
+            messages.append(user_msg)
+        for m in messages:
+            total += 4 + count_tokens(m.content or "")
+            for tc in m.tool_calls:
+                total += count_tokens(tc.name)
+                try:
+                    total += count_tokens(json.dumps(tc.arguments, ensure_ascii=False))
+                except (TypeError, ValueError):
+                    pass
+                total += count_tokens((tc.output or "")[:TOOL_HISTORY_CHARS])
+                if tc.diff:
+                    total += count_tokens(tc.diff[:TOOL_HISTORY_CHARS])
+            for att in m.attachments:
+                suffix = Path(att.split(":", 1)[0]).suffix.lower()
+                total += IMAGE_TOKENS if suffix in (".png", ".jpg", ".jpeg", ".webp", ".gif") else 200
+        return total
+
+    async def predictive_compact(
+        self,
+        session: Session,
+        model_id: str,
+        *,
+        agent_mode: str = "build",
+        user_msg: ChatMessage | None = None,
+        on_status: StatusHook | None = None,
+    ) -> bool:
+        """Compacts older session messages before an API call when near context_window."""
+        cfg = self.get_config()
+        if not cfg.get("auto_compact", True):
+            return False
+        if len(session.messages) < 4:
+            return False
+        info = get_model_info(model_id, self.extra_models)
+        if not info.context_window:
+            return False
+        threshold = int(cfg.get("auto_compact_at", 85))
+        estimated = self.estimate_request_tokens(session, user_msg=user_msg, agent_mode=agent_mode)
+        if estimated / info.context_window * 100 < threshold:
+            return False
+        older = list(session.messages[:-2])
+        if not older:
+            return False
+        if on_status is not None:
+            await on_status(f"Предиктивная компакция ({estimated}/{info.context_window} токенов)...")
+        pinned_older = [m for m in older if m.pinned]
+        summary_text = await self.summarize_session(older, model_id)
+        summary_msg = ChatMessage(
+            id=short_id(),
+            role="assistant",
+            content=f"**[Compacted]** {len(older)} message(s) → handoff summary\n\n{summary_text}",
+            agent=agent_mode,
+            model=model_id,
+            tokens=max(24, count_tokens(summary_text)),
+        )
+        session.messages = [summary_msg, *pinned_older, *session.messages[-2:]]
+        self.storage.save_session(session)
+        return True
 
     async def summarize_session(self, messages: list[ChatMessage], model_id: str) -> str:
         """Summarizes older messages via the active LLM, with a deterministic fallback."""
