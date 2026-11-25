@@ -4470,10 +4470,7 @@ class ToolExecutor:
         prefix = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;$OutputEncoding=[System.Text.Encoding]::UTF8;"
         if sandbox_root is not None:
             root = str(sandbox_root).replace("'", "''")
-            prefix += (
-                f"if (Get-Command New-PSDrive -ErrorAction SilentlyContinue) "
-                f"{{ New-PSDrive -Name rbit -PSProvider FileSystem -Root '{root}' -Scope Global | Out-Null; Set-Location rbit:\\ }};"
-            )
+            prefix += f"New-PSDrive -Name rbit -PSProvider FileSystem -Root '{root}' -Scope Global | Out-Null;Set-Location rbit:\\;"
         return ["powershell", "-NoProfile", "-NonInteractive", "-Command", prefix + command]
 
     def _config_or_empty(self) -> dict[str, Any]:

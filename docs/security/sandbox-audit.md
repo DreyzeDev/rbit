@@ -104,3 +104,26 @@ python -m pytest tests/test_sandbox_isolation.py
 
 The auditors' scripts and raw evidence (`results.jsonl`, evidence JSON, attack drivers) are kept
 outside the repository next to the working session; ask for them if you want to re-run the campaign.
+
+
+---
+
+## 2026-11-26 Multi-OS Re-Test & Red-Team Summary
+
+Automated re-verification after hardening macOS Seatbelt (`rbit/sandbox/macos.py`), Linux `bwrap` fallback (`rbit/sandbox/linux.py`), symlink escape checks (`rbit/sandbox/selftest.py`), full-tree plugin provenance (`rbit/install.py`), and atomic subagent budget reservation (`rbit/agent.py`):
+
+| OS / Environment | Backend | `rbit sandbox check` | Isolation & Core Tests | Known Findings / Notes |
+|---|---|---|---|---|
+| **Windows 11** (local host) | AppContainer + Job Object | **15 / 15 PASS** | `tests/test_sandbox_isolation.py`: **32 passed, 1 skipped** (symlink test skipped when unprivileged symlink creation is disabled) | `New-PSDrive` works when temp/workspace are on `C:`; on Windows Server 2022 CI (`D:\` temp), `powershell.exe` `FileSystem` provider hits `DriveNotFound` while direct `rbit sandbox check` passes 15/15 |
+| **macOS arm64** (`macos-latest` CI) | Seatbelt (`sandbox-exec`) | **14 / 14 PASS** (after fixing `/private/var/folders`, `HOME` read, `.rbit` read, `.git/hooks`, symlink escape) | `smoke (macos-latest)` **GREEN** (`test_fix_core`, `test_long_horizon`, `test_fix_sandbox`, `test_sandbox_isolation`) | First CI run exposed 4 bypasses (9/13); all 4 closed in `f81b540` + `fb6e38b` |
+| **Linux** (`ubuntu-latest` CI, Ubuntu 24.04) | `bwrap` fallback (AppArmor restricts unprivileged `userns` for custom `_linux_exec.py`) | **PASS** (with `.rbit` tmpfs & `.git/hooks` ro-bind added in `48e4b6e`) | `test (3.10, 3.11, 3.12)`: **825+ passed**, `ruff` + `mypy` **GREEN** | Full Landlock + `pivot_root` + `seccomp` (`AF_VSOCK`, abstract unix sockets) verified on WSL2 kernel 6.18 (22/22); `bwrap` fallback on Ubuntu 24.04 cannot install `seccomp` or `pivot_root` |
+
+### Attack Vectors Tested & Blocked
+- **Outside workspace read/write**: Blocked on Windows 11, macOS (`sandbox-exec`), and Linux (`landlock` / `bwrap`).
+- **Workspace symlink escape (`workspace/escape -> ../outside/secret.txt`)**: Blocked on macOS and Linux (`selftest.py`).
+- **Project state tampering (`.rbit/config.json`) & `.git/hooks` planting**: Read and write blocked on Windows 11, macOS, and Linux (`landlock` + `bwrap`).
+- **Credential & env leak (`~/.rbit`, `~/.ssh`, `RBIT_SANDBOX_CANARY`, LLM API keys)**: Blocked and scrubbed via `envscrub.py`.
+- **Network & loopback escape**: Blocked on Windows 11, macOS, and Linux.
+- **Prompt injection (Browser / `webfetch` / GitHub Issues & PRs)**: Stripped zero-width characters, flagged injection directives, and fenced inside `<untrusted_web_content>`.
+- **Plugin code tampering**: Full-tree SHA-256 digest (`_plugin_manifest_digest` in `rbit/install.py`) detects modifications to any `.py` or manifest file after install.
+- **Concurrent subagent budget overspend**: Prevented via `asyncio.Lock` atomic reservation (`_run_subagent` in `rbit/agent.py`).
