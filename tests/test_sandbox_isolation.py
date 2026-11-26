@@ -784,3 +784,65 @@ async def test_adversarial_path_traversal_cannot_read_outside(tmp_path: Path) ->
     assert not res.ok
     assert SECRET not in res.output
     assert "outside" in res.output.lower() or "denied" in res.output.lower() or "sandbox" in res.output.lower() or "error" in res.output.lower()
+
+
+@pytest.mark.asyncio
+async def test_adversarial_junction_or_symlink_cannot_read_outside(tmp_path: Path) -> None:
+    import os
+    import subprocess
+
+    workspace = tmp_path / "ws"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text(SECRET, encoding="utf-8")
+    link_dir = workspace / "escape_link"
+
+    if sys.platform == "win32":
+        proc = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link_dir), str(outside)],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            pytest.skip("Windows junction creation unavailable")
+    else:
+        try:
+            os.symlink(outside, link_dir)
+        except OSError:
+            pytest.skip("Symlink creation unavailable")
+
+    ex = ToolExecutor(
+        workspace=workspace,
+        session=Session(),
+        get_config=lambda: {"shell_sandbox": "strict"},
+    )
+    res = await ex.execute("read", {"path": "escape_link/secret.txt"})
+    assert not res.ok
+    assert SECRET not in res.output
+
+
+@needs_backend
+@pytest.mark.asyncio
+async def test_adversarial_nested_subprocess_cannot_read_outside(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    secret_file = outside / "secret.txt"
+    secret_file.write_text(SECRET, encoding="utf-8")
+
+    ex = ToolExecutor(
+        workspace=workspace,
+        session=Session(),
+        get_config=lambda: {"shell_sandbox": "strict"},
+    )
+    ex.always_allow_bash = True
+    nested_code = (
+        f"import subprocess, sys; "
+        f"p = subprocess.run([sys.executable, '-c', \"print(open(r'{secret_file}').read())\"], capture_output=True, text=True); "
+        f"print(p.stdout, p.stderr)"
+    )
+    cmd = f'& "{sys.executable}" -c "{nested_code}"' if sys.platform == "win32" else f'"{sys.executable}" -c "{nested_code}"'
+    res = await ex.execute("bash", {"command": cmd})
+    assert SECRET not in res.output

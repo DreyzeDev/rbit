@@ -829,7 +829,11 @@ class RbitApp(App[None]):
         self._check_event_loop_lag()
         if self.is_busy:
             self._spin_frame += 1
-            self.query_one(PromptSubHints).update_state(
+            try:
+                hints = self.query_one(PromptSubHints)
+            except Exception:
+                return
+            hints.update_state(
                 busy=True,
                 status=self._busy_status_display,
                 mode=self.agent_mode,
