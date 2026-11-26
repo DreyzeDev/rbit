@@ -657,6 +657,30 @@ class StorageManager:
         # An ambiguous prefix must not silently pick "the first" session.
         return matches[0] if len(matches) == 1 else None
 
+    def save_autopilot_state(self, session_id: str, state: dict[str, Any]) -> None:
+        """Atomically persists autopilot progress for crash/restart resume."""
+        sid = (session_id or "").strip()
+        if not _SAFE_ID_RE.match(sid):
+            return
+        ap_dir = self.state_dir / "autopilot"
+        ap_dir.mkdir(parents=True, exist_ok=True)
+        payload = {**state, "session_id": sid, "updated_at": time.time()}
+        self._atomic_write_json(ap_dir / f"{sid}.json", json.dumps(payload, ensure_ascii=False, indent=2))
+
+    def load_autopilot_state(self, session_id: str) -> dict[str, Any] | None:
+        """Loads saved autopilot progress for `session_id`, or None if absent/invalid."""
+        sid = (session_id or "").strip()
+        if not _SAFE_ID_RE.match(sid):
+            return None
+        path = self.state_dir / "autopilot" / f"{sid}.json"
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
     def search_sessions(
         self,
         query: str,

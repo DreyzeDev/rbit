@@ -812,6 +812,32 @@ class AgentEngine:
         self._turn_subagent_count = 0
         self._turn_subagent_files: dict[str, str] = {}
         self._subagent_budget_lock = asyncio.Lock()
+        self._autopilot_resume_note = ""
+        if agent_mode == "autopilot" and getattr(session, "id", ""):
+            prior_ap = self.storage.load_autopilot_state(session.id)
+            if prior_ap and prior_ap.get("status") in ("running", "paused"):
+                todos_txt = ", ".join(
+                    f"[{t.get('status', 'pending')}] {t.get('content', '')}"
+                    for t in (prior_ap.get("todos") or [])[:12]
+                    if isinstance(t, dict)
+                )
+                self._autopilot_resume_note = (
+                    "\n\n[Autopilot Resume Context]\n"
+                    f"- Previous goal: {prior_ap.get('goal', '')}\n"
+                    f"- Previous status: {prior_ap.get('status')}\n"
+                    + (f"- Last error: {prior_ap.get('last_error')}\n" if prior_ap.get("last_error") else "")
+                    + (f"- Saved todos: {todos_txt}\n" if todos_txt else "")
+                    + "Continue from the saved progress without repeating completed steps."
+                )
+            self.storage.save_autopilot_state(
+                session.id,
+                {
+                    "goal": (getattr(user_msg, "content", "") or "")[:400],
+                    "status": "running",
+                    "todos": [t.to_dict() if hasattr(t, "to_dict") else t for t in (session.todos or [])],
+                    "modified_files": sorted(session.modified_files.keys()),
+                },
+            )
         self._step_usage = None
         model_info = get_model_info(model_id, self.extra_models)
         api_key = self.storage.resolve_api_key(cfg).strip()
@@ -946,25 +972,39 @@ class AgentEngine:
                 on_reasoning_chunk=on_reasoning_chunk,
             )
 
-        if use_remote:
-            await self.predictive_compact(
-                session,
-                model_id,
-                agent_mode=agent_mode,
-                user_msg=user_msg,
-                on_status=on_status,
-            )
-            content = await _dispatch_remote(model_id)
-        else:
-            if not model_info.is_local_smart and not api_key:
-                await on_status("API-ключ не задан — используется встроенный Smart-агент (/connect для API)")
-            content = await self._run_smart_local_agent(
-                session=session,
-                user_msg=user_msg,
-                agent_mode=agent_mode,
-                invoke_tool=invoke_tool,
-                on_status=on_status,
-            )
+        try:
+            if use_remote:
+                await self.predictive_compact(
+                    session,
+                    model_id,
+                    agent_mode=agent_mode,
+                    user_msg=user_msg,
+                    on_status=on_status,
+                )
+                content = await _dispatch_remote(model_id)
+            else:
+                if not model_info.is_local_smart and not api_key:
+                    await on_status("API-ключ не задан — используется встроенный Smart-агент (/connect для API)")
+                content = await self._run_smart_local_agent(
+                    session=session,
+                    user_msg=user_msg,
+                    agent_mode=agent_mode,
+                    invoke_tool=invoke_tool,
+                    on_status=on_status,
+                )
+        except Exception as exc:
+            if agent_mode == "autopilot" and getattr(session, "id", ""):
+                self.storage.save_autopilot_state(
+                    session.id,
+                    {
+                        "goal": (getattr(user_msg, "content", "") or "")[:400],
+                        "status": "paused",
+                        "last_error": f"{type(exc).__name__}: {exc}",
+                        "todos": [t.to_dict() if hasattr(t, "to_dict") else t for t in (session.todos or [])],
+                        "modified_files": sorted(session.modified_files.keys()),
+                    },
+                )
+            raise
 
         mutated_tools = {"write", "edit", "multi_edit", "apply_patch"}
         already_wrote = any(
@@ -1027,6 +1067,17 @@ class AgentEngine:
                     f"({new_pct * 100:.0f}% used)"
                 )
         self._record_usage(model_id, tokens_est, elapsed, session)
+        if agent_mode == "autopilot" and getattr(session, "id", ""):
+            self.storage.save_autopilot_state(
+                session.id,
+                {
+                    "goal": (getattr(user_msg, "content", "") or "")[:400],
+                    "status": "completed",
+                    "todos": [t.to_dict() if hasattr(t, "to_dict") else t for t in (session.todos or [])],
+                    "modified_files": sorted(session.modified_files.keys()),
+                    "tool_calls": len(tool_records),
+                },
+            )
         return ChatMessage(
             id=short_id(),
             role="assistant",
@@ -1153,6 +1204,8 @@ class AgentEngine:
             system_text += f"\n\n{custom_agent_prompt}"
         if self._auto_design_section:
             system_text += self._auto_design_section
+        if getattr(self, "_autopilot_resume_note", ""):
+            system_text += self._autopilot_resume_note
         api_messages[0]["content"] = system_text
 
         units: list[list[dict[str, Any]]] = []
@@ -2765,7 +2818,14 @@ class AgentEngine:
                                 files_map = {}
                                 self._turn_subagent_files = files_map
                             sub_tag = f"{definition.name}:{id(messages)}"
-                            owner = files_map.get(rel_fp)
+                            lock = getattr(self, "_subagent_budget_lock", None)
+                            if lock is None:
+                                lock = asyncio.Lock()
+                                self._subagent_budget_lock = lock
+                            async with lock:
+                                owner = files_map.get(rel_fp)
+                                if owner is None:
+                                    files_map[rel_fp] = sub_tag
                             if owner is not None and owner != sub_tag:
                                 messages.append(
                                     {
@@ -2779,7 +2839,6 @@ class AgentEngine:
                                     }
                                 )
                                 continue
-                            files_map[rel_fp] = sub_tag
                     res = await self.executor.execute(
                         fn_name,
                         parsed_args,
