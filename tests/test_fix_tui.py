@@ -767,7 +767,10 @@ async def test_toasts_show_bracketed_text_literally(workspace: Path) -> None:
     """`Skill not found: [name]` used to show "Skill not found: ": Textual read `[name]` as markup."""
     app = RbitApp(workspace=workspace)
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.pause(0.2)
+        for _ in range(30):
+            await pilot.pause(0.05)
+            if app.query("PromptSubHints"):
+                break
         app.notify("Skill not found: [name]  Bad: '[red]x'  Macro: C:\m\[/oops]", severity="warning", timeout=30)
         await pilot.pause(0.2)
         toast = next(n for n in app._notifications if n.message.startswith("Skill not found"))
@@ -794,7 +797,10 @@ async def test_retry_resends_the_users_prompt_not_the_auto_self_check_followup(w
     """After a self-check the last user message is the app's own "[auto] ..." text; /retry reran that."""
     app = RbitApp(workspace=workspace)
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.pause(0.2)
+        for _ in range(30):
+            await pilot.pause(0.05)
+            if app.query("PromptSubHints"):
+                break
         sent: list[ChatMessage] = []
         app._execute_agent_turn = lambda msg: sent.append(msg)  # type: ignore[method-assign,assignment]
         app.session.messages = [
@@ -847,7 +853,10 @@ def test_undo_turn_skips_a_conflicting_file_and_still_restores_the_rest(tmp_path
 async def test_new_session_forgets_the_previous_sessions_undo_history(workspace: Path) -> None:
     app = RbitApp(workspace=workspace)
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.pause(0.2)
+        for _ in range(30):
+            await pilot.pause(0.05)
+            if app.query("PromptSubHints"):
+                break
         target = workspace / "x.txt"
         target.write_text("1\n", encoding="utf-8")
         app.executor._push_snapshot("edit x", target, True, "0\n", "1\n", b"0\n")
@@ -862,7 +871,10 @@ async def test_new_session_forgets_the_previous_sessions_undo_history(workspace:
 async def test_clear_chat_is_saved(workspace: Path) -> None:
     app = RbitApp(workspace=workspace)
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.pause(0.2)
+        for _ in range(30):
+            await pilot.pause(0.05)
+            if app.query("PromptSubHints"):
+                break
         app.session.messages = [ChatMessage(id="u1", role="user", content="hi")]
         app.storage.save_session(app.session)
         app.action_clear_chat()
@@ -875,7 +887,10 @@ async def test_bang_command_typed_while_busy_stays_in_the_input(workspace: Path)
     """`!pytest` pressed during a turn only said "busy" and the typed command was lost."""
     app = RbitApp(workspace=workspace)
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.pause(0.2)
+        for _ in range(30):
+            await pilot.pause(0.05)
+            if app.query("PromptSubHints"):
+                break
         app.is_busy = True
         inp = app.query_one("#prompt-input", Input)
         inp.focus()
@@ -890,7 +905,10 @@ async def test_bang_command_typed_while_busy_stays_in_the_input(workspace: Path)
 async def test_cost_notice_has_no_literal_markdown_asterisks(workspace: Path) -> None:
     app = RbitApp(workspace=workspace)
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.pause(0.2)
+        for _ in range(30):
+            await pilot.pause(0.05)
+            if app.query("PromptSubHints"):
+                break
         app._cmd_info("/cost")
         await pilot.pause(0.1)
         notices = [str(w.render()) for w in app.query(".system-notice")]
