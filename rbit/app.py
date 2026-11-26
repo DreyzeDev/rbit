@@ -808,7 +808,10 @@ class RbitApp(App[None]):
     async def _discover_models(self, force: bool = False) -> None:
         await self.engine.auto_discover_models(self.config_data, force=force)
         self._persist_provider_models()
-        screen = self.screen
+        try:
+            screen = self.screen
+        except Exception:
+            return
         if isinstance(screen, ModelSelectorModal) and screen.accepts_model_refresh:
             screen.refresh_models(self.engine.extra_models)
         self._sync_ui()
@@ -2340,6 +2343,8 @@ class RbitApp(App[None]):
         self._live_card = None
         if live_card is not None:
             await live_card.finalize(reply)
+            if scroll.children and scroll.children[-1] is not live_card:
+                scroll.move_child(live_card, after=scroll.children[-1])
         else:
             await scroll.mount(AssistantMessageCard(reply, self.engine.extra_models))
 

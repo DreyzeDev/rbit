@@ -1078,12 +1078,22 @@ class AgentEngine:
                 )
         self._record_usage(model_id, tokens_est, elapsed, session)
         if agent_mode == "autopilot" and getattr(session, "id", ""):
+            todo_dicts = [t.to_dict() if hasattr(t, "to_dict") else t for t in (session.todos or [])]
+            has_open_todos = any(
+                isinstance(td, dict) and td.get("status") in ("pending", "in_progress")
+                for td in todo_dicts
+            )
+            blocked_reply = content.lstrip().startswith(
+                ("**[Loop guard]**", "**[Budget guard]**", "**[Fallback]**", "**[Provider error]**", "**[Error]**")
+            )
+            ap_status = "incomplete" if (has_open_todos or blocked_reply) else "completed"
             self.storage.save_autopilot_state(
                 session.id,
                 {
                     "goal": (getattr(user_msg, "content", "") or "")[:400],
-                    "status": "completed",
-                    "todos": [t.to_dict() if hasattr(t, "to_dict") else t for t in (session.todos or [])],
+                    "status": ap_status,
+                    "finished": ap_status == "completed",
+                    "todos": todo_dicts,
                     "modified_files": sorted(session.modified_files.keys()),
                     "tool_calls": len(tool_records),
                 },
@@ -1494,7 +1504,9 @@ class AgentEngine:
                         "Увеличьте `max_cost_usd` в конфиге, чтобы продолжить."
                     )
 
-            return f"Достигнут лимит шагов вызова инструментов ({max_steps})."
+            notice = f"**[Max steps]** Достигнут лимит шагов вызова инструментов ({max_steps})."
+            parts = [*step_texts, notice]
+            return "\n\n".join(p for p in parts if p and p.strip())
 
         try:
             if self.http_client is not None:

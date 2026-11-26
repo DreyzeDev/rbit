@@ -298,7 +298,8 @@ class StorageManager:
                 loaded = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
                 if not isinstance(loaded, dict):
                     raise ValueError("config.json must contain a JSON object")
-                if not trust_all_requested():
+                is_home_config = self.workspace.resolve() == Path.home().resolve()
+                if not trust_all_requested() and not is_home_config:
                     # A cloned repository's config may not start programs or widen permissions
                     # until the user trusts those settings.
                     loaded, self.untrusted_keys = split_config(

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from rbit.agent import AgentEngine
-from rbit.models import ChatMessage, Session, ToolCallRecord, short_id
+from rbit.models import ChatMessage, Session, ToolCallRecord, get_model_info, short_id
 from rbit.storage import StorageManager
 from rbit.tools import MUTATING_TOOLS, ToolExecutor
 
@@ -83,9 +83,47 @@ class SoakTaskResult:
     verify_output: str
     llm_requests: int
     tool_calls: int
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cost_usd: float = 0.0
+    retries: int = 0
+    agent_claimed_success: bool = False
+    false_success_claim: bool = False
     mutated_files: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     reply_preview: str = ""
+
+
+def _claims_success(reply_text: str) -> bool:
+    """Heuristic: detect whether an agent reply claims the task succeeded."""
+    low = (reply_text or "").lower()
+    if not low.strip():
+        return False
+    neg_markers = (
+        "не выполн",
+        "не удал",
+        "cannot",
+        "failed",
+        "unable to",
+        "incomplete",
+        "**[loop guard]**",
+        "**[budget guard]**",
+        "**[fallback]**",
+        "**[provider error]**",
+    )
+    if any(m in low for m in neg_markers):
+        return False
+    pos_markers = (
+        "готово",
+        "успешно",
+        "выполнено",
+        "all tests pass",
+        "passed",
+        "completed",
+        "success",
+    )
+    return any(m in low for m in pos_markers)
 
 
 def load_soak_tasks(path: Path) -> list[SoakTask]:
@@ -231,6 +269,13 @@ class AutopilotSoakRunner:
         passed_count = sum(1 for r in results if r.verify_passed)
         total_count = len(results)
         success_rate = round((passed_count / total_count * 100.0) if total_count else 0.0, 1)
+        total_in = sum(r.input_tokens for r in results)
+        total_out = sum(r.output_tokens for r in results)
+        total_tok = sum(r.total_tokens for r in results)
+        total_cost = round(sum(r.cost_usd for r in results), 6)
+        total_retries = sum(r.retries for r in results)
+        total_errors = sum(len(r.errors) for r in results)
+        false_claims = sum(1 for r in results if r.false_success_claim)
 
         summary: dict[str, Any] = {
             "started_at": started_iso,
@@ -244,6 +289,13 @@ class AutopilotSoakRunner:
             "tasks_passed": passed_count,
             "tasks_failed": total_count - passed_count,
             "success_rate_pct": success_rate,
+            "input_tokens": total_in,
+            "output_tokens": total_out,
+            "total_tokens": total_tok,
+            "cost_usd": total_cost,
+            "total_retries": total_retries,
+            "total_errors": total_errors,
+            "false_success_claims": false_claims,
             "event_counts": dict(self.trace.counts),
             "trace_path": str(self.trace.path),
             "results": [asdict(r) for r in results],
@@ -281,15 +333,17 @@ class AutopilotSoakRunner:
 
         llm_requests = 0
         tool_calls = 0
+        retries = 0
         mutated_files: list[str] = []
         errors: list[str] = []
 
         def on_trace(ev: dict[str, Any]) -> None:
-            nonlocal llm_requests
+            nonlocal llm_requests, retries
             ev_name = str(ev.pop("event", "trace"))
             if ev_name == "llm_request":
                 llm_requests += 1
             if ev_name == "llm_response" and not ev.get("ok", True):
+                retries += 1
                 errors.append(str(ev.get("content_preview") or "llm_response error"))
             self.trace.emit(ev_name, task_id=task.id, **ev)
 
@@ -332,6 +386,9 @@ class AutopilotSoakRunner:
                 errors.append(f"{rec.name}: {str(rec.summary or '')[:200]}")
 
         async def on_status(txt: str) -> None:
+            nonlocal retries
+            if "повтор" in txt.lower() or "retry" in txt.lower():
+                retries += 1
             self.trace.emit("status", task_id=task.id, message=txt)
 
         user_msg = ChatMessage(
@@ -370,6 +427,14 @@ class AutopilotSoakRunner:
             exit_code=verify_code,
             output=verify_out[-800:],
         )
+        in_tok = int(getattr(engine, "_turn_in", 0) or 0)
+        out_tok = int(getattr(engine, "_turn_out", 0) or 0)
+        tot_tok = in_tok + out_tok
+        model_info = get_model_info(model_id, getattr(engine, "extra_models", []))
+        cost_usd = round((tot_tok / 1000.0) * float(getattr(model_info, "cost_per_1k", 0.0) or 0.0), 6)
+        claimed_success = _claims_success(reply_preview)
+        false_claim = bool(claimed_success and not verify_ok)
+
         duration_s = round(time.monotonic() - t0, 2)
         self.trace.emit(
             "task_end",
@@ -378,6 +443,12 @@ class AutopilotSoakRunner:
             verify_passed=verify_ok,
             llm_requests=llm_requests,
             tool_calls=tool_calls,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            total_tokens=tot_tok,
+            cost_usd=cost_usd,
+            retries=retries,
+            false_success_claim=false_claim,
             errors_count=len(errors),
         )
         return SoakTaskResult(
@@ -390,6 +461,13 @@ class AutopilotSoakRunner:
             verify_output=verify_out,
             llm_requests=llm_requests,
             tool_calls=tool_calls,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            total_tokens=tot_tok,
+            cost_usd=cost_usd,
+            retries=retries,
+            agent_claimed_success=claimed_success,
+            false_success_claim=false_claim,
             mutated_files=mutated_files,
             errors=errors,
             reply_preview=reply_preview,
@@ -407,17 +485,21 @@ def render_soak_report(summary: dict[str, Any]) -> str:
         f"- **Workspace:** `{summary['workspace']}`",
         f"- **Model:** `{summary['model']}` (`{summary['api_base']}`)",
         f"- **Tasks:** `{summary['tasks_passed']}/{summary['tasks_total']}` passed (**{summary['success_rate_pct']}%**)",
+        f"- **Tokens:** `{summary.get('total_tokens', 0)}` (in=`{summary.get('input_tokens', 0)}`, out=`{summary.get('output_tokens', 0)}`)",
+        f"- **Estimated Cost:** `${summary.get('cost_usd', 0.0):.6f}`",
+        f"- **Retries / Errors:** `{summary.get('total_retries', 0)}` retries / `{summary.get('total_errors', 0)}` errors",
+        f"- **False SUCCESS claims:** `{summary.get('false_success_claims', 0)}`",
         f"- **Trace log:** `{summary['trace_path']}`",
         "",
         "## Task Results",
         "",
-        "| Task | Title | Duration (s) | LLM Req | Tool Calls | Verify | Errors |",
-        "|---|---|---:|---:|---:|---|---:|",
+        "| Task | Title | Duration (s) | LLM Req | Tool Calls | Tokens | Retries | Verify | Errors |",
+        "|---|---|---:|---:|---:|---:|---:|---|---:|",
     ]
     for r in summary.get("results", []):
         status = "PASS" if r.get("verify_passed") else f"FAIL ({r.get('verify_exit_code')})"
         lines.append(
-            f"| `{r['id']}` | {r['title']} | {r['duration_s']} | {r['llm_requests']} | {r['tool_calls']} | **{status}** | {len(r.get('errors') or [])} |"
+            f"| `{r['id']}` | {r['title']} | {r['duration_s']} | {r['llm_requests']} | {r['tool_calls']} | {r.get('total_tokens', 0)} | {r.get('retries', 0)} | **{status}** | {len(r.get('errors') or [])} |"
         )
     lines.extend(["", "## Event Counts", ""])
     for k, v in sorted((summary.get("event_counts") or {}).items()):
