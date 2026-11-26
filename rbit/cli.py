@@ -5189,12 +5189,16 @@ def _run_serve(
                     else:
                         self._send_json({"error": "not found"}, 404)
             elif self.path == "/v1/usage":
+                from rbit.usage import UsageLedger
+
                 stored = storage.list_sessions(include_archived=True)
+                day_rows = UsageLedger(workspace).read_day()
                 self._send_json(
                     {
                         "sessions": len(stored),
                         "messages": sum(len(session.messages) for session in stored),
                         "tokens": sum(session.total_tokens for session in stored),
+                        "cost_usd": round(sum(r.cost_usd for r in day_rows), 6),
                         "tool_calls": sum(
                             len(message.tool_calls) for session in stored for message in session.messages
                         ),
@@ -5212,7 +5216,19 @@ def _run_serve(
                 proc = _sp.run(
                     ["git", "status", "--porcelain"], cwd=str(workspace), capture_output=True, text=True, check=False
                 )
-                self._send_json({"ok": proc.returncode == 0, "status": proc.stdout})
+                diff_proc = _sp.run(
+                    ["git", "diff", "--no-color"], cwd=str(workspace), capture_output=True, text=True, check=False
+                )
+                branch_name = detect_git_branch(workspace)
+                self._send_json(
+                    {
+                        "ok": proc.returncode == 0,
+                        "is_git": bool(branch_name) or proc.returncode == 0,
+                        "branch": branch_name,
+                        "status": proc.stdout,
+                        "diff": (diff_proc.stdout or "")[:24000],
+                    }
+                )
             elif self.path in ("/", "/index.html"):
                 renderer = Path(__file__).resolve().parent.parent / "desktop" / "renderer" / "index.html"
                 if renderer.exists():
