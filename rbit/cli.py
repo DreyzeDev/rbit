@@ -2157,6 +2157,7 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--max-tasks", type=int, default=0, help="Maximum number of tasks to run (0 = unlimited)")
             p.add_argument("-m", "--model", default=None, help="Override model ID")
             p.add_argument("--log-dir", default=None, help="Directory for trace.jsonl, summary.json, report.md")
+            p.add_argument("--resume", action="store_true", help="Resume an interrupted soak campaign from checkpoint.json")
             p.add_argument("--json", action="store_true", help="Print summary JSON")
             parsed = p.parse_args(rest)
             ws = _resolve_workspace(parsed.dir)
@@ -2168,6 +2169,7 @@ def main(argv: list[str] | None = None) -> int:
                 model_id=parsed.model,
                 target_minutes=parsed.duration_minutes,
                 max_tasks=parsed.max_tasks,
+                resume=parsed.resume,
             )
             summary = asyncio.run(runner.run(tasks))
             if parsed.json:

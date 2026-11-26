@@ -87,6 +87,8 @@ class SoakTaskResult:
     output_tokens: int = 0
     total_tokens: int = 0
     cost_usd: float = 0.0
+    cost_source: str = "estimated"
+    usage_source: str = "estimated"
     retries: int = 0
     agent_claimed_success: bool = False
     false_success_claim: bool = False
@@ -95,14 +97,30 @@ class SoakTaskResult:
     reply_preview: str = ""
 
 
+_FALSE_PASS_CONTEXT_RE = re.compile(
+    r"\b(?:not\s+(?:completed|passed|met|fixed|done|verified)|"
+    r"could\s+not\s+(?:complete|pass|fix|verify)|"
+    r"did\s+not\s+(?:pass|complete|succeed)|"
+    r"\d+\s+failed|0/\d+\s+passed)\b",
+    re.IGNORECASE,
+)
+
+
 def _claims_success(reply_text: str) -> bool:
-    """Heuristic: detect whether an agent reply claims the task succeeded."""
+    """Detect whether an agent reply claims the task succeeded (minimizing FP/FN)."""
     low = (reply_text or "").lower()
     if not low.strip():
         return False
     neg_markers = (
         "не выполн",
         "не удал",
+        "не заверш",
+        "не прош",
+        "отсутствует",
+        "не существует",
+        "достигнут лимит",
+        "ошибка",
+        "partially",
         "cannot",
         "failed",
         "unable to",
@@ -111,15 +129,23 @@ def _claims_success(reply_text: str) -> bool:
         "**[budget guard]**",
         "**[fallback]**",
         "**[provider error]**",
+        "**[max steps]**",
     )
-    if any(m in low for m in neg_markers):
+    if any(m in low for m in neg_markers) or _FALSE_PASS_CONTEXT_RE.search(low):
         return False
     pos_markers = (
         "готово",
         "успешно",
         "выполнено",
+        "задача выполнена",
+        "всё работает",
+        "все тесты проходят",
+        "pytest зелёный",
         "all tests pass",
-        "passed",
+        "tests pass",
+        "fixed and verified",
+        "done —",
+        "done:",
         "completed",
         "success",
     )
@@ -203,21 +229,60 @@ class AutopilotSoakRunner:
         model_id: str | None = None,
         target_minutes: float = 0.0,
         max_tasks: int = 0,
+        resume: bool = False,
     ) -> None:
         self.workspace = workspace.resolve()
         self.log_dir = log_dir.resolve()
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.trace = SoakTraceWriter(self.log_dir / "trace.jsonl")
+        self.checkpoint_path = self.log_dir / "checkpoint.json"
         self.model_id = model_id
         self.target_minutes = max(0.0, float(target_minutes))
         self.max_tasks = max(0, int(max_tasks))
+        self.resume = bool(resume)
         self.storage = StorageManager(self.workspace)
         self.cfg = self.storage.load_config()
+
+    def _save_checkpoint(
+        self,
+        session_id: str,
+        completed_ids: list[str],
+        results: list[SoakTaskResult],
+        in_progress_id: str | None = None,
+    ) -> None:
+        payload = {
+            "session_id": session_id,
+            "completed_ids": completed_ids,
+            "in_progress_id": in_progress_id,
+            "results": [asdict(r) for r in results],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        tmp = self.checkpoint_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.checkpoint_path)
 
     async def run(self, tasks: list[SoakTask]) -> dict[str, Any]:
         started_iso = datetime.now(timezone.utc).isoformat()
         t_start = time.monotonic()
         effective_model = self.model_id or str(self.cfg.get("model") or "rbit/smart-local")
+
+        results: list[SoakTaskResult] = []
+        completed_ids: set[str] = set()
+        session: Session | None = None
+        if self.resume and self.checkpoint_path.exists():
+            try:
+                ckpt = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
+                completed_ids = set(ckpt.get("completed_ids") or [])
+                for raw_r in ckpt.get("results") or []:
+                    results.append(SoakTaskResult(**raw_r))
+                sid = str(ckpt.get("session_id") or "")
+                if sid:
+                    session = self.storage.find_session(sid)
+            except Exception:
+                completed_ids = set()
+        if session is None:
+            session = Session(title=f"Autopilot Soak ({started_iso[:19]})")
+
         self.trace.emit(
             "soak_start",
             workspace=str(self.workspace),
@@ -225,10 +290,10 @@ class AutopilotSoakRunner:
             api_base=str(self.cfg.get("api_base") or ""),
             target_minutes=self.target_minutes,
             task_count=len(tasks),
+            resumed=self.resume and bool(completed_ids),
+            resumed_completed_count=len(completed_ids),
         )
 
-        results: list[SoakTaskResult] = []
-        session = Session(title=f"Autopilot Soak ({started_iso[:19]})")
         task_idx = 0
         deadline = t_start + self.target_minutes * 60.0 if self.target_minutes > 0 else None
 
@@ -240,8 +305,13 @@ class AutopilotSoakRunner:
 
             task = tasks[task_idx]
             task_idx += 1
+            if task.id in completed_ids:
+                continue
+            self._save_checkpoint(session.id, sorted(completed_ids), results, in_progress_id=task.id)
             res = await self._run_single_task(task, session, effective_model)
             results.append(res)
+            completed_ids.add(task.id)
+            self._save_checkpoint(session.id, sorted(completed_ids), results, in_progress_id=None)
 
             # If a target duration was requested and we finished the provided list early,
             # run an additional autonomous verification/improvement pass until deadline.
@@ -334,17 +404,26 @@ class AutopilotSoakRunner:
         llm_requests = 0
         tool_calls = 0
         retries = 0
+        provider_cost_usd = 0.0
+        saw_provider_usage = False
         mutated_files: list[str] = []
         errors: list[str] = []
 
         def on_trace(ev: dict[str, Any]) -> None:
-            nonlocal llm_requests, retries
+            nonlocal llm_requests, retries, provider_cost_usd, saw_provider_usage
             ev_name = str(ev.pop("event", "trace"))
             if ev_name == "llm_request":
                 llm_requests += 1
-            if ev_name == "llm_response" and not ev.get("ok", True):
-                retries += 1
-                errors.append(str(ev.get("content_preview") or "llm_response error"))
+            if ev_name == "llm_response":
+                u = ev.get("usage")
+                if isinstance(u, dict) and u:
+                    saw_provider_usage = True
+                    oc = u.get("opencode") if isinstance(u.get("opencode"), dict) else {}
+                    step_c = float((oc or {}).get("list_cost") or u.get("cost") or 0.0)
+                    provider_cost_usd += step_c
+                if not ev.get("ok", True):
+                    retries += 1
+                    errors.append(str(ev.get("content_preview") or "llm_response error"))
             self.trace.emit(ev_name, task_id=task.id, **ev)
 
         engine.on_trace_event = on_trace
@@ -431,7 +510,10 @@ class AutopilotSoakRunner:
         out_tok = int(getattr(engine, "_turn_out", 0) or 0)
         tot_tok = in_tok + out_tok
         model_info = get_model_info(model_id, getattr(engine, "extra_models", []))
-        cost_usd = round((tot_tok / 1000.0) * float(getattr(model_info, "cost_per_1k", 0.0) or 0.0), 6)
+        est_cost = round((tot_tok / 1000.0) * float(getattr(model_info, "cost_per_1k", 0.0) or 0.0), 6)
+        cost_source = "provider" if provider_cost_usd > 0 else "estimated"
+        usage_source = "provider" if saw_provider_usage else "estimated"
+        cost_usd = round(provider_cost_usd, 6) if provider_cost_usd > 0 else est_cost
         claimed_success = _claims_success(reply_preview)
         false_claim = bool(claimed_success and not verify_ok)
 
@@ -447,6 +529,8 @@ class AutopilotSoakRunner:
             output_tokens=out_tok,
             total_tokens=tot_tok,
             cost_usd=cost_usd,
+            cost_source=cost_source,
+            usage_source=usage_source,
             retries=retries,
             false_success_claim=false_claim,
             errors_count=len(errors),
@@ -465,6 +549,8 @@ class AutopilotSoakRunner:
             output_tokens=out_tok,
             total_tokens=tot_tok,
             cost_usd=cost_usd,
+            cost_source=cost_source,
+            usage_source=usage_source,
             retries=retries,
             agent_claimed_success=claimed_success,
             false_success_claim=false_claim,
