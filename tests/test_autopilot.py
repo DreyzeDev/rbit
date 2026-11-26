@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 import httpx
@@ -68,7 +69,7 @@ async def test_autopilot_end_to_end_multi_file_test_fix_verify(tmp_path: Path) -
             return (
                 True,
                 "Run pytest to reproduce failure",
-                [{"id": "c3", "type": "function", "function": {"name": "bash", "arguments": '{"command": "pytest -q"}'}}],
+                [{"id": "c3", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": f'"{sys.executable}" -B -m pytest -q'})}}],
             )
         if step["n"] == 3:
             return (
