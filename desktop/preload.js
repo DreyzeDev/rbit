@@ -10,4 +10,5 @@ contextBridge.exposeInMainWorld("rbit", {
   workspace: typeof cfg.workspace === "string" ? cfg.workspace : "",
   token: typeof cfg.token === "string" ? cfg.token : "",
   ready: cfg.ready === true,
+  selectWorkspace: () => ipcRenderer.invoke("rbit:selectWorkspace"),
 });

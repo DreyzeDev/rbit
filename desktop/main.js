@@ -1,6 +1,6 @@
 // rbit desktop: spawns `rbit serve` (the local HTTP/NDJSON backend) and shows
 // the chat UI. Requires Python with the rbit package installed.
-const { app, BrowserWindow, shell, ipcMain } = require("electron");
+const { app, BrowserWindow, shell, ipcMain, dialog } = require("electron");
 const { pathToFileURL } = require("url");
 const { spawn } = require("child_process");
 const http = require("http");
@@ -13,7 +13,7 @@ let PORT = PREFERRED_PORT;
 // One random bearer token per launch: the backend refuses every request without
 // it, so a web page in the user's browser cannot drive the local agent.
 const TOKEN = crypto.randomBytes(24).toString("base64url");
-const WORKSPACE = process.env.RBIT_DESKTOP_WORKSPACE || app.getPath("home");
+let WORKSPACE = process.env.RBIT_DESKTOP_WORKSPACE || app.getPath("home");
 let backend = null;
 let backendReady = false;
 
@@ -134,6 +134,24 @@ ipcMain.on("rbit:config", (event) => {
     return;
   }
   event.returnValue = { port: PORT, workspace: WORKSPACE, token: TOKEN, ready: backendReady };
+});
+
+ipcMain.handle("rbit:selectWorkspace", async (event) => {
+  const frameUrl = event.senderFrame ? event.senderFrame.url : "";
+  if (!isOurRenderer(frameUrl)) return null;
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const picked = await dialog.showOpenDialog(win || undefined, {
+    title: "Select workspace folder",
+    defaultPath: WORKSPACE,
+    properties: ["openDirectory"],
+  });
+  if (picked.canceled || !picked.filePaths || !picked.filePaths[0]) return null;
+  WORKSPACE = picked.filePaths[0];
+  killBackend();
+  PORT = await choosePort(PREFERRED_PORT);
+  startBackend();
+  backendReady = await waitBackend();
+  return { port: PORT, workspace: WORKSPACE, token: TOKEN, ready: backendReady };
 });
 
 function createWindow() {

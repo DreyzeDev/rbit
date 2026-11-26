@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ru">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <title>rbit</title>
@@ -7,35 +7,75 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div id="tabbar">
-    <button id="menu-btn" title="Menu">☰</button>
-    <div id="tabs"></div>
-    <button id="tab-new" title="New session">＋</button>
-    <div id="tab-drag"></div>
-  </div>
+  <header id="tabbar">
+    <button id="menu-btn" class="icon-btn" title="Toggle sessions (Ctrl+B)" aria-label="Toggle sessions">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+    <div id="tabs" role="tablist"></div>
+    <button id="tab-new" class="icon-btn" title="New session (Ctrl+N)" aria-label="New session">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+    </button>
+    <div id="header-meta">
+      <span id="sandbox-pill" class="meta-chip" title="OS-level sandbox status">
+        <span class="dot"></span>
+        <span id="sandbox-label">Sandbox: checking</span>
+      </span>
+      <span id="usage-pill" class="meta-chip tabular" title="Today's token and cost usage">0 tok · $0.0000</span>
+    </div>
+  </header>
+
   <div id="layout">
-    <aside id="sessions" class="hidden">
+    <aside id="sessions" class="hidden" aria-label="Sessions">
+      <div class="sidebar-head">
+        <span>Sessions</span>
+        <span id="sessions-count" class="tabular">0</span>
+      </div>
       <div id="sessions-list"></div>
     </aside>
+
     <main id="main">
       <div id="feed">
-        <div class="wordmark">rbit</div>
+        <div class="home-hero">
+          <div class="wordmark">rbit</div>
+          <p class="hero-sub">Autonomous terminal and desktop coding agent</p>
+        </div>
       </div>
+
       <div id="composer-wrap">
         <div id="composer-card">
-          <textarea id="prompt" rows="1" placeholder="Спросите что угодно, / — команды, @ — контекст..."></textarea>
+          <textarea id="prompt" rows="1" placeholder="Ask rbit to inspect, edit, or run tests..."></textarea>
           <div id="composer-bar">
-            <button class="ghost" id="btn-add">＋</button>
-            <button class="ghost" id="btn-mode">Build ▾</button>
-            <button class="ghost" id="btn-model">GLM 5.3 Flash ▾</button>
+            <select id="select-mode" class="pill-select" title="Agent mode" aria-label="Agent mode">
+              <option value="build">Build</option>
+              <option value="plan">Plan</option>
+              <option value="ask">Ask</option>
+              <option value="debug">Debug</option>
+              <option value="review">Review</option>
+              <option value="autopilot">Autopilot</option>
+            </select>
+            <select id="select-model" class="pill-select" title="Active model" aria-label="Active model">
+              <option value="">Default model</option>
+            </select>
             <span class="spacer"></span>
-            <button id="send" title="Send">↑</button>
+            <button id="stop-btn" class="hidden" title="Stop running turn (Esc)" aria-label="Stop">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+            </button>
+            <button id="send" title="Send (Enter)" aria-label="Send">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+            </button>
           </div>
         </div>
+
         <div id="crumbs">
-          <button class="crumb">project ▾</button>
+          <button id="btn-workspace" class="crumb" title="Switch workspace folder">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-6l-2-2H5a2 2 0 0 0-2 2z"/></svg>
+            <span id="crumb-name">Workspace</span>
+          </button>
           <span class="sep">/</span>
-          <span class="crumb-static">⎇ Нет Git</span>
+          <span class="crumb-static" id="crumb-git">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M6 9v6M18 9a6 6 0 0 1-6 6H6"/></svg>
+            <span id="git-branch">No git</span>
+          </span>
           <span class="crumb-path" id="crumb-path"></span>
         </div>
       </div>
