@@ -581,9 +581,18 @@ def _run_trust(workspace: Path, *, yes: bool = False, status: bool = False, revo
     return 0
 
 
+def _default_windows_scripts_dir(executable: str | Path | None = None) -> Path:
+    """Return the Scripts directory for either global Python or a Windows venv."""
+    exe = Path(executable or sys.executable)
+    parent = exe.parent
+    if parent.name.lower() == "scripts":
+        return parent
+    return parent / "Scripts"
+
+
 def install_windows_cmd_shim(scripts_dir: Path | None = None, *, remove_exe: bool = True) -> Path:
     """Create a `.cmd` launcher for Windows Application Control environments."""
-    target_dir = scripts_dir or (Path(sys.executable).resolve().parent / "Scripts")
+    target_dir = scripts_dir or _default_windows_scripts_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
     cmd_path = target_dir / "rbit.cmd"
     cmd_path.write_text(f'@echo off\r\n"{sys.executable}" -m rbit %*\r\n', encoding="ascii")
@@ -648,7 +657,7 @@ async def _run_doctor(workspace: Path, *, fix_shim: bool = False) -> int:
     ruff = shutil.which("ruff")
     tbl.add_row("ruff (lint tool)", "OK" if ruff else "FALLBACK", ruff or "built-in syntax diagnostics only")
     if sys.platform == "win32":
-        scripts_dir = Path(sys.executable).resolve().parent / "Scripts"
+        scripts_dir = _default_windows_scripts_dir()
         if fix_shim:
             shim = install_windows_cmd_shim(scripts_dir, remove_exe=True)
             tbl.add_row("Windows Launcher", "FIXED", f"Created {shim} (App Control safe)")

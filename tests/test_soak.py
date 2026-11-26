@@ -177,7 +177,10 @@ def test_agent_engine_and_usage_ledger_record_provider_cost(tmp_path: Path) -> N
 
 
 def test_install_windows_cmd_shim(tmp_path: Path) -> None:
-    from rbit.cli import install_windows_cmd_shim
+    from rbit.cli import _default_windows_scripts_dir, install_windows_cmd_shim
+
+    assert _default_windows_scripts_dir(r"C:\Python313\python.exe") == Path(r"C:\Python313\Scripts")
+    assert _default_windows_scripts_dir(r"C:\proj\.venv\Scripts\python.exe") == Path(r"C:\proj\.venv\Scripts")
 
     scripts = tmp_path / "Scripts"
     scripts.mkdir()
@@ -187,3 +190,30 @@ def test_install_windows_cmd_shim(tmp_path: Path) -> None:
     assert cmd_path.exists()
     assert "-m rbit %*" in cmd_path.read_text(encoding="ascii")
     assert not exe.exists()
+
+
+def test_windows_venv_install_and_shim_launch(tmp_path: Path) -> None:
+    import os
+    import subprocess
+    import sys
+
+    if sys.platform != "win32":
+        pytest.skip("Windows venv shim integration test")
+
+    venv_dir = tmp_path / "rc_venv"
+    subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", str(venv_dir)], check=True)
+    vpy = venv_dir / "Scripts" / "python.exe"
+    repo_root = Path(__file__).resolve().parents[1]
+    subprocess.run([str(vpy), "-m", "pip", "install", "--no-deps", str(repo_root)], check=True)
+    subprocess.run([str(vpy), "-m", "rbit", "doctor", "--fix-shim", str(tmp_path)], check=True)
+
+    cmd_shim = venv_dir / "Scripts" / "rbit.cmd"
+    nested_wrong = venv_dir / "Scripts" / "Scripts" / "rbit.cmd"
+    assert cmd_shim.is_file()
+    assert not nested_wrong.exists()
+    assert not (venv_dir / "Scripts" / "rbit.exe").exists()
+
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    ver = subprocess.run([str(cmd_shim), "--version"], env=env, capture_output=True, text=True, check=True)
+    assert "rbit v" in ver.stdout
