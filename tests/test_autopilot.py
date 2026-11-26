@@ -185,9 +185,28 @@ async def test_autopilot_persists_paused_state_and_resumes_after_restart(tmp_pat
     eng2 = AgentEngine(workspace=tmp_path, executor=ex2, get_config=lambda: {"api_key": "k"}, storage=storage2)
 
     captured_system: list[str] = []
+    step_n = {"n": 0}
 
     async def resume_step(**kwargs: Any) -> tuple[bool, str, list[dict[str, Any]]]:
         captured_system.append(str(kwargs["messages"][0]["content"]))
+        step_n["n"] += 1
+        if step_n["n"] == 1:
+            return (
+                True,
+                "",
+                [
+                    {
+                        "id": "call_td",
+                        "type": "function",
+                        "function": {
+                            "name": "todowrite",
+                            "arguments": json.dumps(
+                                {"todos": [{"id": "t1", "content": "Implement X", "status": "completed", "priority": "high"}]}
+                            ),
+                        },
+                    }
+                ],
+            )
         return True, "Resumed and completed feature X.", []
 
     eng2._non_stream_chat_step = resume_step  # type: ignore[method-assign]
