@@ -179,8 +179,10 @@ def test_agent_engine_and_usage_ledger_record_provider_cost(tmp_path: Path) -> N
 def test_install_windows_cmd_shim(tmp_path: Path) -> None:
     from rbit.cli import _default_windows_scripts_dir, install_windows_cmd_shim
 
-    assert _default_windows_scripts_dir(r"C:\Python313\python.exe") == Path(r"C:\Python313\Scripts")
-    assert _default_windows_scripts_dir(r"C:\proj\.venv\Scripts\python.exe") == Path(r"C:\proj\.venv\Scripts")
+    assert _default_windows_scripts_dir(tmp_path / "Python313" / "python.exe") == tmp_path / "Python313" / "Scripts"
+    assert _default_windows_scripts_dir(tmp_path / "proj" / ".venv" / "Scripts" / "python.exe") == (
+        tmp_path / "proj" / ".venv" / "Scripts"
+    )
 
     scripts = tmp_path / "Scripts"
     scripts.mkdir()
