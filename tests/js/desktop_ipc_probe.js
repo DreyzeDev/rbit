@@ -20,7 +20,11 @@ const electronStub = {
     }
   },
   shell: {},
-  ipcMain: { on: (channel, fn) => { handlers[channel] = fn; } },
+  dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
+  ipcMain: {
+    on: (channel, fn) => { handlers[channel] = fn; },
+    handle: (channel, fn) => { handlers[channel] = fn; },
+  },
 };
 const originalLoad = Module._load;
 Module._load = function (request, ...rest) {
