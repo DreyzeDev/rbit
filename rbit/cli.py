@@ -295,6 +295,12 @@ async def _run_headless(args: argparse.Namespace) -> int:
         get_config=lambda: cfg,
         storage=storage,
     )
+    trace_writer = None
+    if getattr(args, "trace_log", None):
+        from rbit.soak import SoakTraceWriter
+
+        trace_writer = SoakTraceWriter(Path(args.trace_log).expanduser())
+        engine.on_trace_event = lambda ev: trace_writer.emit(str(ev.pop("event", "trace")), **ev)
     await engine.refresh_ollama_models()
 
     if cfg.get("auto_compact", True) and len(session.messages) >= 8:
@@ -320,18 +326,23 @@ async def _run_headless(args: argparse.Namespace) -> int:
         agent=agent_mode,
     )
     session.messages.append(user_msg)
+    storage.save_session(session)
 
     def _jsonl(payload: dict[str, Any]) -> None:
         sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
         sys.stdout.flush()
 
     async def on_tool_start(rec: ToolCallRecord) -> None:
+        if trace_writer is not None:
+            trace_writer.emit("tool_start", tool=rec.name, arguments=rec.arguments)
         if jsonl_mode:
             _jsonl({"event": "tool_start", "name": rec.name, "arguments": rec.arguments})
         elif not json_mode:
             console.print(f"[#808080]  ~ {markup_escape(rec.name)}[/] [dim]{markup_escape(json.dumps(rec.arguments, ensure_ascii=False))}[/]")
 
     async def on_tool_end(rec: ToolCallRecord) -> None:
+        if trace_writer is not None:
+            trace_writer.emit("tool_end", tool=rec.name, status=rec.status, summary=str(rec.summary or "")[:600])
         if jsonl_mode:
             _jsonl(
                 {
@@ -2068,7 +2079,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "audit", "usage", "selftest", "skill", "migrate", "diag", "status", "test", "gh", "schedule", "risk", "replay", "reload", "pair", "mini", "trust", "sandbox"}
+    subcommands = {"run", "doctor", "stats", "sessions", "session", "export", "map", "lint", "init", "commit", "update", "upgrade", "uninstall", "backup", "describe", "serve", "mobile", "acp", "import", "watch", "voice", "models", "auth", "web", "pr", "agent", "mcp", "service", "api", "debug", "plugin", "config", "permissions", "completion", "logs", "audit", "usage", "selftest", "skill", "migrate", "diag", "status", "test", "gh", "schedule", "risk", "replay", "reload", "pair", "mini", "trust", "sandbox", "soak"}
     if args_list and args_list[0] in subcommands:
         sub = args_list[0]
         rest = _normalize_subcommand_args(sub, args_list[1:])
@@ -2120,7 +2131,8 @@ def main(argv: list[str] | None = None) -> int:
                 help="Output mode: text, json, or event stream jsonl",
             )
             p.add_argument("--json", action="store_true", help="Emit structured JSON output")
-            p.add_argument("--auto", "--yolo", dest="auto_approve", action="store_true", help="Auto-approve permissions")
+            p.add_argument("--trace-log", default=None, help="Write detailed JSONL action trace to this file")
+            p.add_argument("--auto", "--yolo", dest="auto_approve", action="store_true", help="Auto-approve permission requests")
             parsed = p.parse_args(rest)
             if allow_outside:
                 parsed.allow_outside = True
@@ -2131,6 +2143,42 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("dir", nargs="?", help="Workspace directory")
             parsed = p.parse_args(rest)
             return asyncio.run(_run_doctor(_resolve_workspace(parsed.dir)))
+
+        if sub == "soak":
+            from rbit.soak import AutopilotSoakRunner, default_soak_tasks, load_soak_tasks
+
+            p = argparse.ArgumentParser(
+                prog="rbit soak",
+                description="Run a long-horizon real-LLM Autopilot soak campaign with full JSONL trace logging",
+            )
+            p.add_argument("dir", nargs="?", help="Target workspace repository")
+            p.add_argument("--tasks", default=None, help="JSON file with soak tasks")
+            p.add_argument("--duration-minutes", type=float, default=0.0, help="Target soak duration in minutes")
+            p.add_argument("--max-tasks", type=int, default=0, help="Maximum number of tasks to run (0 = unlimited)")
+            p.add_argument("-m", "--model", default=None, help="Override model ID")
+            p.add_argument("--log-dir", default=None, help="Directory for trace.jsonl, summary.json, report.md")
+            p.add_argument("--json", action="store_true", help="Print summary JSON")
+            parsed = p.parse_args(rest)
+            ws = _resolve_workspace(parsed.dir)
+            tasks = load_soak_tasks(Path(parsed.tasks)) if parsed.tasks else default_soak_tasks()
+            log_dir = Path(parsed.log_dir) if parsed.log_dir else (ws / ".rbit" / "soak" / short_id())
+            runner = AutopilotSoakRunner(
+                workspace=ws,
+                log_dir=log_dir,
+                model_id=parsed.model,
+                target_minutes=parsed.duration_minutes,
+                max_tasks=parsed.max_tasks,
+            )
+            summary = asyncio.run(runner.run(tasks))
+            if parsed.json:
+                sys.stdout.write(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+            else:
+                Console().print(
+                    f"[bold]Soak complete:[/] {summary['tasks_passed']}/{summary['tasks_total']} passed "
+                    f"({summary['success_rate_pct']}%) in {summary['duration_minutes']} min\n"
+                    f"Report: {log_dir / 'report.md'}\nTrace: {summary['trace_path']}"
+                )
+            return 0 if summary["tasks_failed"] == 0 else 1
 
         if sub == "sandbox":
             p = argparse.ArgumentParser(

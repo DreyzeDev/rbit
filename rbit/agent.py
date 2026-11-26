@@ -318,6 +318,16 @@ class AgentEngine:
         self._turn_out = 0
         self._auto_design_section = ""
         self._opencode_session = ""
+        self.on_trace_event: Callable[[dict[str, Any]], None] | None = None
+
+    def _emit_trace(self, event: str, **data: Any) -> None:
+        hook = getattr(self, "on_trace_event", None)
+        if hook is None:
+            return
+        try:
+            hook({"ts": time.time(), "event": event, **data})
+        except Exception:
+            logger.debug("trace hook failed", exc_info=True)
 
     def _auto_design_prompt(self, user_msg: ChatMessage) -> str:
         if not self.get_config().get("auto_design_skill", True):
@@ -1363,6 +1373,16 @@ class AgentEngine:
                 self._step_usage = None
                 if on_thinking is not None:
                     await on_thinking(True)
+                _last_msg = api_messages[-1] if api_messages else {}
+                self._emit_trace(
+                    "llm_request",
+                    step=_step,
+                    model=model_id,
+                    message_count=len(api_messages),
+                    last_role=str(_last_msg.get("role") or ""),
+                    last_preview=str(_last_msg.get("content") or "")[:500],
+                )
+                _req_t0 = time.perf_counter()
                 try:
                     if on_stream_chunk is not None:
                         ok, content, tool_calls = await self._stream_chat_step(
@@ -1375,8 +1395,6 @@ class AgentEngine:
                             on_status=on_status,
                             on_reasoning_chunk=on_reasoning_chunk,
                         )
-                        if not ok:
-                            return content
                     else:
                         ok, content, tool_calls = await self._non_stream_chat_step(
                             client=client,
@@ -1387,11 +1405,27 @@ class AgentEngine:
                             on_status=on_status,
                             on_reasoning_chunk=on_reasoning_chunk,
                         )
-                        if not ok:
-                            return content
                 finally:
                     if on_thinking is not None:
                         await on_thinking(False)
+                self._emit_trace(
+                    "llm_response",
+                    step=_step,
+                    model=model_id,
+                    ok=ok,
+                    latency_ms=round((time.perf_counter() - _req_t0) * 1000, 1),
+                    content_preview=str(content or "")[:1500],
+                    tool_calls=[
+                        {
+                            "name": str((tc.get("function") or {}).get("name") or ""),
+                            "arguments": str((tc.get("function") or {}).get("arguments") or "")[:400],
+                        }
+                        for tc in (tool_calls or [])
+                    ],
+                    usage=self._step_usage,
+                )
+                if not ok:
+                    return content
 
                 self._account_step(api_messages, content, tool_calls)
                 if _step == 0 and content and tool_calls and on_status is not None:

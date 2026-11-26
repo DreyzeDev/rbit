@@ -703,3 +703,84 @@ async def test_subagent_is_confined_under_strict_sandbox(tmp_path: Path, monkeyp
     assert res.ok is True
     assert SECRET not in res.output
     assert "subagent-canary" not in res.output
+
+
+@needs_backend
+@pytest.mark.asyncio
+async def test_adversarial_shell_chaining_and_grandchild_cannot_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "ws"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text(SECRET, encoding="utf-8")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-adversarial-canary-999")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-adversarial-canary-999")
+    script = _probe_script(workspace)
+
+    ex = ToolExecutor(
+        workspace=workspace,
+        session=Session(),
+        get_config=lambda: {"shell_sandbox": "strict"},
+    )
+    ex.always_allow_bash = True
+
+    chain = (
+        _shell(script, "env", "OPENAI_API_KEY")
+        + " ; "
+        + _shell(script, "env", "AWS_SECRET_ACCESS_KEY")
+        + " ; "
+        + _shell(script, "read", outside / "secret.txt")
+    )
+    res = await ex.execute("bash", {"command": chain})
+    assert "sk-adversarial-canary-999" not in res.output
+    assert "aws-adversarial-canary-999" not in res.output
+    assert SECRET not in res.output
+
+
+@needs_backend
+@pytest.mark.asyncio
+async def test_adversarial_git_hooks_and_autopilot_state_tamper_blocked(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    hooks = workspace / ".git" / "hooks"
+    ap_dir = workspace / ".rbit" / "autopilot"
+    hooks.mkdir(parents=True)
+    ap_dir.mkdir(parents=True)
+    hook_file = hooks / "pre-commit"
+    ap_file = ap_dir / "sess1.json"
+    hook_file.write_text("#!/bin/sh\necho safe\n", encoding="utf-8")
+    ap_file.write_text('{"status": "running", "todos": []}', encoding="utf-8")
+    script = _probe_script(workspace)
+
+    ex = ToolExecutor(
+        workspace=workspace,
+        session=Session(),
+        get_config=lambda: {"shell_sandbox": "strict"},
+    )
+    ex.always_allow_bash = True
+
+    await ex.execute("bash", {"command": _shell(script, "write", hook_file)})
+    await ex.execute("bash", {"command": _shell(script, "write", ap_file)})
+
+    assert hook_file.read_text(encoding="utf-8") == "#!/bin/sh\necho safe\n"
+    assert ap_file.read_text(encoding="utf-8") == '{"status": "running", "todos": []}'
+
+
+@pytest.mark.asyncio
+async def test_adversarial_path_traversal_cannot_read_outside(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text(SECRET, encoding="utf-8")
+
+    ex = ToolExecutor(
+        workspace=workspace,
+        session=Session(),
+        get_config=lambda: {"shell_sandbox": "strict"},
+    )
+    res = await ex.execute("read", {"path": "../outside/secret.txt"})
+    assert not res.ok
+    assert SECRET not in res.output
+    assert "outside" in res.output.lower() or "denied" in res.output.lower() or "sandbox" in res.output.lower() or "error" in res.output.lower()
