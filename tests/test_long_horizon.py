@@ -354,3 +354,34 @@ async def test_builtin_subagent_roles_file_conflict_and_cancel(tmp_path: Path) -
     assert engine.cancel_background_subagent(bg_id) is True
     await asyncio.sleep(0)
     assert engine.cancel_background_subagent(bg_id) is False
+
+
+@pytest.mark.asyncio
+async def test_terminate_background_kills_process_tree(tmp_path: Path) -> None:
+    """Verifies terminating a background bash command actually kills the OS process."""
+    import os
+    import sys
+
+    storage = StorageManager(workspace=tmp_path)
+    ex = ToolExecutor(workspace=tmp_path, session=Session(), storage=storage, get_config=lambda: {})
+    ex.always_allow_bash = True
+
+    cmd = (
+        f'& "{sys.executable}" -c "import time; time.sleep(30)"'
+        if sys.platform == "win32"
+        else f'"{sys.executable}" -c "import time; time.sleep(30)"'
+    )
+    res = await ex.execute("bash", {"command": cmd, "background": True})
+    assert res.ok is True and res.pid > 0
+    pid = res.pid
+    assert pid in ex.background_pids()
+
+    killed = await ex.terminate_background_pid(pid)
+    assert killed is True
+    assert pid not in ex.background_pids()
+    # Second stop on already-terminated pid must return False
+    assert await ex.terminate_background_pid(pid) is False
+    # Process should no longer be alive
+    if sys.platform != "win32":
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)

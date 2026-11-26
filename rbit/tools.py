@@ -4551,13 +4551,10 @@ class ToolExecutor:
         count = 0
         for proc in self._background_procs:
             if proc.returncode is None:
-                try:
-                    proc.terminate()
-                    count += 1
-                except ProcessLookupError:
-                    pass
+                await _kill_process_tree(proc)
+                count += 1
             try:
-                await proc.wait()
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
             except Exception:
                 pass
         self._background_procs.clear()
@@ -4568,21 +4565,19 @@ class ToolExecutor:
         return [p.pid for p in self._background_procs if p.returncode is None and p.pid]
 
     async def terminate_background_pid(self, pid: int) -> bool:
-        """Terminates a single background process by pid; returns True when it was killed."""
+        """Terminates a single background process tree by pid; returns True when it was running and killed."""
         for proc in list(self._background_procs):
             if proc.pid != pid:
                 continue
-            if proc.returncode is None:
-                try:
-                    proc.terminate()
-                except ProcessLookupError:
-                    pass
+            was_running = proc.returncode is None
+            if was_running:
+                await _kill_process_tree(proc)
             try:
-                await proc.wait()
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
             except Exception:
                 pass
             self._background_procs.remove(proc)
-            return True
+            return was_running
         return False
 
     async def _run_subprocess(self, command: str, timeout_s: float = 30.0) -> ToolResult:
