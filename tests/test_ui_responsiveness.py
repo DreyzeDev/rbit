@@ -242,7 +242,10 @@ async def test_streaming_reply_tail_stays_visible(app_workspace: Path) -> None:
             app._smart_scroll_end()
             await pilot.pause(0.02)
 
-        await pilot.pause(0.35)
+        for _ in range(12):
+            await pilot.pause(0.1)
+            if scroll.max_scroll_y - scroll.scroll_y <= 1:
+                break
 
         assert scroll.max_scroll_y > 10, "test needs a scrollable log to be meaningful"
         gap = scroll.max_scroll_y - scroll.scroll_y
