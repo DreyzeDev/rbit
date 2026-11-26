@@ -342,7 +342,10 @@ async def test_tool_cards_then_final_answer_stays_visible(app_workspace: Path) -
             app._smart_scroll_end()
             await pilot.pause(0.02)
 
-        await pilot.pause(0.3)
+        for _ in range(15):
+            await pilot.pause(0.1)
+            if scroll.max_scroll_y - scroll.scroll_y <= 1:
+                break
 
         assert scroll.max_scroll_y > 10, "test needs a scrollable log"
         gap = scroll.max_scroll_y - scroll.scroll_y
