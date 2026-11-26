@@ -581,7 +581,23 @@ def _run_trust(workspace: Path, *, yes: bool = False, status: bool = False, revo
     return 0
 
 
-async def _run_doctor(workspace: Path) -> int:
+def install_windows_cmd_shim(scripts_dir: Path | None = None, *, remove_exe: bool = True) -> Path:
+    """Create a `.cmd` launcher for Windows Application Control environments."""
+    target_dir = scripts_dir or (Path(sys.executable).resolve().parent / "Scripts")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    cmd_path = target_dir / "rbit.cmd"
+    cmd_path.write_text(f'@echo off\r\n"{sys.executable}" -m rbit %*\r\n', encoding="ascii")
+    if remove_exe:
+        exe_path = target_dir / "rbit.exe"
+        if exe_path.exists():
+            try:
+                exe_path.unlink()
+            except OSError:
+                pass
+    return cmd_path
+
+
+async def _run_doctor(workspace: Path, *, fix_shim: bool = False) -> int:
     console = Console()
     storage = StorageManager(workspace)
     cfg = storage.load_config()
@@ -631,6 +647,22 @@ async def _run_doctor(workspace: Path) -> int:
     tbl.add_row("ripgrep (fast grep)", "OK" if rg else "FALLBACK", rg or "python fallback in use")
     ruff = shutil.which("ruff")
     tbl.add_row("ruff (lint tool)", "OK" if ruff else "FALLBACK", ruff or "built-in syntax diagnostics only")
+    if sys.platform == "win32":
+        scripts_dir = Path(sys.executable).resolve().parent / "Scripts"
+        if fix_shim:
+            shim = install_windows_cmd_shim(scripts_dir, remove_exe=True)
+            tbl.add_row("Windows Launcher", "FIXED", f"Created {shim} (App Control safe)")
+        else:
+            has_exe = (scripts_dir / "rbit.exe").exists()
+            has_cmd = (scripts_dir / "rbit.cmd").exists()
+            if has_exe and not has_cmd:
+                tbl.add_row(
+                    "Windows Launcher",
+                    "WARN",
+                    "rbit.exe may be blocked by App Control; run `rbit doctor --fix-shim` or `python -m rbit`",
+                )
+            else:
+                tbl.add_row("Windows Launcher", "OK", str(scripts_dir / ("rbit.cmd" if has_cmd else "python -m rbit")))
 
     console.print(tbl)
     return 0
@@ -2141,8 +2173,9 @@ def main(argv: list[str] | None = None) -> int:
         if sub == "doctor":
             p = argparse.ArgumentParser(prog="rbit doctor")
             p.add_argument("dir", nargs="?", help="Workspace directory")
+            p.add_argument("--fix-shim", action="store_true", help="Create rbit.cmd and remove unsigned rbit.exe on Windows")
             parsed = p.parse_args(rest)
-            return asyncio.run(_run_doctor(_resolve_workspace(parsed.dir)))
+            return asyncio.run(_run_doctor(_resolve_workspace(parsed.dir), fix_shim=parsed.fix_shim))
 
         if sub == "soak":
             from rbit.soak import AutopilotSoakRunner, default_soak_tasks, load_soak_tasks

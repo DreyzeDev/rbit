@@ -513,6 +513,25 @@ def split_usage(usage: dict[str, Any] | None) -> dict[str, int]:
     }
 
 
+def extract_provider_cost(raw: Any) -> float:
+    """Return provider-reported USD cost from a usage payload, or 0.0 if absent."""
+    if not isinstance(raw, dict):
+        return 0.0
+    oc = raw.get("opencode")
+    candidates = [
+        oc.get("list_cost") if isinstance(oc, dict) else None,
+        raw.get("cost"),
+    ]
+    for val in candidates:
+        try:
+            num = float(val) if val is not None else 0.0
+        except (TypeError, ValueError):
+            continue
+        if num > 0.0:
+            return num
+    return 0.0
+
+
 def estimate_cost(
     usage: dict[str, int],
     cost_per_1k: float,

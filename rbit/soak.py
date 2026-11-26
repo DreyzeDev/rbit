@@ -22,6 +22,7 @@ from rbit.agent import AgentEngine
 from rbit.models import ChatMessage, Session, ToolCallRecord, get_model_info, short_id
 from rbit.storage import StorageManager
 from rbit.tools import MUTATING_TOOLS, ToolExecutor
+from rbit.usage import extract_provider_cost
 
 _SECRET_RE = re.compile(
     r"(?i)(bearer\s+[A-Za-z0-9._\-]{12,}|sk-[A-Za-z0-9_\-]{12,}|ghp_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_\-]{20,})"
@@ -418,9 +419,7 @@ class AutopilotSoakRunner:
                 u = ev.get("usage")
                 if isinstance(u, dict) and u:
                     saw_provider_usage = True
-                    oc = u.get("opencode") if isinstance(u.get("opencode"), dict) else {}
-                    step_c = float((oc or {}).get("list_cost") or u.get("cost") or 0.0)
-                    provider_cost_usd += step_c
+                    provider_cost_usd += extract_provider_cost(u)
                 if not ev.get("ok", True):
                     retries += 1
                     errors.append(str(ev.get("content_preview") or "llm_response error"))

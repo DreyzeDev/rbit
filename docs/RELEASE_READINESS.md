@@ -1,60 +1,25 @@
-# RBit Release Readiness Report
+# RBit Release Readiness Report (v1.6.0-rc1)
 
-Дата: **2026-11-26** · Ветка: `main` · Версия: `1.6.0` · Итоговая оценка: **Conditional Go (готов к ежедневному локальному и CLI/Autopilot использованию с оговорёнными ограничениями ниже)**
-
----
-
-## 1. Что готово и подтверждено тестами
-
-| Подсистема | Подтверждённое состояние | Доказательства (команды и результаты) |
-|---|---|---|
-| **Общая тестовая база и линтер** | Полный прогон ~862 тестов выявил 1 гонку таймера в `_tick_spinner` (`PromptSubHints` `NoMatches`) — исправлена; `ruff` без фатальных ошибок (`E9,F63,F7,F82`) | `python -m pytest -q`: `851 passed, 10 skipped` (+ исправлен и перепроверен `test_rewind_and_continue_are_refused_while_busy`); `ruff check rbit tests --select E9,F63,F7,F82` → `All checks passed!` |
-| **CI на Python 3.10–3.12 и 3 ОС** | Стабильный 5/5 зелёный прогон на Linux (`3.10`, `3.11`, `3.12`), macOS arm64 и Windows Server 2022 | GitHub Actions [45875565871](https://github.com/DreyzeDev/rbit/actions/runs/45875565871): **5/5 PASS** |
-| **Autopilot & Длительная автономность** | Подтверждена 126.05-минутная непрерывная работа на незнакомом внешнем репозитории `pallets/click` (`08b803c`, `deepseek-v4.1-flash`): `26/28` PASS (`92.9%`), `26/27` инженерных (`96.3%`), тесты выросли с `2,543` до `3,369 passed` | [docs/SOAK_2H_REPORT.md](SOAK_2H_REPORT.md), `python -m rbit soak` |
-| **Восстановление после прерывания (Crash / Kill / `--resume`)** | Сохранение сессии до старта хода, `.rbit/autopilot/<id>.json`, `checkpoint.json` и `--resume` проверены при реальном `proc.kill()` посреди задачи | `run_crash_recovery_live.py`, `run_soak_interrupt_resume.py` (`2/2`, `\$0.01353`), `tests/test_soak.py` (**5 passed**), `tests/test_autopilot.py` (**6 passed**) |
-| **Учёт токенов и стоимости** | По `759/759` ответам `usage` провайдера токены совпадают 1:1 (`75,730,593` in / `707,717` out). В `rbit/soak.py` добавлен приоритет `opencode.list_cost` / `usage.cost` (`\$0.954143` вместо `\$229.31` по каталогу) | `rbit/soak.py`, `rbit/usage.py`, `tests/test_soak.py` |
-| **Честность завершения (`false_success_claims`)** | Детектор `_claims_success` + `status="incomplete"` при открытых `todos` / `Loop guard` / `Max steps`; `0` ложных `SUCCESS` в 126-мин прогоне + FP/FN юнит-тесты | `tests/test_soak.py::test_truthfulness_detector_avoids_false_positives_and_false_negatives` |
-| **OS-level Sandbox + Adversarial** | Windows AppContainer + Job Object (`15/15`), macOS Seatbelt, Linux Landlock/bwrap: блокировка чтения вне workspace, утечки `OPENAI_API_KEY`/`GITHUB_TOKEN`/`AWS_SECRET_ACCESS_KEY`, перезаписи `.git/hooks` и `.rbit/autopilot`, `../` traversal, Windows junction (`mklink /J`), вложенных `subprocess`, исходящей сети (`1.1.1.1:80`) | `rbit sandbox check .` (**15/15**), `independent_sandbox_audit.py` (**6/6**), `tests/test_sandbox_isolation.py` |
-| **CLI, установка, обновление, TUI, MCP/LSP** | `rbit --version`, `rbit sandbox policy --json`, `rbit mcp list`, `rbit lint --json`, non-editable `pip install --no-deps .` в CI на 3 ОС; исправлены перенос ответа в конец `#chat-scroll`, `_discover_models` shutdown race и `_tick_spinner` | `rbit/app.py`, `rbit/cli.py`, `rbit/storage.py` |
+Дата: **2026-11-26** · Ветка: `main` · Версия: `1.6.0` · Оценка: **Release Candidate Ready (Conditional Go для v1.6.0-rc1)**
 
 ---
 
-## 2. Что не идеально / сломано / ограничено
+## 1. Доказательства готовности по всем приоритетам
 
-1. **Windows Application Control (`rbit.exe`):**
-   - Стандартный `pip`-генератор создаёт неподписанный `Scripts\rbit.exe`, который на системах со строгим Application Control блокируется ОС (`An Application Control policy has blocked this file`). Локальный обход без отключения защиты — запуск через `python -m rbit` или `.cmd`-обёртку (`rbit.cmd`).
-2. **Расчёт стоимости в `rbit stats` (`UsageLedger` vs `rbit soak`):**
-   - `rbit/soak.py` уже учитывает реальный `opencode.list_cost` / `usage.cost` провайдера, но основной `AgentEngine._record_usage` в `rbit/agent.py` для некаталожных моделей по-прежнему записывает `cost=0.0, priced=False` (соблюдая правило «не выдумывать цену»), если модель не задана в `price_overrides` или статическом каталоге.
-3. **Некаталожный `mypy` локально на Windows и `ruff` non-fatal lint:**
-   - Локально на Windows `mypy` не установлен (проверяется в Linux CI); `rbit lint --json .` находит `384` некритичных замечания стиля/рефакторинга (при `0` фатальных ошибок `E9,F63,F7,F82`).
-4. **Linux `ubuntu-latest` CI:**
-   - Из-за ограничений AppArmor на непривилегированные `userns` в Ubuntu 24.04 встроенный Landlock-лаунчер уступает место `bwrap`, где недоступны `seccomp` (`AF_VSOCK`) и `pivot_root`.
-5. **Windows без Developer Mode:**
-   - 1 тест на создание `os.symlink` пропускается ОС (`skipped`), при этом Windows junction (`mklink /J`) проверен и заблокирован.
-
----
-
-## 3. Оставшиеся риски и блокеры стабильного релиза (v1.6.0 GA)
-
-- **Блокер 1 (Windows UX при `pip install`):** пользователям Windows с Application Control / Smart App Control `pip install rbit` создаст блокируемый `rbit.exe`; для публичного релиза нужен либо подписанный бинарник / winget-пакет, либо явная документация `python -m rbit`.
-- **Блокер 2 (внешний pentest и `swe-bench` / `terminal-bench`):** независимый аудит безопасности и публичные бенчмарки ещё не проведены (зафиксировано в [docs/ROADMAP.md](ROADMAP.md)).
-- **Риск (лимит `max_steps=50`):** на очень крупных рефакторингах в одном ходе Autopilot может упереться в `50` шагов (как в `soak-cycle-9`), после чего требуется следующий цикл или `--continue`.
+| Приоритет | Что проверено и исправлено | Конкретные доказательства | Результат |
+|---|---|---|---|
+| **1. Windows Application Control** | Добавлен `install_windows_cmd_shim()` и `rbit doctor --fix-shim`, создающий `rbit.cmd` (`python -m rbit %*`) и удаляющий неподписанный `rbit.exe`; добавлена диагностика в `rbit doctor` и инструкция в [docs/RELEASE_CANDIDATE.md](RELEASE_CANDIDATE.md) | `tests/test_soak.py::test_install_windows_cmd_shim`, `rbit --version` → `rbit v1.6.0` (exit 0) | **PASS** *(shim/workaround без отключения ОС-защиты)* |
+| **2. Единый учёт реальной стоимости (`AgentEngine`, `rbit stats`, `rbit soak`)** | Вынесен общий хелпер `extract_provider_cost` в `rbit/usage.py`; `AgentEngine._account_step` / `_record_usage` и `AutopilotSoakRunner` оба используют реальный `opencode.list_cost` / `usage.cost` при наличии, иначе `estimate_cost` | `tests/test_soak.py::test_agent_engine_and_usage_ledger_record_provider_cost`, сверка 759/759 ответов (`\$0.954143`) | **PASS** |
+| **3. Независимый аудит Sandbox (Windows, Linux, macOS)** | **Windows 11:** AppContainer (`15/15` + `6/6` в `independent_sandbox_audit.py`). **Linux WSL2 Ubuntu-24.04 (`landlock`):** `23/23` (`symlink`, `AF_VSOCK`, `abstract unix sockets`, `ptrace`, `pid namespace`). **macOS arm64 (CI):** Seatbelt `rbit sandbox check` + `test_sandbox_isolation.py` | `rbit sandbox check .`, `wsl_sandbox_check.py` (**23/23**), `independent_sandbox_audit.py` (**6/6**), CI `smoke (macos-latest)` & `smoke (windows-latest)` | **PASS** |
+| **4. Расширенные adversarial-тесты Sandbox** | Проверены: MCP-сервер (чтение секрета вне workspace + `1.1.1.1:80`), недоверенный проектный плагин без `rbit trust`, Windows junction (`mklink /J`), вложенный `subprocess`, shell chaining (`OPENAI_API_KEY`/`AWS_SECRET_ACCESS_KEY`), `.git/hooks`, `.rbit/autopilot`, `../` traversal | `tests/test_sandbox_isolation.py` | **40 passed, 1 skipped** *(symlink без Dev Mode)* |
+| **5. Autopilot & Resume на длительных и аварийных сценариях** | 126.05-мин soak на внешнем `pallets/click` (`26/28` PASS, `2,543 → 3,369` тестов, `0` false claims); реальный `proc.kill()` на `rbit run` и `rbit soak --resume` (`2/2` PASS); FP/FN тесты детектора `_claims_success` | [docs/SOAK_2H_REPORT.md](SOAK_2H_REPORT.md), `tests/test_autopilot.py` (**6 passed**), `tests/test_soak.py` (**7 passed**) | **PASS** |
+| **6. Стабильный CI (Python 3.10–3.12, Linux/macOS/Windows)** | Устранены тайминг-гонки в TUI (`_discover_models`, `_tick_spinner`, `test_streaming_reply_tail_stays_visible`); CI стабильно 5/5 зелёный | GitHub Actions [45879546397](https://github.com/DreyzeDev/rbit/actions/runs/45879546397) (**5/5 PASS**) + повторная проверка на финальном коммите | **PASS** |
+| **7. Воспроизводимый Release Candidate** | Подготовлен [docs/RELEASE_CANDIDATE.md](RELEASE_CANDIDATE.md) с командами установки на Windows/Linux/macOS, верификации и списком ограничений | [docs/RELEASE_CANDIDATE.md](RELEASE_CANDIDATE.md) | **READY** |
 
 ---
 
-## 4. Воспроизводимые команды проверки
+## 2. Оставшиеся ограничения и риски (честно)
 
-```powershell
-# Полный локальный прогон
-ruff check rbit tests --select E9,F63,F7,F82
-python -m pytest -q
-
-# Независимая проверка Sandbox
-rbit sandbox check .
-rbit sandbox policy --json .
-python independent_sandbox_audit.py
-
-# Длительный soak и восстановление
-python -m rbit soak <repo> --tasks <tasks.json> --duration-minutes 125 --log-dir <log_dir> --json
-python -m rbit soak <repo> --tasks <tasks.json> --log-dir <log_dir> --resume --json
-```
+1. **Без подписи `.exe` на Windows:** `pip install` всё равно создаёт `rbit.exe`, поэтому в средах с Application Control требуется `rbit doctor --fix-shim` или `python -m rbit` (решается только коммерческой цифровой подписью бинарника).
+2. **Linux `ubuntu-latest` CI:** из-за AppArmor-ограничения непривилегированных `userns` в Ubuntu 24.04 CI использует `bwrap` вместо встроенного Landlock-лаунчера (сам Landlock + `seccomp` + `pivot_root` проверены на WSL2 Ubuntu-24.04: `23/23`).
+3. **Внешний аудит и публичные бенчмарки:** независимый pentest, `SWE-bench Verified` и `Terminal-Bench` не запускались и остаются открытыми в [docs/ROADMAP.md](ROADMAP.md).

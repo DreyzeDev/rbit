@@ -29,7 +29,7 @@ from .router import apply_live_route, failover_candidates, router_enabled
 from .rules import load_rules
 from . import sandbox
 from .envscrub import sanitized_env
-from .usage import BudgetGuard, UsageLedger, estimate_cost, normalize_budget_mode, split_usage
+from .usage import BudgetGuard, UsageLedger, estimate_cost, extract_provider_cost, normalize_budget_mode, split_usage
 from .skills import load_skills, skills_prompt
 from .storage import StorageManager
 from .subagents import READONLY_TOOL_NAMES, SubagentDef, load_subagents, subagent_names
@@ -316,6 +316,7 @@ class AgentEngine:
         #: Token accounting of the running turn (provider usage, else estimates).
         self._turn_in = 0
         self._turn_out = 0
+        self._turn_cost = 0.0
         self._auto_design_section = ""
         self._opencode_session = ""
         self.on_trace_event: Callable[[dict[str, Any]], None] | None = None
@@ -476,9 +477,12 @@ class AgentEngine:
         return total
 
     def _account_step(self, api_messages: list[dict[str, Any]], content: str, tool_calls: list[dict[str, Any]]) -> None:
-        """Books input/output tokens of the step just finished into the turn totals."""
-        usage = split_usage(self._step_usage) if self._step_usage else None
+        """Books input/output tokens and provider cost of the step just finished."""
+        raw_usage = self._step_usage
         self._step_usage = None
+        if raw_usage:
+            self._turn_cost += extract_provider_cost(raw_usage)
+        usage = split_usage(raw_usage) if raw_usage else None
         if usage and (usage["input"] or usage["output"]):
             self._turn_in += usage["input"]
             self._turn_out += usage["output"]
@@ -817,6 +821,7 @@ class AgentEngine:
         self.executor.begin_turn()
         self._turn_in = 0
         self._turn_out = 0
+        self._turn_cost = 0.0
         self._turn_subagent_spent = 0.0
         self._turn_subagent_reserved = 0.0
         self._turn_subagent_count = 0
@@ -1132,9 +1137,12 @@ class AgentEngine:
             # what was actually sent (system prompt + history + tool results).
             usage["input"] = int(self._turn_in)
             usage["output"] = int(self._turn_out)
-        cost, priced = estimate_cost(
-            usage, info.cost_per_1k if info.priced else 0.0, self.get_config()
-        )
+        if getattr(self, "_turn_cost", 0.0) > 0:
+            cost, priced = round(float(self._turn_cost), 6), True
+        else:
+            cost, priced = estimate_cost(
+                usage, info.cost_per_1k if info.priced else 0.0, self.get_config()
+            )
         try:
             ledger.record(
                 model_id,

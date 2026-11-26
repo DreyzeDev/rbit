@@ -149,3 +149,41 @@ async def test_soak_checkpoint_and_resume_skips_completed_tasks(
     assert s2["tasks_total"] == 2
     assert calls == ["Do first", "Do second"]
     assert (ws / "a.txt").read_text(encoding="utf-8") == "v2-from-t1\n"
+
+
+def test_agent_engine_and_usage_ledger_record_provider_cost(tmp_path: Path) -> None:
+    from rbit.agent import AgentEngine
+    from rbit.models import Session
+    from rbit.tools import ToolExecutor
+    from rbit.usage import UsageLedger, extract_provider_cost
+
+    assert extract_provider_cost({"opencode": {"list_cost": 0.0042}}) == 0.0042
+    assert extract_provider_cost({"cost": 0.012}) == 0.012
+    assert extract_provider_cost(None) == 0.0
+
+    ledger = UsageLedger(tmp_path)
+    ex = ToolExecutor(workspace=tmp_path, session=Session(), get_config=lambda: {})
+    eng = AgentEngine(workspace=tmp_path, executor=ex, get_config=lambda: {}, usage=ledger)
+    eng._step_usage = {"prompt_tokens": 2000, "completion_tokens": 500, "opencode": {"list_cost": 0.0025}}
+    eng._account_step([], "ok", [])
+    eng._record_usage("deepseek-v4.1-flash", 2500, 1.0, Session())
+
+    rows = ledger.read_day()
+    assert len(rows) == 1
+    assert rows[0].input_tokens == 2000
+    assert rows[0].output_tokens == 500
+    assert rows[0].cost_usd == 0.0025
+    assert rows[0].priced is True
+
+
+def test_install_windows_cmd_shim(tmp_path: Path) -> None:
+    from rbit.cli import install_windows_cmd_shim
+
+    scripts = tmp_path / "Scripts"
+    scripts.mkdir()
+    exe = scripts / "rbit.exe"
+    exe.write_bytes(b"MZ")
+    cmd_path = install_windows_cmd_shim(scripts, remove_exe=True)
+    assert cmd_path.exists()
+    assert "-m rbit %*" in cmd_path.read_text(encoding="ascii")
+    assert not exe.exists()
