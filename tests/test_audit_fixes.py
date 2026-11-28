@@ -11,7 +11,7 @@ import pytest
 from rbit.models import Session
 from rbit.storage import StorageManager
 from rbit.tools import ToolExecutor
-from tests.test_serve_security import _request, _start_server
+from test_serve_security import _request, _start_server
 
 
 def _executor(tmp_path: Path) -> ToolExecutor:
