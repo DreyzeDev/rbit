@@ -497,7 +497,7 @@ class ThemeSelectorModal(ModalScreen[str | None]):
         self._populate(event.value)
 
     @on(Input.Submitted, "#theme-search")
-    def _on_enter(self) -> None:
+    def _on_theme_search_enter(self) -> None:
         olist = self.query_one("#theme-list", OptionList)
         if olist.highlighted is not None:
             opt = olist.get_option_at_index(olist.highlighted)

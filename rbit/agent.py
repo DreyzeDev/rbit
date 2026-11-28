@@ -306,7 +306,7 @@ class AgentEngine:
         self.retry_max_delay = 8.0
         self._provider_models_synced_at = 0.0
         self._bg_tasks: set = set()
-        self.on_background_done = None  # async callable(ChatMessage) for GUI hooks
+        self.on_background_done: Callable[[ChatMessage], Awaitable[None]] | None = None  # GUI hook
         self.last_api_latency: float | None = None
         self._active_profile_tools: set[str] | None = None
         self._active_profile_readonly: bool = False
@@ -828,7 +828,7 @@ class AgentEngine:
         self._turn_subagent_files: dict[str, str] = {}
         self._subagent_budget_lock = asyncio.Lock()
         self._autopilot_resume_note = ""
-        if agent_mode == "autopilot" and getattr(session, "id", ""):
+        if agent_mode == "autopilot" and getattr(session, "id", None):
             prior_ap = self.storage.load_autopilot_state(session.id)
             if prior_ap and prior_ap.get("status") in ("running", "paused"):
                 todos_txt = ", ".join(
@@ -1008,7 +1008,7 @@ class AgentEngine:
                     on_status=on_status,
                 )
         except Exception as exc:
-            if agent_mode == "autopilot" and getattr(session, "id", ""):
+            if agent_mode == "autopilot" and getattr(session, "id", None):
                 self.storage.save_autopilot_state(
                     session.id,
                     {
@@ -1082,7 +1082,7 @@ class AgentEngine:
                     f"({new_pct * 100:.0f}% used)"
                 )
         self._record_usage(model_id, tokens_est, elapsed, session)
-        if agent_mode == "autopilot" and getattr(session, "id", ""):
+        if agent_mode == "autopilot" and getattr(session, "id", None):
             todo_dicts = [t.to_dict() if hasattr(t, "to_dict") else t for t in (session.todos or [])]
             has_open_todos = any(
                 isinstance(td, dict) and td.get("status") in ("pending", "in_progress")
@@ -1358,7 +1358,8 @@ class AgentEngine:
                 # The app renders ONE live card per turn: feed it the text of
                 # every step so far, not just the current one.
                 parts = [*step_texts, partial] if partial else list(step_texts)
-                await on_stream_chunk("\n\n".join(p for p in parts if p))
+                if on_stream_chunk is not None:
+                    await on_stream_chunk("\n\n".join(p for p in parts if p))
 
             for _step in range(max_steps):
                 if _step > 0 and cfg_limits.get("auto_compact", True) and len(api_messages) > 6:
@@ -2034,7 +2035,7 @@ class AgentEngine:
                     )
                     for call in tool_calls
                 ]
-                results = await self._run_native_calls(calls, invoke_tool, on_status)
+                native_results = await self._run_native_calls(calls, invoke_tool, on_status)
                 messages.append(
                     {
                         "role": "user",
@@ -2045,7 +2046,7 @@ class AgentEngine:
                                 "content": body_text[:8000] or "(no output)",
                                 **({"is_error": True} if not res.ok else {}),
                             }
-                            for cid, res, body_text in results
+                            for cid, res, body_text in native_results
                         ],
                     }
                 )

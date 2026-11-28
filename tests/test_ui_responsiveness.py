@@ -392,7 +392,7 @@ async def test_answer_revealed_at_end_of_turn_even_if_user_scrolled_up(
     """
     from rbit.app import RbitApp
     from rbit.models import ChatMessage, Session, ToolCallRecord, short_id
-    from rbit.widgets import ChatScroll, ToolCallCard
+    from rbit.widgets import ChatScroll
 
     # Pre-existing history: the log is already scrollable before the turn
     # starts, so "scroll up mid-turn" is a meaningful action.

@@ -48,5 +48,8 @@ AppImage для Linux). На CI сборка идёт через workflow
 
 The backend is started with `RBIT_APPROVALS=1`: every shell command the agent wants to run
 opens an approval dialog (Allow once / Always allow this exact command / Deny, Esc denies).
-The OS sandbox (`shell_sandbox`) is off unless you enable it in `.rbit/config.json`; the
-"Sandbox" chip in the header shows its state.
+The OS sandbox is on by default in the desktop app (`shell_sandbox: "auto"`: commands run inside
+it when this machine has a sandbox backend, and the "Sandbox" chip shows `auto` or `off` when it
+does not). Inside it there is no network and only the workspace is writable; to allow the network
+set `"shell_sandbox_network": true` in `.rbit/config.json`, or turn the sandbox off with
+`"shell_sandbox": "off"` there (or `RBIT_SHELL_SANDBOX=off` in the environment).

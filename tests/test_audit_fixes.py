@@ -180,3 +180,158 @@ async def test_small_terminal_keeps_the_prompt_box_whole(tmp_path: Path, monkeyp
         await pilot.pause()
         box = app.query_one("#prompt-box")
         assert box.region.bottom <= app.size.height
+
+
+# --- i18n -------------------------------------------------------------------
+
+
+def test_locale_follows_config_and_environment() -> None:
+    from rbit.i18n import detect_locale, set_locale, tr
+
+    assert detect_locale({"LANG": "ru_RU.UTF-8"}) == "ru"
+    assert detect_locale({"LC_ALL": "en_US.UTF-8", "LANG": "ru_RU.UTF-8"}) == "en"
+    assert detect_locale({}) == "en"
+    try:
+        assert set_locale("ru") == "ru"
+        assert tr("agent_busy").startswith("Агент занят")
+        assert set_locale("en") == "en"
+        assert tr("agent_busy").startswith("Agent is busy")
+        assert tr("auto_compact", pct=81.4) == "Context 81% — auto-compacting…"
+        assert set_locale("klingon") == "en"
+        assert tr("no-such-key") == "no-such-key"
+    finally:
+        set_locale("en")
+
+
+def test_every_russian_string_has_an_english_twin() -> None:
+    from rbit.i18n import _STRINGS
+
+    assert set(_STRINGS["ru"]) == set(_STRINGS["en"])
+    for key, text in _STRINGS["ru"].items():
+        # same placeholders in both languages
+        import re
+
+        assert sorted(re.findall(r"\{(\w+)", text)) == sorted(re.findall(r"\{(\w+)", _STRINGS["en"][key])), key
+
+
+# --- `rbit plugin` ----------------------------------------------------------
+
+
+def test_plugin_subcommands_are_routed(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from rbit.cli import _is_package_plugin_command, main as cli_main
+
+    assert _is_package_plugin_command(["add", "pkg"])
+    assert _is_package_plugin_command(["check"])
+    assert not _is_package_plugin_command(["install", "x"])
+    assert not _is_package_plugin_command(["list"])
+    assert _is_package_plugin_command(["remove", "not-installed", "-d", str(tmp_path)])
+    assert cli_main(["plugin", "check", "-d", str(tmp_path)]) == 0
+    assert "No updates available" in capsys.readouterr().out
+
+
+# --- schedules --------------------------------------------------------------
+
+
+def test_schedule_input_is_validated(tmp_path: Path) -> None:
+    from rbit.scheduler import MAX_SCHEDULES, Scheduler
+
+    sched = Scheduler(tmp_path)
+    assert sched.add("x" * 9000, "every 30m")[0] is None
+    assert "unknown agent" in sched.add("do it", "every 30m", agent="root")[1]
+    assert sched.add("do it", "every 30m", model="has space")[0] is None
+    entry, err = sched.add("do it", "every 30m", name="  a   b  ", agent="REVIEW")
+    assert err == "" and entry is not None
+    assert entry["name"] == "a b" and entry["agent"] == "review"
+    for _ in range(MAX_SCHEDULES - 1):
+        assert sched.add("p", "every 30m")[0] is not None
+    assert "too many schedules" in sched.add("p", "every 30m")[1]
+
+
+# --- sandbox default from the environment -----------------------------------
+
+
+def test_env_sets_the_default_sandbox_mode_but_config_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RBIT_SHELL_SANDBOX", "auto")
+    assert StorageManager(tmp_path).load_config()["shell_sandbox"] == "auto"
+    monkeypatch.setenv("RBIT_SHELL_SANDBOX", "nonsense")
+    assert "shell_sandbox" not in StorageManager(tmp_path).load_config()
+    monkeypatch.setenv("RBIT_SHELL_SANDBOX", "auto")
+    (tmp_path / ".rbit").mkdir(exist_ok=True)
+    (tmp_path / ".rbit" / "config.json").write_text('{"shell_sandbox": "off"}', encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))  # home-dir workspace: config is fully trusted
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    assert StorageManager(tmp_path).load_config()["shell_sandbox"] == "off"
+
+
+# --- sandbox -----------------------------------------------------------------
+
+
+def test_unavailable_message_does_not_claim_strict_in_status_output() -> None:
+    from rbit import sandbox
+
+    assert "`strict`" in sandbox.unavailable_message()  # a refused command: strict was configured
+    soft = sandbox.unavailable_message(strict=False)
+    assert "`strict`" not in soft and "cannot be turned on" in soft
+
+
+def test_bwrap_protects_git_config_and_system_secrets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from rbit.sandbox import linux
+    from rbit.sandbox.policy import policy_from_config
+
+    (tmp_path / ".git" / "hooks").mkdir(parents=True)
+    (tmp_path / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+    monkeypatch.setattr("os.path.lexists", lambda p: str(p) in ("/etc/shadow", "/etc/ssl/private") or Path(p).exists())
+    monkeypatch.setattr("os.path.isdir", lambda p: str(p) == "/etc/ssl/private" or Path(p).is_dir())
+    argv = linux.bwrap_argv(["true"], policy_from_config({}, tmp_path))
+    joined = " ".join(argv)
+    assert f"--ro-bind-try {tmp_path}/.git/config {tmp_path}/.git/config" in joined
+    assert f"--ro-bind-try {tmp_path}/.git/hooks {tmp_path}/.git/hooks" in joined
+    assert "--ro-bind /dev/null /etc/shadow" in joined
+    assert "--tmpfs /etc/ssl/private" in joined
+    # the secrets are masked AFTER the whole root was bound, or they would be exposed again
+    assert joined.index("--ro-bind / /") < joined.index("/etc/shadow")
+
+
+def test_macos_profile_protects_git_config_like_the_other_backends(tmp_path: Path) -> None:
+    from rbit.sandbox import macos
+    from rbit.sandbox.policy import policy_from_config
+
+    profile = macos.profile(policy_from_config({}, tmp_path))
+    resolved = str(tmp_path.resolve())
+    assert f'(deny file-write* (literal "{resolved}/.git/config"))' in profile
+    assert f'(deny file-write* (subpath "{resolved}/.git/hooks"))' in profile
+
+
+# --- release templates -------------------------------------------------------
+
+
+def test_render_distribution_fills_every_placeholder(tmp_path: Path) -> None:
+    import hashlib
+    import importlib.util
+    import json as _json
+
+    spec = importlib.util.spec_from_file_location(
+        "render_distribution", Path(__file__).resolve().parent.parent / "scripts" / "render_distribution.py"
+    )
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    sdist = tmp_path / "rbit-1.7.0.tar.gz"
+    sdist.write_bytes(b"sdist bytes")
+    zip_path = tmp_path / "rbit-1.7.0-windows-x64.zip"
+    zip_path.write_bytes(b"zip bytes")
+    out = tmp_path / "out"
+    assert mod.main(["--version", "1.7.0", "--sdist", str(sdist), "--out", str(out)]) == 0
+    assert sorted(p.name for p in out.iterdir()) == ["rbit.rb"]  # no Windows zip: no scoop/winget
+    brew = (out / "rbit.rb").read_text(encoding="utf-8")
+    assert 'version "1.7.0"' in brew and hashlib.sha256(b"sdist bytes").hexdigest() in brew
+    assert "<VERSION>" not in brew and "PLACEHOLDER" not in brew
+
+    assert mod.main(["--version", "1.7.0", "--sdist", str(sdist), "--windows-zip", str(zip_path), "--out", str(out)]) == 0
+    scoop = _json.loads((out / "rbit.scoop.json").read_text(encoding="utf-8"))
+    assert scoop["version"] == "1.7.0"
+    assert scoop["architecture"]["64bit"]["hash"] == hashlib.sha256(b"zip bytes").hexdigest()
+    winget = (out / "rbit.winget").read_text(encoding="utf-8")
+    assert "PackageVersion: 1.7.0" in winget and "v1.7.0/rbit-1.7.0-windows-x64.zip" in winget
+    assert mod.main(["--version", "v1.7", "--sdist", str(sdist), "--out", str(out)]) == 2

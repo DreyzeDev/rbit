@@ -535,7 +535,7 @@ class MCPClient:
                         raw_name=raw_name,
                         exposed_name="",
                         description=str(item.get("description") or "").strip(),
-                        input_schema=item.get("inputSchema") if isinstance(item.get("inputSchema"), dict) else {},
+                        input_schema=dict(item["inputSchema"]) if isinstance(item.get("inputSchema"), dict) else {},
                     )
                 )
             cursor = result.get("nextCursor")

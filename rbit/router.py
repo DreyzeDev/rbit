@@ -166,9 +166,9 @@ def failover_candidates(current_model: str, config: dict[str, Any] | None) -> li
                 seen.add(m)
                 out.append(m)
     for tier in ("balanced", "fast", "deep"):
-        m = _tier_map(config).get(tier)
-        if m and m not in seen:
-            seen.add(m)
+        tier_model = _tier_map(config).get(tier)
+        if tier_model and tier_model not in seen:
+            seen.add(tier_model)
             out.append(m)
     return out
 

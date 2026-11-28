@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from textual import events, on, work
 from textual.app import App, ComposeResult
@@ -47,6 +47,7 @@ from .modals import (
     ThemeSelectorModal,
     TodoManagerModal,
 )
+from .i18n import set_locale, tr
 from .models import (
     ChatMessage,
     FileChangeStat,
@@ -104,7 +105,7 @@ def _write_clipboard(text: str) -> bool:
     if not text:
         return False
     try:
-        import pyperclip  # type: ignore
+        import pyperclip
 
         pyperclip.copy(text)
         return True
@@ -551,6 +552,7 @@ class RbitApp(App[None]):
         self._history_recalled: str | None = None
         self._load_older_seq: int = 0
         self._auto_fix_round: bool = False
+        set_locale(str(self.config_data.get("locale") or "auto"))
         self._sidebar_width: int = max(24, min(60, int(self.config_data.get("sidebar_width", 34))))
         self._stream_chars: int = 0
         self._spin_frame: int = 0
@@ -637,7 +639,7 @@ class RbitApp(App[None]):
             yield SidebarPanel(self.workspace)
         yield BottomStatusBar()
 
-    def notify(  # type: ignore[override]
+    def notify(
         self,
         message: str,
         *,
@@ -1075,7 +1077,7 @@ class RbitApp(App[None]):
                 self.executor.allowed_bash_prefixes.append(prefix)
                 self.config_data["allowed_bash_prefixes"] = list(self.executor.allowed_bash_prefixes)
                 self.storage.save_config(self.config_data)
-            self.notify(f"Команда «{prefix}» больше не спрашивается.", timeout=2.5)
+            self.notify(tr("prefix_allowed", prefix=prefix), timeout=2.5)
             return True
         return choice == "once"
 
@@ -1401,7 +1403,7 @@ class RbitApp(App[None]):
     @work
     async def action_open_todos(self) -> None:
         if self.is_busy:
-            self.notify("Agent is busy — press Esc first.", severity="warning")
+            self.notify(tr("agent_busy"), severity="warning")
             return
         updated = await self.push_screen_wait(TodoManagerModal(self.session.todos))
         if updated is not None:
@@ -1415,7 +1417,7 @@ class RbitApp(App[None]):
     @work
     async def action_open_checkpoints(self) -> None:
         if self.is_busy:
-            self.notify("Agent is busy — press Esc first.", severity="warning")
+            self.notify(tr("agent_busy"), severity="warning")
             return
         cps = self.storage.list_checkpoints()
         res = await self.push_screen_wait(CheckpointModal(cps))
@@ -1425,7 +1427,7 @@ class RbitApp(App[None]):
                 self._cmd_checkpoint(payload)
             elif action == "restore":
                 if self.is_busy:
-                    self.notify("Agent is busy — press Esc first.", severity="warning")
+                    self.notify(tr("agent_busy"), severity="warning")
                     self.query_one("#prompt-input", Input).focus()
                     return
                 msg = self.executor.restore_checkpoint(payload)
@@ -1459,7 +1461,7 @@ class RbitApp(App[None]):
         turn's debounced save wrote the file again after the delete.
         """
         if sid == self.session.id and self.is_busy:
-            self.notify("Cannot delete the current session while the agent is busy — press Esc first.", severity="warning")
+            self.notify(tr("delete_busy"), severity="warning")
             return False
         self.storage.delete_session(sid)
         if sid == self.session.id:
@@ -1495,7 +1497,7 @@ class RbitApp(App[None]):
 
     def action_new_session(self) -> None:
         if self.is_busy:
-            self.notify("Agent is busy — press Esc first.", severity="warning")
+            self.notify(tr("agent_busy"), severity="warning")
             return
         self._queued_prompt = None
         self.session = Session()
@@ -1515,7 +1517,7 @@ class RbitApp(App[None]):
 
     def action_clear_chat(self) -> None:
         if self.is_busy:
-            self.notify("Agent is busy — press Esc first.", severity="warning")
+            self.notify(tr("agent_busy"), severity="warning")
             return
         self.session.messages.clear()
         self.storage.save_session(self.session)  # otherwise the "cleared" chat comes back on resume
@@ -1576,7 +1578,7 @@ class RbitApp(App[None]):
             None,
         )
         if last is None:
-            self.notify("Nothing to copy yet — no assistant answer in this session.", severity="warning")
+            self.notify(tr("nothing_copy"), severity="warning")
             return
         if _write_clipboard(last.content):
             self.notify("Copied the last answer to the clipboard.", timeout=2.0)
@@ -1605,7 +1607,7 @@ class RbitApp(App[None]):
 
     def _load_session_into_ui(self, sess: Session) -> None:
         if self.is_busy:
-            self.notify("Agent is busy — press Esc first.", severity="warning")
+            self.notify(tr("agent_busy"), severity="warning")
             return
         self._queued_prompt = None
         self.session = sess
@@ -1704,7 +1706,7 @@ class RbitApp(App[None]):
             if facts:
                 added = self.storage.append_project_memory(facts)
                 if added:
-                    self.notify(f"🧠 Память пополнена (+{added}).", timeout=2.0)
+                    self.notify(tr("memory_added", added=added), timeout=2.0)
         except Exception:
             pass
 
@@ -1721,14 +1723,14 @@ class RbitApp(App[None]):
             return
         pct = self.session.total_tokens / info.context_window * 100
         if pct >= threshold:
-            self.notify(f"Контекст {pct:.0f}% — авто-компакция…", timeout=3.0)
+            self.notify(tr("auto_compact", pct=pct), timeout=3.0)
             self._start_compact()
 
     @work
     async def _cmd_continue_session(self, arg: str) -> None:
         """/continue <id|prefix> — вплетает выжимку другой сессии в текущую."""
         if self.is_busy:
-            self.notify("Agent is busy — press Esc first.", severity="warning")
+            self.notify(tr("agent_busy"), severity="warning")
             return
         arg = arg.strip()
         if not arg:
@@ -1739,9 +1741,9 @@ class RbitApp(App[None]):
             self.notify(f"Session not found: {arg}", severity="warning")
             return
         if other.id == self.session.id:
-            self.notify("Это и есть текущая сессия.", timeout=2.0)
+            self.notify(tr("is_current"), timeout=2.0)
             return
-        self.notify("Собираю выжимку…", timeout=2.0)
+        self.notify(tr("summarising"), timeout=2.0)
         msgs = other.messages[-12:] if len(other.messages) > 12 else other.messages
         summary = await self.engine.summarize_session(
             msgs, self.config_data.get("model", "rbit/smart-local")
@@ -1773,7 +1775,7 @@ class RbitApp(App[None]):
         parts = arg.split(maxsplit=1)
         if not parts or not parts[0]:
             if not skills:
-                self.notify("Нет скиллов. Создай .rbit/skills/<name>.md", severity="warning")
+                self.notify(tr("no_skills"), severity="warning")
                 return
             lines = ["[bold #eeeeee]Skills[/]"]
             for name, meta in skills.items():
@@ -1836,7 +1838,7 @@ class RbitApp(App[None]):
         if op in ("add", "remove"):
             name = parts[1].strip() if len(parts) > 1 else ""
             if not name:
-                self.notify("Usage: /mcp add <name> <command…> | /mcp add <name> --url <url> | /mcp remove <name>", severity="warning")
+                self.notify(tr("usage_mcp"), severity="warning")
                 return
             if op == "remove":
                 configs.pop(name, None)
@@ -1851,7 +1853,7 @@ class RbitApp(App[None]):
             if rest and rest[0] in ("--url", "-u"):
                 url = rest[1] if len(rest) > 1 else ""
                 if not url:
-                    self.notify("Usage: /mcp add <name> --url <https://…>", severity="warning")
+                    self.notify(tr("usage_mcp_url"), severity="warning")
                     return
                 configs[name] = {"type": "remote", "url": url}
             elif rest and rest[0] in ("--header", "-H") and len(rest) > 1:
@@ -1859,17 +1861,17 @@ class RbitApp(App[None]):
             else:
                 command = " ".join(rest).strip()
                 if not command:
-                    self.notify("Usage: /mcp add <name> <command…>", severity="warning")
+                    self.notify(tr("usage_mcp_cmd"), severity="warning")
                     return
                 configs[name] = {"type": "local", "command": command}
             self.config_data["mcp"] = configs
             self.storage.save_config(self.config_data)
-            self.notify(f"MCP server added: {name} (connecting…)", timeout=2.0)
+            self.notify(tr("mcp_added", name=name), timeout=2.0)
             self._reload_mcp()
             return
 
         if op in ("reload", "restart"):
-            self.notify("Reconnecting MCP servers…", timeout=1.5)
+            self.notify(tr("mcp_reconnect"), timeout=1.5)
             self._reload_mcp()
             return
 
@@ -2132,7 +2134,7 @@ class RbitApp(App[None]):
             inp.cursor_position = len(new_text)
             inp.focus()
             if new_text:
-                self.notify("Промпт подставлен — Enter для отправки.", timeout=2.0)
+                self.notify(tr("prompt_filled"), timeout=2.0)
         else:
             self.notify(f"Saved: {self.executor.rel_display(target)}", timeout=2.0)
         self._sync_ui()
@@ -2214,7 +2216,7 @@ class RbitApp(App[None]):
         as a busy job: sets `is_busy`, is cancellable with Esc, and refuses to
         overlap an agent turn. Returns False when it could not start."""
         if self.is_busy:
-            self.notify("Agent is busy — press Esc first.", severity="warning")
+            self.notify(tr("agent_busy"), severity="warning")
             return False
         self.is_busy = True
         self.busy_status = status
@@ -2249,7 +2251,7 @@ class RbitApp(App[None]):
                 try:
                     import winsound
 
-                    winsound.MessageBeep()
+                    cast(Any, winsound).MessageBeep()
                 except Exception:
                     pass
             elif sys.platform == "darwin":
@@ -2583,7 +2585,7 @@ class RbitApp(App[None]):
             return True
         if cmd == "/rewind":
             if self.is_busy:
-                self.notify("Agent is busy — press Esc first.", severity="warning")
+                self.notify(tr("agent_busy"), severity="warning")
                 return True
             self.action_open_checkpoints()
             return True
@@ -2696,7 +2698,7 @@ class RbitApp(App[None]):
         if cmd == "/help":
             self._cmd_help()
             return True
-
+        return False
 
     # --- Plan / Execute / Bug workflows ---
 
@@ -2750,7 +2752,7 @@ class RbitApp(App[None]):
         """`/bug <symptom>` - reproduce, isolate with git bisect, then fix."""
         symptom = arg.strip()
         if not symptom:
-            self.notify("Usage: /bug <что сломано>", severity="warning")
+            self.notify(tr("usage_bug"), severity="warning")
             return
         self.agent_mode = "build"
         self._sync_ui()
@@ -2882,7 +2884,7 @@ class RbitApp(App[None]):
 
     def _cmd_compact(self) -> None:
         if self.is_busy:
-            self.notify("Agent is busy — press Esc first.", severity="warning")
+            self.notify(tr("agent_busy"), severity="warning")
             return
         if len(self.session.messages) <= 2:
             self.notify("Context is already compact.", timeout=2.0)
@@ -2946,7 +2948,7 @@ class RbitApp(App[None]):
 
     def _cmd_retry(self) -> None:
         if self.is_busy:
-            self.notify("Agent is busy — press Esc first.", severity="warning")
+            self.notify(tr("agent_busy"), severity="warning")
             return
         msgs = self.session.messages
         # Skip the "[auto] Self-check ..." follow-up the app writes itself: retrying must resend what
@@ -2960,7 +2962,7 @@ class RbitApp(App[None]):
             None,
         )
         if idx is None:
-            self.notify("Nothing to retry — no user prompt in this session.", severity="warning")
+            self.notify(tr("nothing_retry"), severity="warning")
             return
         user_msg = msgs[idx]
         self.session.messages = msgs[: idx + 1]
@@ -2973,18 +2975,18 @@ class RbitApp(App[None]):
 
     def _cmd_fork(self, arg: str) -> None:
         if self.is_busy:
-            self.notify("Agent is busy — press Esc first.", severity="warning")
+            self.notify(tr("agent_busy"), severity="warning")
             return
         msgs = self.session.messages
         if not msgs:
-            self.notify("Nothing to fork — session is empty.", severity="warning")
+            self.notify(tr("nothing_fork"), severity="warning")
             return
         upto = len(msgs)
         if arg.strip():
             try:
                 upto = max(1, min(len(msgs), int(arg.strip())))
             except ValueError:
-                self.notify("Usage: /fork [N] — N is the message index to branch at.", timeout=3.0)
+                self.notify(tr("usage_fork"), timeout=3.0)
                 return
         forked = Session(title=(self.session.title[:40] + " (fork)"))
         forked.messages = [ChatMessage.from_dict(m.to_dict()) for m in msgs[:upto]]
@@ -3000,11 +3002,11 @@ class RbitApp(App[None]):
     def _cmd_commit(self, arg: str) -> None:
         token = arg.strip().lower()
         if self.is_busy and token not in ("cancel", "no", "abort"):
-            self.notify("Agent is busy — press Esc first.", severity="warning")
+            self.notify(tr("agent_busy"), severity="warning")
             return
         if token in ("yes", "y", "confirm", "apply"):
             if not self._pending_commit:
-                self.notify("No pending commit — run /commit first.", timeout=2.5)
+                self.notify(tr("no_pending_commit"), timeout=2.5)
                 return
             self._run_commit_apply()
             return
@@ -3026,7 +3028,7 @@ class RbitApp(App[None]):
         unstaged = await self.engine._run_git("diff")
         staged = await self.engine._run_git("diff", "--staged")
         if not status.strip() and not unstaged.strip() and not staged.strip():
-            self.notify("Nothing to commit — working tree is clean.", timeout=2.5)
+            self.notify(tr("nothing_commit"), timeout=2.5)
             return
         stat = "\n".join(part for part in (unstaged_stat, staged_stat) if part) or status
         diff = "\n".join(part for part in (unstaged, staged) if part) or status
@@ -3115,7 +3117,7 @@ class RbitApp(App[None]):
         if raw.startswith("!"):
             if self.is_busy:
                 event.input.value = raw  # keep what was typed: it was cleared a few lines above
-                self.notify("Agent is busy — press Esc first.", severity="warning")
+                self.notify(tr("agent_busy"), severity="warning")
                 return
             cmd_str = raw[1:].strip()
             if cmd_str:
@@ -3178,10 +3180,10 @@ class RbitApp(App[None]):
         lowered = raw_text.lower()
         if lowered.startswith(("спланируй", "составь план", "план:", "plan:")) and self.agent_mode != "plan":
             self.agent_mode = "plan"
-            self.notify("Plan mode (по фразе в промпте).", timeout=2.0)
+            self.notify(tr("plan_by_phrase"), timeout=2.0)
         elif self._phrase_is_build(lowered) and self.agent_mode != "build":
             self.agent_mode = "build"
-            self.notify("Build mode (по фразе в промпте).", timeout=2.0)
+            self.notify(tr("build_by_phrase"), timeout=2.0)
 
         # Budget guard: a hard stop happens *before* the paid call, never after.
         allowed, budget_msg = self.budget.check(self.config_data.get("model", ""))
@@ -3198,7 +3200,7 @@ class RbitApp(App[None]):
             # it is dispatched automatically when the current turn finishes.
             self._queued_prompts.append(raw_text)
             preview = raw_text.strip().replace("\n", " ")[:40]
-            self.notify(f"В очереди — выполнится после текущего хода: {preview}", timeout=3.0)
+            self.notify(tr("queued", preview=preview), timeout=3.0)
             self._sync_ui()
             return
 
@@ -3448,7 +3450,7 @@ class RbitApp(App[None]):
                 import time as _time
 
                 if _time.monotonic() - self._turn_started > 30:
-                    self._os_notify("Ход завершён")
+                    self._os_notify(tr("turn_done"))
             changed_files = {
                 rel: st
                 for rel, st in session.modified_files.items()

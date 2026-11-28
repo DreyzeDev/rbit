@@ -89,7 +89,7 @@ function startBackend() {
   backend = spawn(py, ["-c", boot, "serve", "--port", String(PORT), "-d", WORKSPACE], {
     cwd: WORKSPACE,
     // RBIT_APPROVALS=1: every shell command asks the user first (the renderer shows the dialog).
-    env: { ...process.env, PYTHONUNBUFFERED: "1", RBIT_SERVER_TOKEN: TOKEN, RBIT_APPROVALS: "1" },
+    env: { ...process.env, PYTHONUNBUFFERED: "1", RBIT_SERVER_TOKEN: TOKEN, RBIT_APPROVALS: "1", RBIT_SHELL_SANDBOX: process.env.RBIT_SHELL_SANDBOX || "auto" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   backend.stderr.on("data", (d) => console.error("[rbit]", String(d)));

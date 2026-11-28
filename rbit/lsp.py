@@ -179,11 +179,18 @@ def build_servers(config: dict[str, Any] | None, workspace: Path) -> list[LSPSer
     for name, entry in overrides.items():
         if name in BUILTIN_SERVERS or not isinstance(entry, dict) or entry.get("disabled") is True:
             continue
-        command = entry.get("command")
-        extensions = entry.get("extensions")
-        if not isinstance(command, list) or not command or not isinstance(extensions, list) or not extensions:
+        raw_command = entry.get("command")
+        raw_extensions = entry.get("extensions")
+        if (
+            not isinstance(raw_command, list)
+            or not raw_command
+            or not isinstance(raw_extensions, list)
+            or not raw_extensions
+        ):
             continue
-        resolved = _resolve_command(workspace, [str(part) for part in command])
+        command_parts: list[Any] = raw_command
+        ext_parts: list[Any] = raw_extensions
+        resolved = _resolve_command(workspace, [str(part) for part in command_parts])
         if resolved is None:
             continue
         initialization = entry.get("initialization")
@@ -191,7 +198,7 @@ def build_servers(config: dict[str, Any] | None, workspace: Path) -> list[LSPSer
             LSPServerDef(
                 name=name,
                 command=resolved,
-                extensions=[str(ext).lower() if str(ext).startswith(".") else f".{str(ext).lower()}" for ext in extensions],
+                extensions=[str(ext).lower() if str(ext).startswith(".") else f".{str(ext).lower()}" for ext in ext_parts],
                 language_ids={str(k).lower(): str(v) for k, v in (entry.get("language_ids") or {}).items()},
                 initialization=initialization if isinstance(initialization, dict) else {},
             )
@@ -587,9 +594,10 @@ class LSPClient:
                     continue
                 text_document = change.get("textDocument")
                 uri = text_document.get("uri") if isinstance(text_document, dict) else ""
-                target = self._uri_to_path(str(uri)) if uri else None
-                if target is None or not self._inside_workspace(target):
+                maybe_target = self._uri_to_path(str(uri)) if uri else None
+                if maybe_target is None or not self._inside_workspace(maybe_target):
                     continue
+                target = maybe_target
                 for item in change.get("edits") or []:
                     if not isinstance(item, dict):
                         continue

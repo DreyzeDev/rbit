@@ -425,7 +425,7 @@ class UserMessageCard(Static):
 
     def render(self) -> Group:
         body = Text(self.msg.content, style="#eeeeee")
-        parts: list[object] = [body]
+        parts: list[Any] = [body]
         if self.msg.attachments:
             att_line = Text()
             for att in self.msg.attachments:

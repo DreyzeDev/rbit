@@ -17,7 +17,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
@@ -300,7 +300,10 @@ async def _run_headless(args: argparse.Namespace) -> int:
         from rbit.soak import SoakTraceWriter
 
         trace_writer = SoakTraceWriter(Path(args.trace_log).expanduser())
-        engine.on_trace_event = lambda ev: trace_writer.emit(str(ev.pop("event", "trace")), **ev)
+        def _trace(ev: dict[str, Any]) -> None:
+            trace_writer.emit(str(ev.pop("event", "trace")), **ev)
+
+        engine.on_trace_event = _trace
     await engine.refresh_ollama_models()
 
     if cfg.get("auto_compact", True) and len(session.messages) >= 8:
@@ -529,12 +532,12 @@ def _run_sandbox(workspace: Path, action: str, as_json: bool = False) -> int:
     print(f"platform: {info['platform']}   backend: {info['backend'] or 'none'}   mode: {info['mode']}   network: {'allowed' if info['network'] else 'blocked'}")
     if action == "status":
         if info["backend"] is None:
-            print("No sandbox backend on this machine: " + sandbox.unavailable_message())
+            print("No sandbox backend: " + sandbox.unavailable_message(strict=False))
             return 1 if info["mode"] == "strict" else 0
         print("Turn it on with `shell_sandbox: \"auto\"` (or \"strict\") in .rbit/config.json. Run `rbit sandbox check` to prove the isolation here.")
         return 0
     if info["backend"] is None:
-        print("Cannot check: " + sandbox.unavailable_message())
+        print("Cannot check: " + sandbox.unavailable_message(strict=False))
         return 1
     from .sandbox.selftest import run_checks
 
@@ -1174,7 +1177,7 @@ def _run_status(workspace: Path, as_json: bool = False) -> int:
     sessions = storage.list_sessions(include_archived=True)
     service = ServiceManager().status()
     risk = analyze_risk(workspace)
-    mcp = cfg.get("mcp") if isinstance(cfg.get("mcp"), dict) else {}
+    mcp: dict[str, Any] = cfg["mcp"] if isinstance(cfg.get("mcp"), dict) else {}
     data = {
         "workspace": str(workspace),
         "git_branch": detect_git_branch(workspace),
@@ -1749,7 +1752,7 @@ def _run_update(
         cmd = [sys.executable, "-m", "pip", "install", f"rbit=={version}"]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         ok = proc.returncode == 0
-        payload = {
+        payload: dict[str, Any] = {
             "status": "updated" if ok else "failed",
             "target": version,
             "message": f"Installed rbit v{version}." if ok else (proc.stderr.strip()[-500:] or "pip install failed."),
@@ -2115,8 +2118,8 @@ def main(argv: list[str] | None = None) -> int:
     # Ensure UTF-8 stdout/stderr on Windows consoles
     if hasattr(sys.stdout, "reconfigure"):
         try:
-            sys.stdout.reconfigure(encoding="utf-8")
-            sys.stderr.reconfigure(encoding="utf-8")
+            cast(Any, sys.stdout).reconfigure(encoding="utf-8")
+            cast(Any, sys.stderr).reconfigure(encoding="utf-8")
         except Exception:
             pass
 
@@ -2413,7 +2416,11 @@ def main(argv: list[str] | None = None) -> int:
                 parsed.json,
             )
 
-        if sub == "plugin":
+        # `rbit plugin add|check|update` manage package plugins (the second `plugin` block below);
+        # `remove` goes there too unless the name is an installed project plugin.
+        if sub == "plugin" and _is_package_plugin_command(rest):
+            pass
+        elif sub == "plugin":
             p = argparse.ArgumentParser(
                 prog="rbit plugin", description="Install, enable and remove plugins"
             )
@@ -2530,7 +2537,7 @@ def main(argv: list[str] | None = None) -> int:
             remove_p.add_argument("package")
             p.add_argument("-d", "--dir", help="Workspace directory")
             parsed = p.parse_args(rest)
-            return _run_plugin(parsed)
+            return _run_package_plugin(parsed)
 
         if sub == "debug":
             p = argparse.ArgumentParser(prog="rbit debug", description="Debugging and troubleshooting tools")
@@ -2762,8 +2769,9 @@ def main(argv: list[str] | None = None) -> int:
             executor = _TE(workspace=workspace, session=_Session())
             files = executor.list_workspace_files(limit=60)
             exts: dict[str, int] = {}
-            for f in files:
-                exts[Path(f).suffix.lower() or "(none)"] = exts.get(Path(f).suffix.lower() or "(none)", 0) + 1
+            for rel_name in files:
+                ext_key = Path(rel_name).suffix.lower() or "(none)"
+                exts[ext_key] = exts.get(ext_key, 0) + 1
             top = sorted(exts.items(), key=lambda kv: -kv[1])[:6]
             readme = next(
                 (workspace / n for n in ("README.md", "readme.md", "README.rst", "README.txt") if (workspace / n).exists()),
@@ -3306,7 +3314,32 @@ def _run_api(args: argparse.Namespace) -> int:
     return 0 if status_code < 400 else 1
 
 
-def _run_plugin(args: argparse.Namespace) -> int:
+def _is_package_plugin_command(rest: list[str]) -> bool:
+    """`rbit plugin add|check|update` and `remove <pkg>` (unless <pkg> is an installed project plugin)."""
+    positional: list[str] = []
+    directory: str | None = None
+    skip = False
+    for index, token in enumerate(rest):
+        if skip:
+            skip = False
+        elif token in ("-d", "--dir"):
+            directory = rest[index + 1] if index + 1 < len(rest) else None
+            skip = True
+        elif not token.startswith("-"):
+            positional.append(token)
+    if not positional:
+        return False
+    if positional[0] in ("add", "check", "update"):
+        return True
+    if positional[0] == "remove" and len(positional) >= 2:
+        from rbit.install import list_installed
+
+        installed = list_installed(_resolve_workspace(directory))
+        return not any(row.get("name") == positional[1] for row in installed)
+    return False
+
+
+def _run_package_plugin(args: argparse.Namespace) -> int:
     from rbit.plugin_manager import PluginManager
 
     console = Console()
@@ -3423,7 +3456,7 @@ def _run_uninstall(dry_run: bool = False, force: bool = False) -> int:
         from importlib.metadata import distribution
 
         dist = distribution("rbit")
-        location = Path(dist.locate_file(""))
+        location = Path(str(dist.locate_file("")))
     except Exception:
         location = None
     console.print("[bold #fab283]rbit uninstall[/]")
@@ -3726,7 +3759,10 @@ CONFIG_RANGES: dict[str, tuple[float | None, float | None]] = {
     "auto_compact_at": (1, 100),
     "budget_usd": (0, None),
 }
-CONFIG_ENUMS: dict[str, tuple[str, ...]] = {"effort": ("auto", "low", "medium", "high")}
+CONFIG_ENUMS: dict[str, tuple[str, ...]] = {
+    "effort": ("auto", "low", "medium", "high"),
+    "locale": ("auto", "ru", "en"),
+}
 
 
 def _config_value_error(key: str, value: Any) -> str | None:
@@ -3761,6 +3797,7 @@ CONFIG_TYPES: dict[str, type | tuple[type, ...]] = {
     "api_base": str,
     "api_key": str,
     "theme": str,
+    "locale": str,
     "effort": str,
     "auto_compact": bool,
     "auto_approve": bool,
@@ -3805,27 +3842,28 @@ def _run_config(
             return 2
         root = key.split(".")[0]
         words = {"true": True, "yes": True, "on": True, "1": True, "false": False, "no": False, "off": False, "0": False}
+        new_value: Any
         if CONFIG_TYPES.get(root) is str and "." not in key and not value.lstrip().startswith('"'):
-            parsed = value  # string-typed key: never reinterpret `123`/`true` as JSON
+            new_value = value  # string-typed key: never reinterpret `123`/`true` as JSON
         elif CONFIG_TYPES.get(root) is bool and "." not in key and value.strip().lower() in words:
-            parsed = words[value.strip().lower()]  # `config set auto_approve no` is False, not the text "no"
+            new_value = words[value.strip().lower()]  # `config set auto_approve no` is False, not the text "no"
         else:
             try:
-                parsed = json.loads(value)
+                new_value = json.loads(value)
             except ValueError:
-                parsed = value
+                new_value = value
         if "." in key:
             root_type = CONFIG_TYPES.get(root)
             if root_type is not None and dict not in _as_tuple(root_type):
                 console.print(f"[red]Invalid value:[/] {markup_escape(root)} does not accept nested keys")
                 return 2
-            problem = _config_value_error(key, parsed) if key in CONFIG_RANGES else None
+            problem = _config_value_error(key, new_value) if key in CONFIG_RANGES else None
         else:
-            problem = _config_value_error(key, parsed)
+            problem = _config_value_error(key, new_value)
         if problem:
             console.print(f"[red]Invalid value:[/] {markup_escape(problem)}")
             return 2
-        _config_set(cfg, key, parsed)
+        _config_set(cfg, key, new_value)
         storage.save_config(cfg)
         console.print(f"config updated: {markup_escape(str(key))}")
         return 0
@@ -3870,6 +3908,7 @@ def _run_config(
                 "api_key": {"type": "string"},
                 "effort": {"type": "string", "enum": ["auto", "low", "medium", "high"]},
                 "theme": {"type": "string"},
+                "locale": {"type": "string", "enum": ["auto", "ru", "en"]},
                 "auto_compact": {"type": "boolean"},
                 "auto_design_skill": {"type": "boolean"},
                 "formatter": {"type": ["boolean", "object"]},
@@ -4680,12 +4719,12 @@ def _run_serve(
 
     # Modes the engine really enforces (ask/plan/review are read-only); anything else is `build`.
     _SERVE_AGENTS = [
-        {"name": "build", "title": "Build", "description": "Пишет код и запускает инструменты"},
-        {"name": "plan", "title": "Plan", "description": "Только читает и планирует"},
-        {"name": "ask", "title": "Ask", "description": "Отвечает на вопросы, ничего не меняет"},
-        {"name": "debug", "title": "Debug", "description": "Ищет причину ошибки"},
-        {"name": "review", "title": "Review", "description": "Проверяет код, ничего не меняет"},
-        {"name": "autopilot", "title": "Autopilot", "description": "Работает до проверенного результата"},
+        {"name": "build", "title": "Build", "description": "Writes code and runs tools"},
+        {"name": "plan", "title": "Plan", "description": "Read-only: explores and plans"},
+        {"name": "ask", "title": "Ask", "description": "Answers questions, changes nothing"},
+        {"name": "debug", "title": "Debug", "description": "Finds the cause of a bug"},
+        {"name": "review", "title": "Review", "description": "Reviews code, changes nothing"},
+        {"name": "autopilot", "title": "Autopilot", "description": "Works until the result is verified"},
     ]
     _SERVE_AGENT_NAMES = {a["name"] for a in _SERVE_AGENTS}
 
@@ -4761,7 +4800,7 @@ def _run_serve(
     def run_turn_events(
         prompt_text: str,
         session: Session,
-        sink: "_queue.Queue",  # type: ignore[name-defined]
+        sink: "_queue.Queue",
         model_override: str = "",
         agent_override: str = "",
         effort_override: str = "",
@@ -5613,7 +5652,7 @@ def _run_serve(
             sid = unquote(self.path[len("/v1/sessions/") :].strip("/"))
             with session_lock:
                 found = storage.find_session(sid) if sid else None
-                ok = bool(found) and storage.delete_session(found.id)
+                ok = found is not None and storage.delete_session(found.id)
                 if found is not None:
                     sessions.pop(found.id, None)  # drop it from the in-memory cache too
             body = _json.dumps({"deleted": bool(ok), "id": found.id if found else sid}).encode("utf-8")

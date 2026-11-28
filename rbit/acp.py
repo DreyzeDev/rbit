@@ -181,8 +181,8 @@ class ACPServer:
             if session_id not in self.sessions:
                 self.sessions[session_id] = Session(id=session_id)
             self.session_workspaces.setdefault(session_id, Path(params.get("cwd") or self.workspace))
-            for message in self.sessions[session_id].messages:
-                if message.role not in ("user", "assistant") or not message.content:
+            for stored in self.sessions[session_id].messages:
+                if stored.role not in ("user", "assistant") or not stored.content:
                     continue
                 await notify(
                     {
@@ -191,8 +191,8 @@ class ACPServer:
                         "params": {
                             "sessionId": session_id,
                             "update": {
-                                "sessionUpdate": "agent_message_chunk" if message.role == "assistant" else "user_message_chunk",
-                                "content": {"type": "text", "text": message.content},
+                                "sessionUpdate": "agent_message_chunk" if stored.role == "assistant" else "user_message_chunk",
+                                "content": {"type": "text", "text": stored.content},
                             },
                         },
                     }

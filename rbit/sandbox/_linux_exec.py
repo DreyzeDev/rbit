@@ -35,6 +35,7 @@ import json
 import os
 import signal
 import sys
+from typing import Any
 
 CLONE_NEWNS = 0x00020000
 CLONE_NEWUTS = 0x04000000
@@ -542,7 +543,10 @@ def launch(spec: dict, command: list[str]) -> int:
             sys.stderr.write(f"rbit-sandbox: unexpected failure, command not run: {exc!r}\n")
             os._exit(EXIT_UNAVAILABLE)
     for name in ("SIGTERM", "SIGINT", "SIGHUP"):
-        signal.signal(getattr(signal, name), lambda signum, _f, c=child: _forward(c, signum))
+        def _handler(signum: int, _frame: Any, c: int = child) -> None:
+            _forward(c, signum)
+
+        signal.signal(getattr(signal, name), _handler)
     while True:
         try:
             _pid, status = os.waitpid(child, 0)

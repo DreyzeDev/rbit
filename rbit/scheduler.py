@@ -52,6 +52,12 @@ def acquire_lock(lock_path: Path, *, max_age: float = LOCK_MAX_AGE) -> bool:
     return False
 
 
+#: Limits for what a schedule may hold (the HTTP API is reachable by paired clients).
+MAX_PROMPT_CHARS = 8000
+MAX_SCHEDULES = 100
+VALID_AGENTS = frozenset({"build", "plan", "ask", "debug", "review", "autopilot"})
+
+
 class Scheduler:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace.resolve()
@@ -159,10 +165,21 @@ class Scheduler:
         prompt = prompt.strip()
         if not prompt:
             return None, "prompt is required"
+        if len(prompt) > MAX_PROMPT_CHARS:
+            return None, f"prompt is too long ({len(prompt)} > {MAX_PROMPT_CHARS} characters)"
+        agent = (agent or "build").strip().lower()
+        if agent not in VALID_AGENTS:
+            return None, f"unknown agent {agent!r} (use one of: {', '.join(sorted(VALID_AGENTS))})"
+        model = (model or "").strip()
+        if len(model) > 200 or any(ch.isspace() for ch in model):
+            return None, "invalid model id"
+        name = " ".join((name or "").split())[:80]
         next_run = self.next_run(spec)
         if next_run is None:
             return None, f"invalid schedule: {spec!r} (use 'every 30m', 'daily 09:30', or ISO datetime)"
         entries = self.load()
+        if len(entries) >= MAX_SCHEDULES:
+            return None, f"too many schedules (limit {MAX_SCHEDULES}); remove one first"
         entry = {
             "id": short_id(),
             "name": (name or prompt[:40]).strip(),

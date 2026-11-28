@@ -145,7 +145,7 @@ def load_plugins(app: Any, config: dict[str, Any] | None = None, registry: Plugi
     try:
         from importlib.metadata import entry_points
 
-        eps = entry_points(group="rbit.plugins")
+        eps: Any = entry_points(group="rbit.plugins")
     except Exception:  # noqa: BLE001 - metadata backends vary across Python versions
         eps = []
     for ep in eps:

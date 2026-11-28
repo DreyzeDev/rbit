@@ -6,6 +6,8 @@ All notable changes to rbit are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-28
+
 ### Security
 
 - **Desktop app asks before running shell commands.** The backend it starts now runs with
@@ -42,11 +44,32 @@ All notable changes to rbit are documented here. The format follows
   outlines, `prefers-reduced-motion`, a light theme and a narrow-window layout.
 - Lint: loop-variable and `zip(strict=)` findings; invalid escape sequences in tests.
 
+- `rbit plugin add|check|update|remove <package>` was unreachable (a second `plugin` command
+  shadowed it, and its handler was defined twice); the package commands are routed again, and
+  `remove <name>` prefers an installed project plugin.
+- Sandbox: the Linux bubblewrap launcher also protects `.git/config` and masks system credential
+  files (`/etc/shadow`, ...) as the Landlock launcher does; the macOS profile protects `.git/config`;
+  `rbit sandbox status/check` no longer says `shell_sandbox` is `strict` when it is not.
+- Type fixes found on the way: a possible `None` call in the streaming path (`on_stream_chunk`) and a
+  slash-command handler that fell off its end instead of returning `False`.
+
+### Added
+
+- `locale` setting (`auto` | `ru` | `en`, default `auto` from the environment): TUI notices are
+  translated through `rbit.i18n` instead of being hard-coded in one language.
+- `RBIT_SHELL_SANDBOX=off|auto|strict` sets the default sandbox mode; the desktop app starts its
+  backend with `auto`.
+- Schedules: prompt length, agent, model and count are validated (`MAX_PROMPT_CHARS`, `MAX_SCHEDULES`).
+- `scripts/render_distribution.py` fills the Homebrew formula (and Scoop/winget when a Windows zip
+  exists) with the real version and SHA-256; the release workflow attaches the result.
+
 ### Changed
 
-- CI also runs Python 3.13, the extra lint rules above, and mypy on every module that is type-clean.
-- `shell_sandbox` stays `"off"` by default; `"strict"` in `trust.py` is only the value an untrusted
-  project config may *set* (it narrows access).
+- CI also runs Python 3.13, `ruff` (`F,E9,B,PLE`) and mypy on the whole `rbit` package (it was 2
+  files); the release workflow runs them too before publishing.
+- `shell_sandbox` stays `"off"` by default for the CLI; `"strict"` in `trust.py` is only the value an
+  untrusted project config may *set* (it narrows access).
+- `rbit serve` agent descriptions are English (API text), the mode list has all six modes.
 
 ### Added
 

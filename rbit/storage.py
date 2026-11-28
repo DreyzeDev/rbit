@@ -290,6 +290,11 @@ class StorageManager:
             "auto_approve_safe": True,
             "allow_secret_reads": False,
         }
+        # A launcher (the desktop app) can make the OS sandbox the default for its sessions;
+        # `shell_sandbox` in a config file still wins.
+        env_sandbox = (os.environ.get("RBIT_SHELL_SANDBOX") or "").strip().lower()
+        if env_sandbox in ("off", "auto", "strict"):
+            default_cfg["shell_sandbox"] = env_sandbox
         self.config_warning = ""
         self.untrusted_keys = []
         if self.config_path.exists():

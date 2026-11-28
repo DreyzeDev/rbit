@@ -24,6 +24,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Lint and types
+        run: |
+          ruff check rbit tests --isolated --select F,E9,B,PLE
+          python -m mypy
+
       - name: Test
         run: python -m pytest -q -p no:cacheprovider
 
@@ -60,6 +65,12 @@ jobs:
           name: dist
           path: dist/
 
+      - name: Render package-manager manifests
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          python scripts/render_distribution.py --version "$version" \
+            --sdist "dist/rbit-${version}.tar.gz" --out distribution-rendered
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -67,7 +78,7 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
-            dist/*
+            dist/* distribution-rendered/*
 
   publish-pypi:
     name: Publish to PyPI

@@ -96,8 +96,17 @@ def bwrap_argv(argv: list[str], policy: Policy) -> list[str]:
     out += ["--bind", ws, ws]  # after the tmpfs: a workspace inside $HOME stays visible
     if (policy.workspace / ".rbit").exists():
         out += ["--tmpfs", str(policy.workspace / ".rbit")]
-    if (policy.workspace / ".git" / "hooks").exists():
-        out += ["--ro-bind-try", str(policy.workspace / ".git" / "hooks"), str(policy.workspace / ".git" / "hooks")]
+    # visible but not writable: files a later `git` run OUTSIDE the sandbox would execute
+    for guarded in (policy.workspace / ".git" / "hooks", policy.workspace / ".git" / "config"):
+        if guarded.exists():
+            out += ["--ro-bind-try", str(guarded), str(guarded)]
+    # system credential files stay unreadable (as with the Landlock launcher): an empty file or
+    # directory replaces them
+    for secret in SYSTEM_SECRETS:
+        if os.path.isdir(secret):
+            out += ["--tmpfs", secret]
+        elif os.path.lexists(secret):
+            out += ["--ro-bind", os.devnull, secret]
     out += ["--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent", "--new-session",
             "--cap-drop", "ALL"]
     if not policy.network:

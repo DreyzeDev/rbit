@@ -167,9 +167,10 @@ def _check_permissions(report: SelfTestReport) -> None:
             ws = Path(tmp)
             problems: list[str] = []
             for mode in MODE_IDS:
-                executor = ToolExecutor(
-                    workspace=ws, session=Session(), get_config=lambda m=mode: {"permission_mode": m}
-                )
+                def _cfg(m: str = mode) -> dict[str, Any]:
+                    return {"permission_mode": m}
+
+                executor = ToolExecutor(workspace=ws, session=Session(), get_config=_cfg)
                 if executor.current_permission_mode() != mode:
                     problems.append(f"{mode} did not apply")
                 if mode == "auto" and not executor.mode_allows("edit"):

@@ -3525,7 +3525,6 @@ async def test_tool_output_truncation_marker(tmp_path: Path) -> None:
         workspace=tmp_path, session=Session(), get_config=lambda: {"tool_output_chars": 1000}
     )
     from rbit.agent import AgentEngine
-    from rbit.models import Session as S2
 
     engine = AgentEngine(workspace=tmp_path, executor=executor, get_config=lambda: {"tool_output_chars": 1000})
     res = ToolResult(True, "ok", "z" * 9000)
@@ -3550,7 +3549,8 @@ def test_i18n_and_plugins(tmp_path: Path) -> None:
     i18n.set_locale("en")
     assert i18n.tr("nothing_undo") == "Nothing to undo."
     i18n.set_locale("ru")
-    assert i18n.tr("nothing_undo") == "Nothing to undo."
+    assert i18n.tr("nothing_undo") == "Отменять нечего."
+    i18n.set_locale("en")  # the locale is process-global: leave it as other tests expect
     assert load_plugins(object()) == []  # no plugins installed: empty list, no crash
 
 

@@ -82,7 +82,17 @@ def backend() -> str | None:
     return None
 
 
-def unavailable_message() -> str:
+_NEEDS = (
+    "needs a Linux kernel with Landlock and user namespaces or bubblewrap, macOS "
+    "sandbox-exec, or Windows AppContainers"
+)
+
+
+def unavailable_message(strict: bool = True) -> str:
+    """Why programs cannot be sandboxed here. `strict=False` is for status/check output, where
+    `shell_sandbox` is not necessarily `strict` and nothing was refused."""
+    if not strict:
+        return f"this machine has no sandbox backend ({_NEEDS}), so `shell_sandbox` cannot be turned on here."
     return (
         "`shell_sandbox` is `strict`, but this machine has no sandbox backend "
         "(needs a Linux kernel with Landlock and user namespaces or bubblewrap, macOS "

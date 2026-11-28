@@ -56,6 +56,8 @@ def profile(policy: Policy) -> str:
     rules.append(f"(deny file-read* (subpath {quote(f'{ws_resolved}/.rbit')}))")
     rules.append(f"(deny file-write* (subpath {quote(f'{ws_resolved}/.rbit')}))")
     rules.append(f"(deny file-write* (subpath {quote(f'{ws_resolved}/.git/hooks')}))")
+    # a later `git` run outside the sandbox would execute what a hostile .git/config sets
+    rules.append(f"(deny file-write* (literal {quote(f'{ws_resolved}/.git/config')}))")
     if not policy.network:
         rules.append("(deny network*)")
     return "\n".join(rules)
