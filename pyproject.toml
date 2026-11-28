@@ -46,6 +46,10 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.10"]
 [tool.setuptools.packages.find]
 include = ["rbit*"]
 
+# The web/desktop UI served at `/` by `rbit serve`; installed to <prefix>/share/rbit/renderer.
+[tool.setuptools.data-files]
+"share/rbit/renderer" = ["desktop/renderer/index.html", "desktop/renderer/app.js", "desktop/renderer/styles.css"]
+
 [tool.setuptools.package-data]
 rbit = ["builtin_skills/**/*.md", "builtin_skills/**/*.js", "builtin_skills/**/*.css"]
 

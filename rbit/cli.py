@@ -3314,6 +3314,18 @@ def _run_api(args: argparse.Namespace) -> int:
     return 0 if status_code < 400 else 1
 
 
+def _renderer_dir() -> Path:
+    """The web/desktop UI files: the source checkout's `desktop/renderer`, or, for an installed
+    package, the copy the wheel puts under `<prefix>/share/rbit/renderer`."""
+    import sysconfig
+
+    candidates = [Path(__file__).resolve().parent.parent / "desktop" / "renderer"]
+    for prefix in (sysconfig.get_path("data"), sys.prefix):
+        if prefix:
+            candidates.append(Path(prefix) / "share" / "rbit" / "renderer")
+    return next((c for c in candidates if (c / "index.html").is_file()), candidates[0])
+
+
 def _is_package_plugin_command(rest: list[str]) -> bool:
     """`rbit plugin add|check|update` and `remove <pkg>` (unless <pkg> is an installed project plugin)."""
     positional: list[str] = []
@@ -5284,7 +5296,7 @@ def _run_serve(
                     }
                 )
             elif self.path in ("/", "/index.html"):
-                renderer = Path(__file__).resolve().parent.parent / "desktop" / "renderer" / "index.html"
+                renderer = _renderer_dir() / "index.html"
                 if renderer.exists():
                     body = renderer.read_bytes()
                     self.send_response(200)
@@ -5303,7 +5315,7 @@ def _run_serve(
                     self.end_headers()
             elif self.path in ("/app.js", "/styles.css"):
                 fname = "app.js" if self.path.endswith("app.js") else "styles.css"
-                fpath = Path(__file__).resolve().parent.parent / "desktop" / "renderer" / fname
+                fpath = _renderer_dir() / fname
                 if fpath.exists():
                     body = fpath.read_bytes()
                     ctype = "application/javascript; charset=utf-8" if fname == "app.js" else "text/css; charset=utf-8"

@@ -1,0 +1,1 @@
+include desktop/renderer/index.html desktop/renderer/app.js desktop/renderer/styles.css

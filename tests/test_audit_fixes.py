@@ -66,12 +66,9 @@ def test_token_in_query_only_opens_the_page(tmp_path: Path, monkeypatch: pytest.
     assert _request(port, "GET", "/v1/sessions?pair=secret-token")[0] == 401
     assert _request(port, "GET", "/v1/sessions", {"Authorization": "Bearer secret-token"})[0] == 200
     status, headers, _b = _request(port, "GET", "/?token=secret-token")
-    # The page itself is only served from a source checkout (the renderer is not in the wheel):
-    # 200 there, 404 from an installed package. Either way the token was accepted (not 401).
-    assert status in (200, 404)
-    if status == 200:
-        assert "rbit_pair=secret-token" in headers.get("set-cookie", "")
-        assert "SameSite=Strict" in headers["set-cookie"]
+    assert status == 200  # the renderer ships with the package (see `_renderer_dir`)
+    assert "rbit_pair=secret-token" in headers.get("set-cookie", "")
+    assert "SameSite=Strict" in headers["set-cookie"]
     assert _request(port, "GET", "/?token=wrong")[0] == 401
 
 
@@ -339,3 +336,15 @@ def test_render_distribution_fills_every_placeholder(tmp_path: Path) -> None:
     winget = (out / "rbit.winget").read_text(encoding="utf-8")
     assert "PackageVersion: 1.7.0" in winget and "v1.7.0/rbit-1.7.0-windows-x64.zip" in winget
     assert mod.main(["--version", "v1.7", "--sdist", str(sdist), "--out", str(out)]) == 2
+
+
+def test_renderer_dir_is_found_in_a_checkout_and_declared_for_the_wheel() -> None:
+    tomllib = pytest.importorskip("tomllib")  # Python 3.11+
+
+    from rbit.cli import _renderer_dir
+
+    root = Path(__file__).resolve().parent.parent
+    assert (_renderer_dir() / "index.html").is_file()
+    data_files = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["setuptools"]["data-files"]
+    shipped = {Path(f).name for f in data_files["share/rbit/renderer"]}
+    assert shipped == {p.name for p in (root / "desktop" / "renderer").iterdir() if p.is_file()}

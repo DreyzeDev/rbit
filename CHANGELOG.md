@@ -17,6 +17,7 @@ All notable changes to rbit are documented here. The format follows
 - **"Always allow" no longer approves a whole program.** For interpreters and launchers
   (`python`, `node`, `bash`, `sudo`, `npx`, `docker`, ...) and for `tool -option ...`, only the
   exact command is remembered, so approving `python script.py` no longer approves `python -c "..."`.
+- The web UI at `/` is shipped in the wheel and sdist (it returned 404 for a pip-installed package).
 - `rbit serve`: the `ask`, `review`, `debug` and `autopilot` modes are honoured (they used to be
   silently turned into `build`, i.e. full write access); a schedule created over HTTP while approvals
   are on does not run shell commands unattended; `git status`/`git diff` for `/v1/vcs/status` run with
