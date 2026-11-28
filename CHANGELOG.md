@@ -29,6 +29,10 @@ All notable changes to rbit are documented here. The format follows
 
 ### Fixed
 
+- Terminal UI polish: the Todo dialog footer was cut off ("esc sa"); the prompt-history dialog had
+  a differently styled input and an empty body (now "No prompt history yet."); right-aligned hints in
+  lists no longer run under the scrollbar; context sizes read `1M`, not `1000k`; the answer to "create
+  a file" no longer shows `((+13 -0))`; the busy hint shows how long the turn has been running.
 - Terminal UI: the model and prompt-history shortcuts were `ctrl+m` and `ctrl+h`, which terminals
   deliver as Enter and Backspace, so they never fired. They are now `f2` and `f3` (the old keys stay
   as aliases for terminals that can tell them apart); stop-background, collapse-cards and sidebar

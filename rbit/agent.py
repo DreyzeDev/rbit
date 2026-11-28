@@ -3620,7 +3620,7 @@ class AgentEngine:
             await invoke_tool("todowrite", {"todos": todos})
 
             return (
-                f"Готово! Файл **`{filename}`** создан ({write_res.summary}).\n\n"
+                f"Готово! Файл **`{filename}`** создан {write_res.summary}.\n\n"
                 "- Карточка `write` выше содержит полный цветной **diff** изменений.\n"
                 "- Вы можете отменить правку через `/undo` или сохранить снимок проекта через `/checkpoint`."
             )

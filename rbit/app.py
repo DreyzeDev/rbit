@@ -442,6 +442,11 @@ ModalScreen {
     border: none;
 }
 
+/* reserve the scrollbar column so right-aligned hints never run under it */
+.oc-modal-list, #palette-list {
+    scrollbar-gutter: stable;
+}
+
 OptionList > .option-list--option-highlighted {
     background: #fab283;
     color: #0a0a0a;
@@ -457,6 +462,8 @@ OptionList > .option-list--option-highlighted {
 .oc-modal-foot {
     color: #808080;
     margin-top: 1;
+    width: 100%;
+    height: auto;
 }
 
 .help-modal {

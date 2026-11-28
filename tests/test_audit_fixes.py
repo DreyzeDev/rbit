@@ -348,3 +348,68 @@ def test_renderer_dir_is_found_in_a_checkout_and_declared_for_the_wheel() -> Non
     data_files = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["setuptools"]["data-files"]
     shipped = {Path(f).name for f in data_files["share/rbit/renderer"]}
     assert shipped == {p.name for p in (root / "desktop" / "renderer").iterdir() if p.is_file()}
+
+
+# --- TUI polish --------------------------------------------------------------
+
+
+def test_context_window_formatting() -> None:
+    from rbit.modals import format_context_window
+
+    assert format_context_window(128_000) == "128k"
+    assert format_context_window(1_000_000) == "1M"
+    assert format_context_window(2_097_152) == "2.1M"
+    assert format_context_window(512) == "512"
+
+
+@pytest.mark.asyncio
+async def test_history_modal_empty_state_and_consistent_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from textual.widgets import Input, OptionList
+
+    from rbit.app import RbitApp
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("f3")
+        await pilot.pause()
+        assert app.screen.query_one("#history-filter", Input).has_class("oc-modal-search")
+        listing = app.screen.query_one("#history-list", OptionList)
+        assert listing.option_count == 1 and listing.get_option_at_index(0).disabled  # "No prompt history yet."
+
+
+@pytest.mark.asyncio
+async def test_todo_footer_is_not_cut_off_and_busy_hint_shows_elapsed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from textual.widgets import Label
+
+    from rbit.app import RbitApp
+    from rbit.widgets import PromptSubHints
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    app = RbitApp(workspace=tmp_path)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("ctrl+o")
+        await pilot.pause()
+        foot = app.screen.query_one(".oc-modal-foot", Label)
+        assert foot.region.height >= 1 and foot.size.width >= len("enter toggle · ctrl+p priority · ctrl+d delete · esc save") - 8
+        await pilot.press("escape")
+        hints = app.query_one(PromptSubHints)
+        hints.update_state(busy=True, status="", mode="build")
+        hints._busy_since -= 75  # pretend the turn has run for 1m15s
+        from rich.console import Console
+
+        console = Console(width=80, record=True)
+        console.print(hints.render())
+        assert "1:15" in console.export_text()
+        hints.update_state(busy=False, status="", mode="build")
+        assert hints._busy_since is None
+
+
+def test_written_file_answer_has_single_parentheses() -> None:
+    import inspect
+
+    from rbit import agent
+
+    assert "создан {write_res.summary}." in inspect.getsource(agent)

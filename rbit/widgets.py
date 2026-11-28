@@ -202,8 +202,15 @@ class PromptSubHints(Static):
         self._status = ""
         self._mode = "build"
         self._frame = 0
+        self._busy_since: float | None = None
 
     def update_state(self, busy: bool, status: str, mode: str, frame: int = 0) -> None:
+        import time
+
+        if busy and self._busy_since is None:
+            self._busy_since = time.monotonic()
+        elif not busy:
+            self._busy_since = None
         self._busy = busy
         self._status = status
         self._mode = mode
@@ -223,6 +230,12 @@ class PromptSubHints(Static):
             accent = agent_accent(self._mode)
             left.append(f" {spin} ", style=f"bold {accent}")
             left.append("Thinking...", style="#808080")
+            if self._busy_since is not None:
+                import time
+
+                elapsed = int(time.monotonic() - self._busy_since)
+                if elapsed >= 3:
+                    left.append(f"  {elapsed // 60}:{elapsed % 60:02d}" if elapsed >= 60 else f"  {elapsed}s", style="#606060")
             right.append("esc", style="bold #eeeeee")
             right.append(" interrupt", style="#808080")
         else:

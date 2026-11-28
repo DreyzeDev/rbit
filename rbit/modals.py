@@ -61,6 +61,14 @@ PALETTE_ITEMS: list[tuple[str, str, str, str]] = [
 ]
 
 
+def format_context_window(tokens: int) -> str:
+    """`128000` -> `128k`, `1000000` -> `1M`, `2097152` -> `2.1M`."""
+    if tokens >= 1_000_000:
+        millions = tokens / 1_000_000
+        return f"{millions:.0f}M" if abs(millions - round(millions)) < 0.05 else f"{millions:.1f}M"
+    return f"{tokens // 1000}k" if tokens >= 1000 else str(tokens)
+
+
 def _modal_header(title: str) -> Table:
     grid = Table.grid(expand=True)
     grid.add_column(justify="left", ratio=1)
@@ -143,8 +151,8 @@ class PromptHistoryModal(ModalScreen[str | None]):
     def compose(self) -> ComposeResult:
         with Vertical(classes="oc-modal"):
             yield Static(_modal_header("Prompt history"), classes="oc-modal-header")
-            yield Input(placeholder="Filter history…", id="history-filter")
-            yield OptionList(id="history-list")
+            yield Input(placeholder="Filter history…", id="history-filter", classes="oc-modal-search")
+            yield OptionList(id="history-list", classes="oc-modal-list")
             yield Label("enter pick · esc close", classes="oc-modal-foot")
 
     def on_mount(self) -> None:
@@ -161,7 +169,10 @@ class PromptHistoryModal(ModalScreen[str | None]):
                 self._prompts[option_id] = item
                 # Text, not str: prompts may contain "[...]" which is markup.
                 ol.add_option(Option(Text(item[:160].replace("\n", " ")), id=option_id))
-        if ol.option_count:
+        if not ol.option_count:
+            empty = "No matching prompts." if self._query else "No prompt history yet."
+            ol.add_option(Option(Text(empty, style="#808080"), disabled=True))
+        else:
             ol.highlighted = 0
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -413,7 +424,7 @@ class ModelSelectorModal(ModalScreen[str | None]):
                 olist.add_option(Option(Text(m.provider, style="bold #fab283"), disabled=True))
                 last_prov = m.provider
             matched_ids.append(m.id)
-            right = "Free" if m.cost_per_1k == 0 else f"{m.context_window // 1000}k"
+            right = "Free" if m.cost_per_1k == 0 else format_context_window(m.context_window)
             olist.add_option(
                 Option(
                     _two_col_option(m.name, right, active_dot=(m.id == self.active_model)),
@@ -718,7 +729,7 @@ class TodoManagerModal(ModalScreen[list[TodoItem] | None]):
             yield Static(_modal_header("Todos"), classes="oc-modal-header")
             yield Input(placeholder="Add new task and press Enter...", id="todo-new-input", classes="oc-modal-search")
             yield OptionList(id="todo-modal-list", classes="oc-modal-list")
-            yield Label("enter toggle status · ctrl+p priority · ctrl+d delete · esc save", classes="oc-modal-foot")
+            yield Label("enter toggle · ctrl+p priority · ctrl+d delete · esc save", classes="oc-modal-foot")
 
     def on_mount(self) -> None:
         self._refresh_list()
@@ -1029,7 +1040,7 @@ class QuestionModal(ModalScreen[str | None]):
                     *[Option(Text(option), id=str(index)) for index, option in enumerate(self.options)],
                     id="question-options",
                 )
-            yield Input(placeholder="Type an answer...", id="question-input")
+            yield Input(placeholder="Type an answer...", id="question-input", classes="oc-modal-search")
             yield Label("enter submit   esc cancel", classes="oc-modal-foot")
 
     def on_mount(self) -> None:
