@@ -3614,7 +3614,9 @@ async def _execute_schedule_entry(
     """Run one scheduled prompt as an agent turn; returns the reply text."""
     session = Session(title=f"Schedule: {entry.get('name') or entry.get('id')}")
     executor = ToolExecutor(workspace=workspace, session=session, storage=storage, get_config=lambda: cfg)
-    executor.always_allow_bash = True
+    # Entries made from the CLI (or with approvals off) run unattended; one made over HTTP while
+    # approvals were on has nobody to ask, so its shell commands fail closed.
+    executor.always_allow_bash = bool(entry.get("unattended", True))
     engine = AgentEngine(workspace=workspace, executor=executor, get_config=lambda: cfg, storage=storage)
     user = ChatMessage(id=short_id(), role="user", content=str(entry.get("prompt") or ""))
     session.messages.append(user)
@@ -4676,6 +4678,17 @@ def _run_serve(
         data = value.encode("utf-8", "replace")
         return any(hmac.compare_digest(data, token.encode("utf-8", "replace")) for token in tokens)
 
+    # Modes the engine really enforces (ask/plan/review are read-only); anything else is `build`.
+    _SERVE_AGENTS = [
+        {"name": "build", "title": "Build", "description": "Пишет код и запускает инструменты"},
+        {"name": "plan", "title": "Plan", "description": "Только читает и планирует"},
+        {"name": "ask", "title": "Ask", "description": "Отвечает на вопросы, ничего не меняет"},
+        {"name": "debug", "title": "Debug", "description": "Ищет причину ошибки"},
+        {"name": "review", "title": "Review", "description": "Проверяет код, ничего не меняет"},
+        {"name": "autopilot", "title": "Autopilot", "description": "Работает до проверенного результата"},
+    ]
+    _SERVE_AGENT_NAMES = {a["name"] for a in _SERVE_AGENTS}
+
     sessions: dict[str, Session] = {}
     # Interactive tool approvals: with RBIT_APPROVALS=1 the desktop client gets
     # a `tool_approval` event for every non-read-only bash command and answers
@@ -4848,7 +4861,7 @@ def _run_serve(
                 )
                 if effort_override in EFFORT_LEVELS:
                     turn_cfg["effort"] = effort_override
-                agent_mode = agent_override if agent_override in ("build", "plan") else "build"
+                agent_mode = agent_override if agent_override in _SERVE_AGENT_NAMES else "build"
                 reply = await engine.run_turn(
                     session=session,
                     user_msg=user,
@@ -4956,13 +4969,19 @@ def _run_serve(
                 return True
             from urllib.parse import parse_qs, urlparse
 
-            query = parse_qs(urlparse(self.path).query)
-            for key in ("pair", "token"):
-                value = (query.get(key) or [""])[0]
-                if value and _token_matches(value, tokens):
-                    return True
+            parsed_url = urlparse(self.path)
+            # A token in the URL ends up in history and logs: accept it only to open the page
+            # (which then keeps it in a cookie), never on API calls.
+            if parsed_url.path in ("/", "/index.html"):
+                query = parse_qs(parsed_url.query)
+                for key in ("pair", "token"):
+                    value = (query.get(key) or [""])[0]
+                    if value and _token_matches(value, tokens):
+                        self._cookie_token = value
+                        return True
             cookie = self.headers.get("Cookie", "")
-            for part in cookie.split(";"):
+            # Cookies ride along on cross-site requests: only with a trusted Origin.
+            for part in cookie.split(";") if self._origin_trusted() else ():
                 if part.strip().startswith("rbit_pair="):
                     value = part.strip().split("=", 1)[1]
                     if _token_matches(value, tokens):
@@ -5108,32 +5127,14 @@ def _run_serve(
                         "model": model_id,
                         "effort": str(cfg.get("effort") or "auto"),
                         "efforts": ["auto", "low", "medium", "high"],
-                        "agents": [
-                            {"name": "build", "title": "Build", "description": "Пишет код и запускает инструменты"},
-                            {"name": "plan", "title": "Plan", "description": "Только читает и планирует"},
-                        ],
+                        "agents": _SERVE_AGENTS,
                         "approvals": os.environ.get("RBIT_APPROVALS") == "1",
                         "auth": bool(server_token or pair_token),
                         "busy": busy,
                     }
                 )
             elif self.path.split("?", 1)[0] == "/v1/agents":
-                self._send_json(
-                    {
-                        "agents": [
-                            {
-                                "name": "build",
-                                "title": "Build",
-                                "description": "Пишет код и запускает инструменты",
-                            },
-                            {
-                                "name": "plan",
-                                "title": "Plan",
-                                "description": "Только читает и планирует",
-                            },
-                        ]
-                    }
-                )
+                self._send_json({"agents": _SERVE_AGENTS})
             elif self.path.startswith("/v1/artifacts"):
                 from urllib.parse import unquote
 
@@ -5163,8 +5164,9 @@ def _run_serve(
                 query = parse_qs(urlparse(self.raw_path).query)
                 raw = (query.get("path") or ["."])[0]  # parse_qs already decoded it once
                 try:
-                    target = (workspace / raw).resolve() if not Path(raw).is_absolute() else Path(raw).resolve()
-                    rel_parts = target.relative_to(workspace.resolve()).parts
+                    root = workspace.resolve()
+                    target = (root / raw).resolve() if not Path(raw).is_absolute() else Path(raw).resolve()
+                    rel_parts = target.relative_to(root).parts
                 except (ValueError, OSError):
                     self._send_json({"error": "path outside workspace"}, 403)
                 else:
@@ -5178,11 +5180,11 @@ def _run_serve(
                             {"name": child.name, "type": "dir" if child.is_dir() else "file"}
                             for child in sorted(target.iterdir())[:500]
                         ]
-                        self._send_json({"path": str(target.relative_to(workspace)), "entries": entries})
+                        self._send_json({"path": str(target.relative_to(root)), "entries": entries})
                     elif target.is_file():
                         self._send_json(
                             {
-                                "path": str(target.relative_to(workspace)),
+                                "path": str(target.relative_to(root)),
                                 "content": target.read_text(encoding="utf-8", errors="replace")[:200_000],
                             }
                         )
@@ -5213,12 +5215,25 @@ def _run_serve(
             elif self.path == "/v1/vcs/status":
                 import subprocess as _sp
 
-                proc = _sp.run(
-                    ["git", "status", "--porcelain"], cwd=str(workspace), capture_output=True, text=True, check=False
-                )
-                diff_proc = _sp.run(
-                    ["git", "diff", "--no-color"], cwd=str(workspace), capture_output=True, text=True, check=False
-                )
+                # A cloned repository can set `core.fsmonitor`, `core.sshCommand`, diff drivers... in its
+                # own .git/config, which git runs as programs: neutralise them for this read-only query.
+                safe_git = [
+                    "git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                    "-c", "diff.external=", "-c", "core.pager=cat", "-c", "protocol.ext.allow=never",
+                ]
+                git_env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"}
+                try:
+                    proc = _sp.run(
+                        [*safe_git, "status", "--porcelain"], cwd=str(workspace), capture_output=True,
+                        text=True, check=False, timeout=15, env=git_env,
+                    )
+                    diff_proc = _sp.run(
+                        [*safe_git, "diff", "--no-color", "--no-ext-diff", "--no-textconv"], cwd=str(workspace),
+                        capture_output=True, text=True, check=False, timeout=15, env=git_env,
+                    )
+                except (OSError, _sp.TimeoutExpired):
+                    self._send_json({"ok": False, "is_git": False, "branch": "", "status": "", "diff": ""})
+                    return
                 branch_name = detect_git_branch(workspace)
                 self._send_json(
                     {
@@ -5236,8 +5251,11 @@ def _run_serve(
                     self.send_response(200)
                     self._cors()
                     self.send_header("Content-Type", "text/html; charset=utf-8")
-                    if pair_token:
-                        self.send_header("Set-Cookie", f"rbit_pair={pair_token}; HttpOnly; SameSite=Lax; Path=/")
+                    cookie_value = getattr(self, "_cookie_token", "") or pair_token
+                    if cookie_value:
+                        self.send_header(
+                            "Set-Cookie", f"rbit_pair={cookie_value}; HttpOnly; SameSite=Strict; Path=/"
+                        )
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
@@ -5385,6 +5403,8 @@ def _run_serve(
                         name=str(req.get("name") or ""),
                         model=str(req.get("model") or ""),
                         agent=str(req.get("agent") or "build"),
+                        # With approvals on, a schedule must not become a way around them.
+                        unattended=os.environ.get("RBIT_APPROVALS") != "1",
                     )
                 except Exception as exc:  # noqa: BLE001 - always answer with JSON, never drop the connection
                     self._send_json({"error": f"cannot create schedule: {exc}"}, 422)
@@ -5638,6 +5658,10 @@ def _run_serve(
         console.print(f"[#808080]Проект:[/] {markup_escape(str(workspace))}")
         console.print(f"[#808080]Адрес:[/]  http://{hostname}:{args.port}")
         console.print(f"[#808080]Токен:[/]  {server_token or '(без токена)'}")
+        console.print(
+            "[yellow]Соединение не шифруется (HTTP): токен и код видны в сети. "
+            "Используйте только доверенную Wi-Fi сеть или VPN.[/]"
+        )
         if links:
             console.print()
             console.print("[#808080]Ссылки для iPhone:[/]")

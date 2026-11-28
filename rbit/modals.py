@@ -29,7 +29,7 @@ from .themes import CURATED_THEMES
 
 
 PALETTE_ITEMS: list[tuple[str, str, str, str]] = [
-    ("Suggested", "models", "Switch model", "ctrl+m"),
+    ("Suggested", "models", "Switch model", "f2"),
     ("Suggested", "new_session", "New session", "ctrl+n"),
     ("Suggested", "todo", "Manage Todo list", "ctrl+o"),
     ("Suggested", "checkpoint", "Save workspace checkpoint", "/checkpoint"),
@@ -50,7 +50,7 @@ PALETTE_ITEMS: list[tuple[str, str, str, str]] = [
     ("Session", "search", "Search session messages", "ctrl+f"),
     ("Session", "diff", "View modified files diff summary", "/diff"),
     ("Session", "clear", "Clear messages", "ctrl+l"),
-    ("System", "stop_background", "Stop background shells", "ctrl+x"),
+    ("System", "stop_background", "Stop background shells", "f6"),
     ("System", "toggle_sidebar", "Toggle sidebar", "ctrl+b"),
     ("System", "theme", "Switch theme", "ctrl+t"),
     ("System", "effort", "Switch reasoning effort", "/effort"),
@@ -89,14 +89,18 @@ HELP_MARKDOWN = """
 - `tab` — switch Build ↔ Plan agent
 - `ctrl+p` — command palette
 - `ctrl+b` — toggle right sidebar (Context / MCP / LSP / Ollama / Todo / Files)
-- `ctrl+m` — switch model
+- `f2` — switch model
 - `ctrl+t` — switch theme
 - `ctrl+o` — Todo manager
 - `ctrl+n` — new session
 - `ctrl+y` — copy last answer
 - `ctrl+f` — search session messages and tool output
-- `ctrl+shift+x` — stop background shell processes
-- `ctrl+shift+e` — collapse all tool cards
+- `f3` — prompt history search
+- `f6` — stop background shell processes
+- `f7` — collapse all tool cards
+- `f8` / `f9` — narrow / widen the sidebar
+- `ctrl+r` — re-run the last prompt
+- `ctrl+l` — clear messages
 - `enter` (on a tool card) — expand / collapse it
 - `ctrl+q` — quit
 
@@ -125,7 +129,7 @@ HELP_MARKDOWN = """
 
 
 class PromptHistoryModal(ModalScreen[str | None]):
-    """Searchable prompt history (ctrl+h). Enter picks a prompt into the input."""
+    """Searchable prompt history (f3). Enter picks a prompt into the input."""
 
     BINDINGS = [Binding("escape", "cancel", "Close")]
 
@@ -925,7 +929,10 @@ class PermissionModal(ModalScreen[str]):
         self._armed = True
 
     def compose(self) -> ComposeResult:
-        prefix = " ".join(self.command.split()[:2])
+        from .tools import ToolExecutor
+
+        prefix = ToolExecutor._bash_prefix(self.command) if self.command else ""
+        exact = bool(prefix) and prefix == " ".join(self.command.split())
         with Vertical(classes="oc-modal"):
             yield Static(_modal_header("Permission required"), classes="oc-modal-header")
             # The command comes from the model: show it verbatim. In markup mode a
@@ -941,7 +948,8 @@ class PermissionModal(ModalScreen[str]):
             )
             foot = "y allow once   a always allow   esc reject"
             if prefix:
-                foot = f"y once   a always   p always '{prefix}…'   esc reject"
+                shown = f"'{prefix[:40]}'" if exact else f"'{prefix}…'"
+                foot = f"y once   a always   p always {shown}   esc reject"
             yield Label(Text(foot), classes="oc-modal-foot")
 
     def action_allow_once(self) -> None:

@@ -179,7 +179,12 @@ class PromptModelLabel(Static):
         info = get_model_info(model_id, extra_models)
         t = Text()
         t.append(f"  {info.name}", style="#eeeeee")
-        t.append(f"  {info.provider}", style="#808080")
+        try:
+            narrow = self.app.size.width < 56
+        except Exception:  # noqa: BLE001 - not mounted yet
+            narrow = False
+        if not narrow:  # the provider is the first thing to give way on a narrow terminal
+            t.append(f"  {info.provider}", style="#808080")
         if effort and effort != "auto":
             t.append(f"  effort:{effort}", style="#fab283")
         self.update(t)
@@ -223,7 +228,11 @@ class PromptSubHints(Static):
         else:
             right.append("tab", style="#eeeeee")
             right.append(" agents   ", style="#808080")
-            right.append("ctrl+p", style="#eeeeee")
+            try:
+                palette_key = self.app.key_for("open_palette", "ctrl+p")  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 - hints must never break rendering
+                palette_key = "ctrl+p"
+            right.append(palette_key, style="#eeeeee")
             right.append(" commands", style="#808080")
 
         grid.add_row(left, right)
@@ -993,6 +1002,7 @@ class SidebarPanel(Vertical):
         mcp_status: dict[str, dict[str, Any]] | None = None,
         mcp_configs: dict[str, dict[str, Any]] | None = None,
         permission_mode: str = "",
+        lsp_servers: list[tuple[str, bool]] | None = None,
     ) -> None:
         info = get_model_info(model_id, extra_models)
         used = session.total_tokens
@@ -1040,28 +1050,35 @@ class SidebarPanel(Vertical):
                 mcp.append(f"+{len(configured) - 6} more\n", style="#686868")
         self.query_one("#sb-mcp", Static).update(mcp)
 
-        # 4. LSP
+        # 4. LSP: only the servers that are actually configured; "ready" means a client is running.
+        lsp_block = self.query_one("#sb-lsp", Static)
         lsp = Text()
         lsp.append("LSP\n", style="bold #eeeeee")
-        lsp.append("• ", style="bold #7fd88f")
-        lsp.append("python ", style="#eeeeee")
-        lsp.append("Ready", style="#808080")
-        self.query_one("#sb-lsp", Static).update(lsp)
+        for name, running in (lsp_servers or [])[:6]:
+            lsp.append("• ", style="bold #7fd88f" if running else "#808080")
+            lsp.append(f"{name} ", style="#eeeeee")
+            lsp.append("running" if running else "idle", style="#808080")
+            lsp.append("\n")
+        lsp_block.display = bool(lsp_servers)
+        lsp_block.update(lsp)
 
-        # 4b. Ollama
+        # 4b. Ollama: shown when it is up or when Ollama models are configured; a missing optional
+        # service is not an error, so it is simply left out.
         local_models = [m for m in (extra_models or []) if "ollama" in m.provider.lower()]
+        ollama_block = self.query_one("#sb-ollama", Static)
         ollama = Text()
         ollama.append("Ollama\n", style="bold #eeeeee")
         if ollama_online is False:
-            ollama.append("• ", style="bold #e06c75")
-            ollama.append("offline ", style="#eeeeee")
+            ollama.append("• ", style="#808080")
+            ollama.append("not running ", style="#eeeeee")
             ollama.append("localhost:11434", style="#808080")
         else:
             ollama.append("• ", style="bold #7fd88f")
             ollama.append("online ", style="#eeeeee")
             count = len(local_models)
             ollama.append(f"{count} model{'s' if count != 1 else ''}", style="#808080")
-        self.query_one("#sb-ollama", Static).update(ollama)
+        ollama_block.display = ollama_online is True or bool(local_models)
+        ollama_block.update(ollama)
 
         # 5. Todo
         todo = Text()

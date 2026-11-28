@@ -88,7 +88,8 @@ function startBackend() {
     "runpy.run_module('rbit.cli', run_name='__main__', alter_sys=True)";
   backend = spawn(py, ["-c", boot, "serve", "--port", String(PORT), "-d", WORKSPACE], {
     cwd: WORKSPACE,
-    env: { ...process.env, PYTHONUNBUFFERED: "1", RBIT_SERVER_TOKEN: TOKEN },
+    // RBIT_APPROVALS=1: every shell command asks the user first (the renderer shows the dialog).
+    env: { ...process.env, PYTHONUNBUFFERED: "1", RBIT_SERVER_TOKEN: TOKEN, RBIT_APPROVALS: "1" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   backend.stderr.on("data", (d) => console.error("[rbit]", String(d)));
@@ -136,9 +137,19 @@ ipcMain.on("rbit:config", (event) => {
   event.returnValue = { port: PORT, workspace: WORKSPACE, token: TOKEN, ready: backendReady };
 });
 
+let switching = false;
 ipcMain.handle("rbit:selectWorkspace", async (event) => {
   const frameUrl = event.senderFrame ? event.senderFrame.url : "";
-  if (!isOurRenderer(frameUrl)) return null;
+  if (!isOurRenderer(frameUrl) || switching) return null;
+  switching = true;
+  try {
+    return await pickWorkspace(event);
+  } finally {
+    switching = false;
+  }
+});
+
+async function pickWorkspace(event) {
   const win = BrowserWindow.fromWebContents(event.sender);
   const picked = await dialog.showOpenDialog(win || undefined, {
     title: "Select workspace folder",
@@ -148,11 +159,12 @@ ipcMain.handle("rbit:selectWorkspace", async (event) => {
   if (picked.canceled || !picked.filePaths || !picked.filePaths[0]) return null;
   WORKSPACE = picked.filePaths[0];
   killBackend();
+  backendReady = false;
   PORT = await choosePort(PREFERRED_PORT);
   startBackend();
   backendReady = await waitBackend();
   return { port: PORT, workspace: WORKSPACE, token: TOKEN, ready: backendReady };
-});
+}
 
 function createWindow() {
   const win = new BrowserWindow({

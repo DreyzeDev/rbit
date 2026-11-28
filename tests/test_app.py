@@ -197,7 +197,7 @@ async def test_autocomplete_and_modals(tmp_path: Path) -> None:
         await pilot.pause()
         assert sidebar.display is True
 
-        for shortcut in ("ctrl+p", "ctrl+m", "ctrl+t", "ctrl+o"):
+        for shortcut in ("ctrl+p", "f2", "f3", "ctrl+t", "ctrl+o"):
             await pilot.press(shortcut)
             await pilot.pause()
             assert len(app.screen_stack) == 2
@@ -1420,7 +1420,7 @@ async def test_sidebar_ollama_indicator(tmp_path: Path, monkeypatch: pytest.Monk
         await offline.workers.wait_for_complete()
         await pilot.pause()
         text = str(offline.query_one("#sb-ollama", Static).render())
-        assert "offline" in text
+        assert "not running" in text
 
 
 def test_custom_extra_headers_are_merged(tmp_path: Path) -> None:
@@ -2997,7 +2997,7 @@ async def test_completion_inserts_path_without_control_chars(tmp_path: Path) -> 
         inp = app.query_one("#prompt-input", Input)
         inp.value = "прочитай @zet"
         await pilot.pause()
-        app._apply_completion("file", "sub\zeta.txt")
+        app._apply_completion("file", r"sub\zeta.txt")
         assert inp.value == "прочитай @sub/zeta.txt "
         assert "\t" not in inp.value and "\n" not in inp.value and "\r" not in inp.value
 

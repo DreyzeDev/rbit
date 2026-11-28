@@ -43,3 +43,10 @@ AppImage для Linux). На CI сборка идёт через workflow
 > `node node_modules/electron/install.js`, либо собирайте через CI
 > (`.github/workflows/desktop.yml` соберёт инсталляторы для Windows/macOS/Linux
 > при пуше тега `v*`).
+
+## Safety
+
+The backend is started with `RBIT_APPROVALS=1`: every shell command the agent wants to run
+opens an approval dialog (Allow once / Always allow this exact command / Deny, Esc denies).
+The OS sandbox (`shell_sandbox`) is off unless you enable it in `.rbit/config.json`; the
+"Sandbox" chip in the header shows its state.

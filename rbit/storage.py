@@ -758,7 +758,7 @@ class StorageManager:
             vecs = model.encode([q_text, *docs_text], normalize_embeddings=True)
             q_vec = vecs[0]
             for idx in range(n_docs):
-                emb_scores[idx] = max(0.0, float(sum(a * b_val for a, b_val in zip(q_vec, vecs[idx + 1]))))
+                emb_scores[idx] = max(0.0, float(sum(a * b_val for a, b_val in zip(q_vec, vecs[idx + 1], strict=False))))
         except Exception:
             pass
 

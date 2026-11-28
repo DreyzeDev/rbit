@@ -155,7 +155,7 @@ class Scheduler:
             current += timedelta(minutes=1)
         return None
 
-    def add(self, prompt: str, spec: str, *, name: str = "", model: str = "", agent: str = "build") -> tuple[dict[str, Any] | None, str]:
+    def add(self, prompt: str, spec: str, *, name: str = "", model: str = "", agent: str = "build", unattended: bool = True) -> tuple[dict[str, Any] | None, str]:
         prompt = prompt.strip()
         if not prompt:
             return None, "prompt is required"
@@ -171,6 +171,7 @@ class Scheduler:
             "model": model,
             "agent": agent,
             "enabled": True,
+            "unattended": unattended,
             "created_at": _now(),
             "last_run": None,
             "next_run": next_run,

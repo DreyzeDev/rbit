@@ -396,7 +396,7 @@ def test_desktop_csp_and_renderer_guards() -> None:
     assert "Content-Security-Policy" in html and "script-src 'self'" in html
     assert "unsafe-inline" not in html
     app_js = _read("desktop/renderer/app.js")
-    assert 'ev.type === "session"' in app_js
+    assert 'case "session":' in app_js
     assert "if (busy) return" in app_js
 
 

@@ -98,6 +98,18 @@ _STATEMENT_SPLIT = re.compile(r"(?:;|\|\||&&|\||&|\r?\n)")
 #: Shell constructs that can smuggle a second command or write a file.
 _SHELL_UNSAFE_CHARS = re.compile(r"[;&|<>`\r\n]|\$\(|\$\{")
 
+#: Programs that execute whatever they are given next (`python -c ...`, `bash -c ...`,
+#: `node -e ...`, `sudo <anything>`): approving a two-word prefix of them would approve any
+#: program, so they only ever match the exact command that was approved.
+_EXEC_PROGRAMS = frozenset(
+    {
+        "python", "python2", "python3", "py", "node", "deno", "bun", "ruby", "perl", "php", "lua",
+        "bash", "sh", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "pwsh", "powershell", "cmd",
+        "eval", "ssh", "npx", "pipx", "uvx", "docker", "podman", "kubectl", "find", "awk", "gawk",
+        "osascript", "xargs",
+    }
+)
+
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*$")
 _WRAPPER_COMMANDS = frozenset({"sudo", "doas", "env", "command", "exec", "nohup", "time", "nice", "builtin", "xargs"})
 
@@ -2716,7 +2728,7 @@ class ToolExecutor:
         output = list(lines)
         cursor = 0
         delta = 0
-        for old_start, old_len, hunk_lines in hunks:
+        for old_start, _old_len, hunk_lines in hunks:
             old_block = [ln[1:] for ln in hunk_lines if ln[0] in (" ", "-")]
             new_block = [ln[1:] for ln in hunk_lines if ln[0] in (" ", "+")]
             numbered = old_start >= 0
@@ -4352,12 +4364,32 @@ class ToolExecutor:
             return False
         for prefix in self.allowed_bash_prefixes:
             parts = [t.lower() for t in str(prefix).split()]
-            if parts and tokens[: len(parts)] == parts:
+            if not parts:
+                continue
+            if self._prefix_is_exact_only(parts):
+                if tokens == parts:
+                    return True
+            elif tokens[: len(parts)] == parts:
                 return True
         return False
 
-    def _bash_prefix(self, command: str) -> str:
-        return " ".join(command.split()[:2])
+    @staticmethod
+    def _prefix_is_exact_only(parts: list[str]) -> bool:
+        """True when approving `parts` must not extend to other arguments."""
+        program = parts[0].replace("\\", "/").rsplit("/", 1)[-1]
+        if program.endswith(".exe"):
+            program = program[:-4]
+        if program in _EXEC_PROGRAMS or program in _WRAPPER_COMMANDS:
+            return True
+        # `tool -x ...`: an option as the second word (`npm --prefix`) changes what runs.
+        return len(parts) > 1 and parts[1].startswith("-")
+
+    @staticmethod
+    def _bash_prefix(command: str) -> str:
+        tokens = command.split()
+        if ToolExecutor._prefix_is_exact_only([t.lower() for t in tokens[:2]]):
+            return " ".join(tokens)  # exact command only
+        return " ".join(tokens[:2])
 
     async def _confirm_shell(
         self,

@@ -501,19 +501,19 @@ class RbitApp(App[None]):
     BINDINGS = [
         Binding("ctrl+p", "open_palette", "Commands", show=False),
         Binding("ctrl+b", "toggle_sidebar", "Sidebar", show=False),
-        Binding("ctrl+m", "open_models", "Models", show=False),
+        Binding("f2,ctrl+m", "open_models", "Models", show=False),
         Binding("ctrl+t", "open_themes", "Themes", show=False),
         Binding("ctrl+o", "open_todos", "Todos", show=False),
         Binding("ctrl+n", "new_session", "New Session", show=False),
         Binding("ctrl+l", "clear_chat", "Clear", show=False),
         Binding("ctrl+y", "copy_last", "Copy", show=False),
         Binding("ctrl+f", "search_session", "Search", show=False),
-        Binding("ctrl+shift+x", "stop_background", "Stop background", show=False),
-        Binding("ctrl+shift+e", "collapse_all_cards", "Collapse cards", show=False),
+        Binding("f6,ctrl+shift+x", "stop_background", "Stop background", show=False),
+        Binding("f7,ctrl+shift+e", "collapse_all_cards", "Collapse cards", show=False),
         Binding("ctrl+r", "retry_last", "Retry", show=False),
-        Binding("ctrl+h", "history_search", "Prompt history", show=False),
-        Binding("ctrl+shift+right", "sidebar_wider", "Sidebar wider", show=False),
-        Binding("ctrl+shift+left", "sidebar_narrower", "Sidebar narrower", show=False),
+        Binding("f3,ctrl+h", "history_search", "Prompt history", show=False),
+        Binding("f9,ctrl+shift+right", "sidebar_wider", "Sidebar wider", show=False),
+        Binding("f8,ctrl+shift+left", "sidebar_narrower", "Sidebar narrower", show=False),
         Binding("f1", "show_help", "Help", show=False),
         Binding("escape", "interrupt_or_close", "Interrupt", show=False),
         Binding("ctrl+q", "quit", "Quit", show=False),
@@ -664,14 +664,23 @@ class RbitApp(App[None]):
         if untrusted:
             self.notify(untrusted, title="Project config", severity="warning", timeout=12.0)
         self._maybe_show_doctor_hint()
-        # Config-driven keybindings: {"bindings": {"open_models": "ctrl+shift+m"}}
+        # Config-driven keybindings: {"bindings": {"open_models": "ctrl+shift+m"}}. Textual has
+        # already collected BINDINGS by now, so rebind in the live map: drop the action's default
+        # keys and add the configured one.
         custom_bindings = self.config_data.get("bindings")
-        if isinstance(custom_bindings, dict) and custom_bindings:
-            merged = []
-            for b in self.BINDINGS:
-                new_key = custom_bindings.get(b.action)
-                merged.append(Binding(new_key, b.action, b.description, show=b.show) if new_key else b)
-            self.BINDINGS = merged
+        if isinstance(custom_bindings, dict):
+            for action, new_key in custom_bindings.items():
+                if not isinstance(action, str) or not isinstance(new_key, str) or not new_key.strip():
+                    continue
+                known = [b for b in self.BINDINGS if isinstance(b, Binding) and b.action == action]
+                if not known:
+                    continue
+                key_map = self._bindings.key_to_bindings
+                for key in list(key_map):
+                    key_map[key] = [b for b in key_map[key] if b.action != action]
+                    if not key_map[key]:
+                        del key_map[key]
+                self.bind(new_key.strip(), action, description=known[0].description, show=False)
         from .plugins import load_plugins
 
         self._loaded_plugins = load_plugins(self, self.config_data, self.plugins)
@@ -931,8 +940,9 @@ class RbitApp(App[None]):
         if self._is_home_state:
             stage.remove_class("is-session")
             stage.add_class("is-home")
-            logo.display = True
-            tip.display = True
+            # Short terminals: the logo and tip give way so the prompt box is never cut off.
+            logo.display = self.size.height >= 24
+            tip.display = self.size.height >= 18
             header.display = False
             scroll.display = False
             sidebar.display = self._sidebar_override_on_home and not self._is_compact
@@ -941,7 +951,7 @@ class RbitApp(App[None]):
             stage.add_class("is-session")
             logo.display = False
             tip.display = False
-            header.display = True
+            header.display = self.size.height >= 12
             scroll.display = True
             sidebar.display = bool(self.config_data.get("sidebar_visible", True)) and not self._is_compact
             sidebar.styles.width = self._sidebar_width
@@ -1032,6 +1042,7 @@ class RbitApp(App[None]):
             mcp_status=self.mcp.status,
             mcp_configs=self.mcp.configs,
             permission_mode=self.executor.current_permission_mode(),
+            lsp_servers=[(d.name, d.name in getattr(self.lsp, "_clients", {})) for d in self.lsp.servers],
         )
         self.query_one(BottomStatusBar).update_bar(self.workspace, self.git_branch)
 
@@ -1059,12 +1070,12 @@ class RbitApp(App[None]):
                 self.executor.remember_permission(tool_name, detail)
             return True
         if choice == "prefix":
-            prefix = " ".join(detail.split()[:2])
+            prefix = self.executor._bash_prefix(detail)
             if prefix and prefix not in self.executor.allowed_bash_prefixes:
                 self.executor.allowed_bash_prefixes.append(prefix)
                 self.config_data["allowed_bash_prefixes"] = list(self.executor.allowed_bash_prefixes)
                 self.storage.save_config(self.config_data)
-            self.notify(f"Префикс «{prefix}» больше не спрашивается.", timeout=2.5)
+            self.notify(f"Команда «{prefix}» больше не спрашивается.", timeout=2.5)
             return True
         return choice == "once"
 
@@ -1791,6 +1802,13 @@ class RbitApp(App[None]):
         if attach_refs:
             prompt = f"{prompt}\n\n{attach_refs}"
         self._submit_prompt(prompt)
+
+    def key_for(self, action: str, default: str = "") -> str:
+        """The first key currently bound to `action` (shown in hints, so they follow rebinding)."""
+        for key, bindings in self._bindings.key_to_bindings.items():
+            if any(b.action == action for b in bindings):
+                return key
+        return default
 
     def action_sidebar_wider(self) -> None:
         self._resize_sidebar(+6)

@@ -2,27 +2,31 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>rbit</title>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:*" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:*; object-src 'none'; base-uri 'none'; form-action 'none'" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <header id="tabbar">
-    <button id="menu-btn" class="icon-btn" title="Toggle sessions (Ctrl+B)" aria-label="Toggle sessions">
+    <button id="menu-btn" class="icon-btn" title="Toggle sessions (Ctrl+B)" aria-label="Toggle sessions" aria-controls="sessions" aria-expanded="false">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
     </button>
-    <div id="tabs" role="tablist"></div>
+    <div id="tabs" role="tablist" aria-label="Open sessions"></div>
     <button id="tab-new" class="icon-btn" title="New session (Ctrl+N)" aria-label="New session">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
     </button>
     <div id="header-meta">
-      <span id="sandbox-pill" class="meta-chip" title="OS-level sandbox status">
+      <span id="sandbox-pill" class="meta-chip" title="OS-level sandbox status" role="status">
         <span class="dot"></span>
         <span id="sandbox-label">Sandbox: checking</span>
       </span>
       <span id="usage-pill" class="meta-chip tabular" title="Today's token and cost usage">0 tok · $0.0000</span>
     </div>
   </header>
+
+  <div id="banner" class="banner" role="alert" hidden></div>
+  <div id="approval" hidden></div>
 
   <div id="layout">
     <aside id="sessions" class="hidden" aria-label="Sessions">
@@ -34,7 +38,7 @@
     </aside>
 
     <main id="main">
-      <div id="feed">
+      <div id="feed" role="log" aria-live="polite" aria-label="Conversation" tabindex="0">
         <div class="home-hero">
           <div class="wordmark">rbit</div>
           <p class="hero-sub">Autonomous terminal and desktop coding agent</p>
@@ -43,7 +47,7 @@
 
       <div id="composer-wrap">
         <div id="composer-card">
-          <textarea id="prompt" rows="1" placeholder="Ask rbit to inspect, edit, or run tests..."></textarea>
+          <textarea id="prompt" rows="1" aria-label="Message to rbit" placeholder="Ask rbit to inspect, edit, or run tests..."></textarea>
           <div id="composer-bar">
             <select id="select-mode" class="pill-select" title="Agent mode" aria-label="Agent mode">
               <option value="build">Build</option>
@@ -67,7 +71,7 @@
         </div>
 
         <div id="crumbs">
-          <button id="btn-workspace" class="crumb" title="Switch workspace folder">
+          <button id="btn-workspace" class="crumb" title="Switch workspace folder" aria-label="Switch workspace folder">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-6l-2-2H5a2 2 0 0 0-2 2z"/></svg>
             <span id="crumb-name">Workspace</span>
           </button>

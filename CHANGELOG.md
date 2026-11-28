@@ -6,6 +6,48 @@ All notable changes to rbit are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **Desktop app asks before running shell commands.** The backend it starts now runs with
+  `RBIT_APPROVALS=1` and the window shows an approval dialog (allow once / always allow / deny,
+  Esc denies, buttons are armed after a short delay). Before, the desktop ran every command
+  unattended.
+- **"Always allow" no longer approves a whole program.** For interpreters and launchers
+  (`python`, `node`, `bash`, `sudo`, `npx`, `docker`, ...) and for `tool -option ...`, only the
+  exact command is remembered, so approving `python script.py` no longer approves `python -c "..."`.
+- `rbit serve`: the `ask`, `review`, `debug` and `autopilot` modes are honoured (they used to be
+  silently turned into `build`, i.e. full write access); a schedule created over HTTP while approvals
+  are on does not run shell commands unattended; `git status`/`git diff` for `/v1/vcs/status` run with
+  repository-configured programs (`core.fsmonitor`, hooks, external diff) disabled and a timeout;
+  a token in the URL is accepted only to open the page (which keeps it in a `SameSite=Strict`
+  cookie), and cookies are honoured only for same-origin requests; `/v1/fs` works when the
+  workspace is a symlink.
+- `rbit mobile` states that the connection is plain HTTP.
+
+### Fixed
+
+- Terminal UI: the model and prompt-history shortcuts were `ctrl+m` and `ctrl+h`, which terminals
+  deliver as Enter and Backspace, so they never fired. They are now `f2` and `f3` (the old keys stay
+  as aliases for terminals that can tell them apart); stop-background, collapse-cards and sidebar
+  width have `f6`-`f9` next to the `ctrl+shift` combinations that most terminals cannot send.
+- Terminal UI: `"bindings"` in the config file did nothing; they now rebind the action, and the
+  on-screen hints follow.
+- Terminal UI: on a short or narrow terminal the logo, tip and provider name give way so the prompt
+  box is never cut off; the sidebar no longer claims "LSP python Ready" when nothing runs and hides
+  Ollama when it is simply not installed.
+- Desktop: the saved model is restored (`current` vs `active`), tool calls and their output are shown
+  live and in loaded sessions, errors and a dead backend are shown instead of swallowed, Stop works
+  before the session id arrives, session rows are keyboard-reachable and deleting asks first, Markdown
+  lists/headings/italics/links render, Enter during IME composition no longer sends, plus focus
+  outlines, `prefers-reduced-motion`, a light theme and a narrow-window layout.
+- Lint: loop-variable and `zip(strict=)` findings; invalid escape sequences in tests.
+
+### Changed
+
+- CI also runs Python 3.13, the extra lint rules above, and mypy on every module that is type-clean.
+- `shell_sandbox` stays `"off"` by default; `"strict"` in `trust.py` is only the value an untrusted
+  project config may *set* (it narrows access).
+
 ### Added
 
 - **OS-level sandbox for everything the agent starts (`shell_sandbox`).** `"auto"` runs

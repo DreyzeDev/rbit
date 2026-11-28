@@ -1264,7 +1264,7 @@ class AgentEngine:
                                         ".webp": "image/webp",
                                         ".gif": "image/gif",
                                     }[suffix]
-                                    image_parts.append(
+                                    image_parts.append(  # noqa: B023 - awaited within this iteration
                                         {
                                             "type": "image_url",
                                             "image_url": {"url": f"data:{mime};base64,{b64}"},
@@ -1273,7 +1273,7 @@ class AgentEngine:
                                     return f"(image attached: {rel})"
                             except Exception:
                                 logger.debug("image attachment failed: %s", rel, exc_info=True)
-                        async with att_sem:
+                        async with att_sem:  # noqa: B023 - awaited within this iteration
                             res = await self.executor.execute(
                                 "read",
                                 {"filePath": actual, "offset": offset, "limit": limit},
@@ -1658,14 +1658,14 @@ class AgentEngine:
                 await on_status(f"Параллельный вызов ({len(batch)} read-only инструментов)...")
                 sem = asyncio.Semaphore(MAX_PARALLEL_TOOLS)
 
-                async def _bounded_call(name: str, args: dict[str, Any]) -> ToolResult:
+                async def _bounded_call(name: str, args: dict[str, Any], sem: asyncio.Semaphore = sem) -> ToolResult:
                     async with sem:
                         return await _safe_invoke(name, args)
 
                 results = await asyncio.gather(
                     *(_bounded_call(fn_name, parsed_args) for _, fn_name, parsed_args in batch)
                 )
-                for (tc, fn_name, _), res in zip(batch, results):
+                for (tc, fn_name, _), res in zip(batch, results, strict=True):
                     _emit(tc, fn_name, res)
 
     async def _apply_chat_params(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
@@ -1873,7 +1873,7 @@ class AgentEngine:
                                     "response": {"content": body_text[:8000] or "(no output)"},
                                 }
                             }
-                            for call, (_cid, _res, body_text) in zip(calls, results)
+                            for call, (_cid, _res, body_text) in zip(calls, results, strict=False)
                         ],
                     }
                 )

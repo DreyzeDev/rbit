@@ -58,7 +58,47 @@ asyncio_default_fixture_loop_scope = "function"
 
 [tool.mypy]
 python_version = "3.11"
-files = ["rbit/models.py", "rbit/storage.py"]
+# Modules that are type-clean today; the rest (acp, agent, app, cli, lsp, mcp, modals, plugins,
+# router, sandbox/_linux_exec, selftest, widgets) are added as their errors are fixed.
+files = [
+    "rbit/__init__.py",
+    "rbit/__main__.py",
+    "rbit/audit.py",
+    "rbit/browser.py",
+    "rbit/completion.py",
+    "rbit/envscrub.py",
+    "rbit/formatters.py",
+    "rbit/guard.py",
+    "rbit/i18n.py",
+    "rbit/install.py",
+    "rbit/migrate.py",
+    "rbit/models.py",
+    "rbit/permissions.py",
+    "rbit/plugin_manager.py",
+    "rbit/policy.py",
+    "rbit/remote.py",
+    "rbit/risk.py",
+    "rbit/rules.py",
+    "rbit/sandbox/__init__.py",
+    "rbit/sandbox/linux.py",
+    "rbit/sandbox/macos.py",
+    "rbit/sandbox/policy.py",
+    "rbit/sandbox/selftest.py",
+    "rbit/sandbox/windows.py",
+    "rbit/scheduler.py",
+    "rbit/service.py",
+    "rbit/skills.py",
+    "rbit/soak.py",
+    "rbit/storage.py",
+    "rbit/subagents.py",
+    "rbit/telemetry.py",
+    "rbit/terminal.py",
+    "rbit/themes.py",
+    "rbit/tools.py",
+    "rbit/trust.py",
+    "rbit/usage.py",
+]
+follow_imports = "silent"
 check_untyped_defs = true
 warn_redundant_casts = true
 warn_unused_ignores = true

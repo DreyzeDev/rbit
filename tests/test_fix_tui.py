@@ -771,11 +771,11 @@ async def test_toasts_show_bracketed_text_literally(workspace: Path) -> None:
             await pilot.pause(0.05)
             if app.query("PromptSubHints"):
                 break
-        app.notify("Skill not found: [name]  Bad: '[red]x'  Macro: C:\m\[/oops]", severity="warning", timeout=30)
+        app.notify(r"Skill not found: [name]  Bad: '[red]x'  Macro: C:\m\[/oops]", severity="warning", timeout=30)
         await pilot.pause(0.2)
         toast = next(n for n in app._notifications if n.message.startswith("Skill not found"))
         assert toast.markup is False
-        assert toast.message == "Skill not found: [name]  Bad: '[red]x'  Macro: C:\m\[/oops]"
+        assert toast.message == r"Skill not found: [name]  Bad: '[red]x'  Macro: C:\m\[/oops]"
 
 
 def test_diff_block_fence_outgrows_backticks_inside_the_diff() -> None:
